@@ -260,7 +260,7 @@ void SyncSession::handle_bad_auth(const std::shared_ptr<SyncUser>& user, Status 
     }
 }
 
-static bool check_for_auth_failure(const app::AppError& error)
+static bool check_for_auth_failure(const networking::NetworkError& error)
 {
     using namespace barq::sync;
     // Auth failure is returned as a 401 (unauthorized) or 403 (forbidden) response
@@ -273,7 +273,7 @@ static bool check_for_auth_failure(const app::AppError& error)
     return false;
 }
 
-static bool check_for_redirect_response(const app::AppError& error)
+static bool check_for_redirect_response(const networking::NetworkError& error)
 {
     using namespace barq::sync;
     // Check for unhandled 301/308 permanent redirect response
@@ -286,11 +286,11 @@ static bool check_for_redirect_response(const app::AppError& error)
     return false;
 }
 
-util::UniqueFunction<void(std::optional<app::AppError>)>
+util::UniqueFunction<void(std::optional<networking::NetworkError>)>
 SyncSession::handle_refresh(const std::shared_ptr<SyncSession>& session, bool restart_session)
 {
     auto weak_session = session->weak_from_this();
-    return [weak_session, restart_session](std::optional<app::AppError> error) {
+    return [weak_session, restart_session](std::optional<networking::NetworkError> error) {
         auto session = weak_session.lock();
         if (!session) {
             return;

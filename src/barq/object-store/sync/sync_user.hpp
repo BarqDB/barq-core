@@ -27,9 +27,9 @@
 #include <vector>
 
 namespace barq {
-namespace app {
-struct AppError;
-} // namespace app
+namespace networking {
+struct NetworkError;
+} // namespace networking
 class SyncManager;
 class SyncSession;
 
@@ -59,7 +59,7 @@ public:
     virtual std::string user_id() const noexcept = 0;
     /// App id which this user is associated with
     virtual std::string app_id() const noexcept = 0;
-    /// Legacy uuids attached to this user. Only applicable to app::User.
+    /// Legacy uuids attached to this user. Only applicable to networking::User.
     virtual std::vector<std::string> legacy_identities() const
     {
         return {};
@@ -75,7 +75,7 @@ public:
 
     virtual SyncManager* sync_manager() = 0;
 
-    using CompletionHandler = util::UniqueFunction<void(std::optional<app::AppError>)>;
+    using CompletionHandler = util::UniqueFunction<void(std::optional<networking::NetworkError>)>;
     // The sync server has told the client to log out the user
     // No completion handler as the user is already logged out server-side
     virtual void request_log_out() = 0;

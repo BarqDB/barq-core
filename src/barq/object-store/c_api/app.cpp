@@ -23,7 +23,7 @@
 #include <barq/object-store/sync/sync_user.hpp>
 
 namespace barq::c_api {
-using namespace barq::app;
+using namespace barq::networking;
 
 static_assert(barq_user_state_e(SyncUser::State::LoggedOut) == BARQ_USER_STATE_LOGGED_OUT);
 static_assert(barq_user_state_e(SyncUser::State::LoggedIn) == BARQ_USER_STATE_LOGGED_IN);
@@ -34,14 +34,14 @@ static void cb_proxy_for_completion(barq_userdata_t userdata, const barq_app_err
 {
     SyncUser::CompletionHandler* cxx_cb = static_cast<SyncUser::CompletionHandler*>(userdata);
     BARQ_ASSERT(cxx_cb);
-    std::optional<AppError> cxx_err;
+    std::optional<NetworkError> cxx_err;
     if (err) {
         std::optional<int> additional_error_code;
         if (err->http_status_code) {
             additional_error_code = err->http_status_code;
         }
         cxx_err =
-            AppError(ErrorCodes::Error(err->error), err->message, err->link_to_server_logs, additional_error_code);
+            NetworkError(ErrorCodes::Error(err->error), err->message, err->link_to_server_logs, additional_error_code);
     }
     (*cxx_cb)(cxx_err);
     delete cxx_cb;

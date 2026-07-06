@@ -21,7 +21,7 @@
 #include <emscripten/fetch.h>
 
 using namespace barq;
-using namespace barq::app;
+using namespace barq::networking;
 
 namespace barq::_impl {
 struct FetchState {
@@ -116,10 +116,10 @@ void EmscriptenNetworkTransport::send_request_to_server(
         case HttpMethod::put:
             strncpy(attr.requestMethod, "PUT", sizeof(attr.requestMethod));
             break;
-        case app::HttpMethod::del:
+        case networking::HttpMethod::del:
             strncpy(attr.requestMethod, "DELETE", sizeof(attr.requestMethod));
             break;
-        case app::HttpMethod::patch:
+        case networking::HttpMethod::patch:
             strncpy(attr.requestMethod, "PATCH", sizeof(attr.requestMethod));
             break;
     }

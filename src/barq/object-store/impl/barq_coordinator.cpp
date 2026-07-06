@@ -547,7 +547,7 @@ void BarqCoordinator::init_external_helpers()
     // BarqCoordinator. If not, we need to create a new one now.
     if (m_config.sync_config && !m_sync_session) {
         if (!m_config.sync_config->user || m_config.sync_config->user->state() == SyncUser::State::Removed) {
-            throw app::AppError(
+            throw networking::NetworkError(
                 ErrorCodes::ClientUserNotFound,
                 util::format("Cannot start a sync session for user '%1' because this user has been removed.",
                              m_config.sync_config->user->user_id()));

@@ -1157,7 +1157,7 @@ TEST_CASE("Get Barq using Async Open", "[sync][pbs][async open]") {
             using TestUser::TestUser;
             void request_access_token(CompletionHandler&& completion) override
             {
-                completion(app::AppError(ErrorCodes::HTTPError, "403 error", "", 403));
+                completion(networking::NetworkError(ErrorCodes::HTTPError, "403 error", "", 403));
             }
             bool access_token_refresh_required() const override
             {

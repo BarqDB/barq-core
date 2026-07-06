@@ -29,15 +29,15 @@
 #include <string>
 #include <vector>
 
-namespace barq::app {
+namespace barq::networking {
 
-struct AppError : public Exception {
+struct NetworkError : public Exception {
     std::optional<int> additional_status_code;
 
     std::string link_to_server_logs;
     std::string server_error;
 
-    AppError(ErrorCodes::Error ec, std::string message, std::string link = "",
+    NetworkError(ErrorCodes::Error ec, std::string message, std::string link = "",
              std::optional<int> additional_error_code = std::nullopt,
              std::optional<std::string> server_err = std::nullopt);
 
@@ -72,7 +72,7 @@ struct AppError : public Exception {
     }
 };
 
-std::ostream& operator<<(std::ostream& os, AppError error);
+std::ostream& operator<<(std::ostream& os, NetworkError error);
 
 /**
  * An HTTP method type.
@@ -156,6 +156,6 @@ struct GenericNetworkTransport {
                                         util::UniqueFunction<void(const Response&)>&& completion) = 0;
 };
 
-} // namespace barq::app
+} // namespace barq::networking
 
 #endif /* BARQ_GENERIC_NETWORK_TRANSPORT_HPP */

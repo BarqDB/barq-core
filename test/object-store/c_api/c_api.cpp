@@ -709,7 +709,7 @@ TEST_CASE("C API (non-database)", "[c_api]") {
             CHECK(custom_user.m_log_out_requested_count == 2);
         }
         size_t completions = 0;
-        auto verify_completion = [&custom_user, &completions](std::optional<barq::app::AppError> err) {
+        auto verify_completion = [&custom_user, &completions](std::optional<barq::networking::NetworkError> err) {
             CHECK(err);
             CHECK(int(err->code()) == int(custom_user.m_fake_app_error.error));
             CHECK(err->reason() == custom_user.m_fake_app_error.message);
@@ -5758,7 +5758,7 @@ TEST_CASE("C API - async_open", "[sync][pbs][c_api]") {
             using TestUser::TestUser;
             void request_access_token(CompletionHandler&& completion) override
             {
-                completion(app::AppError(ErrorCodes::HTTPError, "403 error", "", 403));
+                completion(networking::NetworkError(ErrorCodes::HTTPError, "403 error", "", 403));
             }
             bool access_token_refresh_required() const override
             {
