@@ -120,8 +120,13 @@ std::optional<size_t> base64_decode(Span<const char> input, Span<char> out_buffe
     BARQ_ASSERT_EX(out_buffer.size() >= required_buffer_len, out_buffer.size(), required_buffer_len);
     static_cast<void>(required_buffer_len);
 
-    // Guard against overlap (so that "restrict" works in the following)
-    BARQ_ASSERT(input.data() + input.size() <= out_buffer.data() || input.data() > &out_buffer.back());
+    // Guard against overlap (so that "restrict" works in the following).
+    // Empty ranges can never overlap; check that explicitly so we never call back() on an
+    // empty out_buffer. out_buffer is empty whenever input is empty (e.g. an empty or
+    // unsigned access token reaching AccessToken::parse), and back() on an empty Span aborts.
+    BARQ_ASSERT(input.empty() || out_buffer.empty() ||
+                input.data() + input.size() <= out_buffer.data() ||
+                input.data() >= out_buffer.data() + out_buffer.size());
 
 
     const char* BARQ_RESTRICT p = input.data();
