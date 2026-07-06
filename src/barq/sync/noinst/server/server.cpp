@@ -1130,6 +1130,16 @@ public:
         return m_client_user_agent;
     }
 
+    const std::string& get_signed_access_token() const noexcept
+    {
+        return m_signed_access_token;
+    }
+
+    void set_signed_access_token(std::string token)
+    {
+        m_signed_access_token = std::move(token);
+    }
+
     const std::string& get_remote_endpoint() const noexcept
     {
         return m_remote_endpoint;
@@ -1324,6 +1334,10 @@ private:
     const std::string m_remote_endpoint;
 
     const std::string m_barq_request_id;
+
+    // The signed access token from the sync request's 'barq_at' query parameter,
+    // used to authenticate the client when it sends BIND.
+    std::string m_signed_access_token;
 
     // A queue of sessions that have enlisted for an opportunity to send a
     // message. Sessions will be served in the order that they enlist. A session
@@ -1870,8 +1884,22 @@ private:
                 user_agent = i->second; // Throws (copy)
         }
 
+        // Extract the signed access token from the 'barq_at' query parameter of
+        // the request target (e.g. "/barq-sync?barq_at=<token>"). It is used to
+        // authenticate the client when it sends BIND.
+        std::string signed_access_token;
+        {
+            std::string_view request_path(request.path.data(), request.path.size());
+            if (auto pos = request_path.find("barq_at="); pos != std::string_view::npos) {
+                std::string_view value = request_path.substr(pos + 8);
+                if (auto amp = value.find('&'); amp != std::string_view::npos)
+                    value = value.substr(0, amp);
+                signed_access_token = std::string(value); // Throws
+            }
+        }
+
         auto handler = [protocol_version = m_negotiated_protocol_version, user_agent = std::move(user_agent),
-                        this](std::error_code ec) {
+                        signed_access_token = std::move(signed_access_token), this](std::error_code ec) {
             // If the operation is aborted, the socket object may have been destroyed.
             if (ec != util::error::operation_aborted) {
                 if (ec) {
@@ -1884,6 +1912,7 @@ private:
                     protocol_version, std::move(user_agent), std::move(m_remote_endpoint),
                     get_barq_request_id()); // Throws
                 SyncConnection& sync_conn_ref = *sync_conn;
+                sync_conn_ref.set_signed_access_token(std::move(signed_access_token));
                 m_server.add_sync_connection(m_id, std::move(sync_conn));
                 m_server.remove_http_connection(m_id);
                 sync_conn_ref.initiate();
@@ -2287,7 +2316,41 @@ public:
             return false;
         }
 
-        // The user has proper permissions at this stage.
+        // Authenticate the client before granting access to the file: verify the
+        // signed access token, reject it if expired, and confirm it grants access
+        // to the requested path. Without this, any client could bind to any path.
+        {
+            // Modern clients send the token in the 'barq_at' query parameter of
+            // the sync request, not in the BIND message body, so authenticate
+            // using the token captured from the connection's HTTP handshake.
+            AccessToken::ParseError parse_error = AccessToken::ParseError::none;
+            util::Optional<AccessToken> access_token =
+                server.get_access_control().verify_access_token(m_connection.get_signed_access_token(), &parse_error);
+            if (!access_token) {
+                logger.error("BIND rejected (path='%1'): invalid access token (parse_error=%2)", path,
+                             int(parse_error)); // Throws
+                // Use permission_denied for all session-level auth failures: it
+                // is the code the client maps (bad_authentication/token_expired
+                // are pre-sync app-layer errors the client treats as unreachable
+                // here), and it avoids leaking why auth failed to the client.
+                error = ProtocolError::permission_denied;
+                return false;
+            }
+            if (access_token->expired(server.token_expiration_clock_now())) {
+                logger.error("BIND rejected (path='%1', identity='%2'): access token expired", path,
+                             access_token->identity); // Throws
+                error = ProtocolError::permission_denied;
+                return false;
+            }
+            if (!server.get_access_control().can(*access_token, Privilege::Read, path)) {
+                logger.error("BIND rejected (path='%1', identity='%2'): permission denied", path,
+                             access_token->identity); // Throws
+                error = ProtocolError::permission_denied;
+                return false;
+            }
+            logger.detail("BIND authenticated (path='%1', identity='%2')", path,
+                          access_token->identity); // Throws
+        }
 
         m_server_file = server.get_or_create_file(path); // Throws
 
