@@ -400,7 +400,7 @@ private:
 
     std::shared_ptr<SyncManager> sync_manager() const REQUIRES(!m_state_mutex);
 
-    static util::UniqueFunction<void(std::optional<app::AppError>)>
+    static util::UniqueFunction<void(std::optional<networking::NetworkError>)>
     handle_refresh(const std::shared_ptr<SyncSession>&, bool);
 
     // Initialize or tear down the subscription store based on whether or not flx_sync_requested is true

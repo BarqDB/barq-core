@@ -20,7 +20,7 @@
 
 #include <ostream>
 
-namespace barq::app {
+namespace barq::networking {
 
 namespace {
 std::string http_message(const std::string& prefix, int code)
@@ -61,7 +61,7 @@ std::ostream& operator<<(std::ostream& os, HttpMethod method)
     return os << "UNKNOWN";
 }
 
-AppError::AppError(ErrorCodes::Error ec, std::string message, std::string link,
+NetworkError::NetworkError(ErrorCodes::Error ec, std::string message, std::string link,
                    std::optional<int> additional_error_code, std::optional<std::string> server_err)
     : Exception(ec, ec == ErrorCodes::HTTPError && additional_error_code
                         ? http_message(message, *additional_error_code)
@@ -74,9 +74,9 @@ AppError::AppError(ErrorCodes::Error ec, std::string message, std::string link,
     BARQ_ASSERT(ErrorCodes::error_categories(ec).test(ErrorCategory::app_error));
 }
 
-std::ostream& operator<<(std::ostream& os, AppError error)
+std::ostream& operator<<(std::ostream& os, NetworkError error)
 {
     return os << error.server_error << ": " << error.what();
 }
 
-} // namespace barq::app
+} // namespace barq::networking

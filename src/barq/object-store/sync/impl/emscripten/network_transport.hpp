@@ -20,10 +20,10 @@
 
 namespace barq::_impl {
 
-class EmscriptenNetworkTransport final : public app::GenericNetworkTransport {
+class EmscriptenNetworkTransport final : public networking::GenericNetworkTransport {
 public:
-    virtual void send_request_to_server(const app::Request& request,
-                                        util::UniqueFunction<void(const app::Response&)>&& completion_block) final;
+    virtual void send_request_to_server(const networking::Request& request,
+                                        util::UniqueFunction<void(const networking::Response&)>&& completion_block) final;
 };
 
 } // namespace barq::_impl

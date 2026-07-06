@@ -134,9 +134,9 @@ std::string unquote_string(std::string_view possibly_quoted_string);
 #if BARQ_ENABLE_SYNC
 
 template <typename Transport>
-const std::shared_ptr<app::GenericNetworkTransport> instance_of = std::make_shared<Transport>();
+const std::shared_ptr<networking::GenericNetworkTransport> instance_of = std::make_shared<Transport>();
 
-std::ostream& operator<<(std::ostream& os, util::Optional<app::AppError> error);
+std::ostream& operator<<(std::ostream& os, util::Optional<networking::NetworkError> error);
 
 sync::SubscriptionSet subscribe_to_all(Barq& barq);
 void subscribe_to_all_and_bootstrap(Barq& barq);
@@ -146,12 +146,12 @@ void wait_for_advance(Barq& barq);
 StatusWith<std::shared_ptr<Barq>> async_open_barq(const Barq::Config& config);
 std::shared_ptr<Barq> successfully_async_open_barq(const Barq::Config& config);
 
-app::Response do_http_request(const app::Request& request);
+networking::Response do_http_request(const networking::Request& request);
 
-class SynchronousTestTransport : public app::GenericNetworkTransport {
+class SynchronousTestTransport : public networking::GenericNetworkTransport {
 public:
-    void send_request_to_server(const app::Request& request,
-                                util::UniqueFunction<void(const app::Response&)>&& completion) override
+    void send_request_to_server(const networking::Request& request,
+                                util::UniqueFunction<void(const networking::Response&)>&& completion) override
     {
         {
             std::lock_guard barrier(m_mutex);
@@ -174,18 +174,18 @@ private:
 
 template <typename BaseTransport = SynchronousTestTransport>
 class HookedTransport : public BaseTransport {
-    static_assert(std::is_base_of_v<app::GenericNetworkTransport, BaseTransport>);
+    static_assert(std::is_base_of_v<networking::GenericNetworkTransport, BaseTransport>);
 
 public:
-    void send_request_to_server(const app::Request& request,
-                                util::UniqueFunction<void(const app::Response&)>&& completion) override
+    void send_request_to_server(const networking::Request& request,
+                                util::UniqueFunction<void(const networking::Response&)>&& completion) override
     {
         if (request_hook) {
             if (auto simulated_response = request_hook(request)) {
                 return completion(*simulated_response);
             }
         }
-        BaseTransport::send_request_to_server(request, [&](app::Response response) mutable {
+        BaseTransport::send_request_to_server(request, [&](networking::Response response) mutable {
             if (response_hook) {
                 response_hook(request, response);
             }
@@ -194,9 +194,9 @@ public:
     }
 
     // Optional handler for the request and response before it is returned to completion
-    util::UniqueFunction<void(const app::Request&, app::Response&)> response_hook;
+    util::UniqueFunction<void(const networking::Request&, networking::Response&)> response_hook;
     // Optional handler for the request before it is sent to the server
-    util::UniqueFunction<std::optional<app::Response>(const app::Request&)> request_hook;
+    util::UniqueFunction<std::optional<networking::Response>(const networking::Request&)> request_hook;
 };
 
 

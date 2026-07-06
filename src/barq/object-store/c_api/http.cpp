@@ -21,7 +21,7 @@
 
 namespace barq::c_api {
 namespace {
-using namespace barq::app;
+using namespace barq::networking;
 
 static_assert(barq_http_request_method_e(HttpMethod::get) == BARQ_HTTP_REQUEST_METHOD_GET);
 static_assert(barq_http_request_method_e(HttpMethod::post) == BARQ_HTTP_REQUEST_METHOD_POST);

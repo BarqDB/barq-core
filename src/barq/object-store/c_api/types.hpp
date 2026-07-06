@@ -592,9 +592,9 @@ struct barq_sync_session_connection_state_notification_token : barq::c_api::Wrap
     uint64_t token;
 };
 
-struct barq_http_transport : barq::c_api::WrapC, std::shared_ptr<barq::app::GenericNetworkTransport> {
-    barq_http_transport(std::shared_ptr<barq::app::GenericNetworkTransport> transport)
-        : std::shared_ptr<barq::app::GenericNetworkTransport>(std::move(transport))
+struct barq_http_transport : barq::c_api::WrapC, std::shared_ptr<barq::networking::GenericNetworkTransport> {
+    barq_http_transport(std::shared_ptr<barq::networking::GenericNetworkTransport> transport)
+        : std::shared_ptr<barq::networking::GenericNetworkTransport>(std::move(transport))
     {
     }
 

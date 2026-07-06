@@ -52,12 +52,12 @@ BarqJWT::BarqJWT(std::string_view token)
 {
     auto payload = split_token(token);
     if (!payload.data()) {
-        throw app::AppError(ErrorCodes::BadToken, "malformed JWT");
+        throw networking::NetworkError(ErrorCodes::BadToken, "malformed JWT");
     }
 
     auto json_str = util::base64_decode_to_vector(payload);
     if (!json_str) {
-        throw app::AppError(ErrorCodes::BadToken, "JWT payload could not be base64 decoded");
+        throw networking::NetworkError(ErrorCodes::BadToken, "JWT payload could not be base64 decoded");
     }
 
     nlohmann::json json;
@@ -71,7 +71,7 @@ BarqJWT::BarqJWT(std::string_view token)
         }
     }
     catch (const nlohmann::json::exception& e) {
-        throw app::AppError(ErrorCodes::BadJsonParse, std::string("malformed JWT payload: ") + e.what());
+        throw networking::NetworkError(ErrorCodes::BadJsonParse, std::string("malformed JWT payload: ") + e.what());
     }
 
     this->token = token;
