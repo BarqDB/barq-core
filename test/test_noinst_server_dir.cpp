@@ -29,7 +29,7 @@ TEST(ServerDir_InvalidVirtualPath)
         "/abc+",
         "/db.barq",
         "/abc/db.barq.lock",
-        "/abc/db.barq.management",
+        "/abc/db.barq.control",
         " ",
         "/ abc",
         "/abc/*",

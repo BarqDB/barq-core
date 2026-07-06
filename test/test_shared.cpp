@@ -3171,7 +3171,7 @@ TEST(Shared_LockFileOfWrongSizeThrows)
 
     std::thread t([&]() {
         File f(path.get_lock_path(), File::mode_Write);
-        f.set_fifo_path(std::string(path) + ".management", "lock.fifo");
+        f.set_fifo_path(std::string(path) + ".control", "lock.fifo");
         f.rw_lock_shared();
         File::UnlockGuard ug(f);
 
@@ -3233,7 +3233,7 @@ TEST(Shared_LockFileOfWrongVersionThrows)
 
         File f;
         f.open(path.get_lock_path(), File::access_ReadWrite, File::create_Auto, 0); // Throws
-        f.set_fifo_path(std::string(path) + ".management", "lock.fifo");
+        f.set_fifo_path(std::string(path) + ".control", "lock.fifo");
 
         f.rw_lock_shared();
         File::UnlockGuard ug(f);
@@ -3282,7 +3282,7 @@ TEST(Shared_LockFileOfWrongMutexSizeThrows)
     std::thread t([&]() {
         File f;
         f.open(path.get_lock_path(), File::access_ReadWrite, File::create_Auto, 0); // Throws
-        f.set_fifo_path(std::string(path) + ".management", "lock.fifo");
+        f.set_fifo_path(std::string(path) + ".control", "lock.fifo");
         f.rw_lock_shared();
         File::UnlockGuard ug(f);
 
@@ -3332,7 +3332,7 @@ TEST(Shared_LockFileOfWrongCondvarSizeThrows)
     std::thread t([&]() {
         File f;
         f.open(path.get_lock_path(), File::access_ReadWrite, File::create_Auto, 0); // Throws
-        f.set_fifo_path(std::string(path) + ".management", "lock.fifo");
+        f.set_fifo_path(std::string(path) + ".control", "lock.fifo");
         f.rw_lock_shared();
         File::UnlockGuard ug(f);
 

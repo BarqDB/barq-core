@@ -176,7 +176,7 @@ public:
         /// Furthermore, each segment of the virtual path must consist of one or
         /// more characters that are either alpha-numeric or in (`_`, `-`, `.`),
         /// and each segment is not allowed to equal `.` or `..`, and must not end
-        /// with `.barq`, `.barq.lock`, or `.barq.management`. These rules are
+        /// with `.barq`, `.barq.lock`, or `.barq.control`. These rules are
         /// necessary because the C++ server currently reserves the right to use the
         /// specified path as part of the file system path of a Barq file.
         /// On a Barq Sync server, virtual paths are not coupled

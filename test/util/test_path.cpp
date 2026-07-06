@@ -301,9 +301,9 @@ void DBTestPathGuard::cleanup() const noexcept
     if (!m_do_remove)
         return;
     try {
-        do_clean_dir(m_path + ".management", ".management");
-        if (File::is_dir(m_path + ".management"))
-            remove_dir(m_path + ".management");
+        do_clean_dir(m_path + ".control", ".control");
+        if (File::is_dir(m_path + ".control"))
+            remove_dir(m_path + ".control");
         File::try_remove(get_lock_path());
     }
     catch (...) {

@@ -1127,6 +1127,10 @@ TEST_CASE("Get Barq using Async Open", "[sync][pbs][async open]") {
             }
         };
         auto user = std::make_shared<User>("barq", tsm.sync_manager());
+        // This User is constructed directly rather than via TestSyncManager::fake_user(), so it
+        // has no access token by default. Give it a valid one (as fake_user() does) — otherwise
+        // valid_token below is empty and the post-refresh bind is rejected by the server.
+        user->m_access_token = encode_fake_jwt("also_not_real");
         SyncTestFile config(user, "barq");
         auto valid_token = user->access_token();
         user->m_access_token = expired_token;
@@ -3102,7 +3106,7 @@ TEST_CASE("Barq::delete_files()") {
         Barq::delete_files(path, &did_delete);
         REQUIRE(did_delete);
         REQUIRE_FALSE(util::File::exists(path));
-        REQUIRE_FALSE(util::File::exists(path + ".management"));
+        REQUIRE_FALSE(util::File::exists(path + ".control"));
         REQUIRE_FALSE(util::File::exists(path + ".note"));
         REQUIRE_FALSE(util::File::exists(path + ".log"));
 
@@ -3115,7 +3119,7 @@ TEST_CASE("Barq::delete_files()") {
                           util::format("Cannot delete files of an open Barq: '%1' is still in use.", path));
         REQUIRE(util::File::exists(path + ".lock"));
         REQUIRE(util::File::exists(path));
-        REQUIRE(util::File::exists(path + ".management"));
+        REQUIRE(util::File::exists(path + ".control"));
 #ifndef _WIN32
         REQUIRE(util::File::exists(path + ".note"));
 #endif

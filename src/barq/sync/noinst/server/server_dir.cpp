@@ -14,10 +14,10 @@ bool valid_virt_path_segment(const std::string& seg)
     if (seg.front() == '.')
         return false;
     // Prevent spurious clashes between directory names and file names
-    // created by appending `.barq`, `.barq.lock`, or `.barq.management`
+    // created by appending `.barq`, `.barq.lock`, or `.barq.control`
     // to the last component of client specified virtual paths.
     bool possible_clash = (StringData(seg).ends_with(".barq") || StringData(seg).ends_with(".barq.lock") ||
-                           StringData(seg).ends_with(".barq.management"));
+                           StringData(seg).ends_with(".barq.control"));
     if (possible_clash)
         return false;
     std::locale c_loc = std::locale::classic();

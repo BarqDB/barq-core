@@ -161,7 +161,7 @@ public:
     DBTestPathGuard(const std::string& path);
     std::string get_lock_path() const
     {
-        return m_path + ".lock"; // ".management/access_control";
+        return m_path + ".lock"; // ".control/access_control";
     }
     ~DBTestPathGuard() noexcept;
     DBTestPathGuard(DBTestPathGuard&&) = default;
