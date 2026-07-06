@@ -1,0 +1,18 @@
+Barq
+Copyright (c) 2026 the Barq authors
+
+This product is a modified fork of Realm Core
+(https://github.com/realm/realm-core).
+
+Realm Core is Copyright (c) Realm Inc. and its contributors and is licensed
+under the Apache License, Version 2.0. The original copyright and license
+headers are retained in the source files. Those files have been modified from
+their original form as part of the Barq project; see the Git history for the
+specific changes.
+
+Barq is an independent project. It is not affiliated with, sponsored by, or
+endorsed by Realm, MongoDB, Inc., or MongoDB Atlas. "Realm", "MongoDB", and
+"MongoDB Atlas" are trademarks of MongoDB, Inc., referenced here only for
+description and attribution.
+
+Third-party component notices are provided in THIRD-PARTY-NOTICES.
