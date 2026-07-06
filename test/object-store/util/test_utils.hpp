@@ -235,14 +235,14 @@ void chmod(const std::string& path, int permissions);
     do {                                                                                                             \
         REQUIRE(util::File::exists(macro_path));                                                                     \
         REQUIRE(util::File::exists((macro_path) + ".lock"));                                                         \
-        REQUIRE_DIR_EXISTS((macro_path) + ".management");                                                            \
+        REQUIRE_DIR_EXISTS((macro_path) + ".control");                                                            \
     } while (0)
 
 #define REQUIRE_BARQ_DOES_NOT_EXIST(macro_path)                                                                     \
     do {                                                                                                             \
         REQUIRE(!util::File::exists(macro_path));                                                                    \
         REQUIRE(!util::File::exists((macro_path) + ".lock"));                                                        \
-        REQUIRE_DIR_DOES_NOT_EXIST((macro_path) + ".management");                                                    \
+        REQUIRE_DIR_DOES_NOT_EXIST((macro_path) + ".control");                                                    \
     } while (0)
 
 #define REQUIRE_THROWS_CONTAINING(expr, msg) REQUIRE_THROWS_WITH(expr, Catch::Matchers::ContainsSubstring(msg))

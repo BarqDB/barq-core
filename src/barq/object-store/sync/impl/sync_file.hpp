@@ -129,7 +129,7 @@ private:
     static constexpr const char c_metadata_barq[] = "sync_metadata.barq";
     static constexpr const char c_barq_file_suffix[] = ".barq";
     static constexpr const char c_barq_file_test_suffix[] =
-        ".rtest.management"; // Must have same length as the biggest path name we might use.
+        ".rtest.control"; // Must have same length as the biggest path name we might use.
     static constexpr const char c_legacy_sync_directory[] = "barq-object-server";
 
     std::string get_special_directory(std::string directory_name) const;

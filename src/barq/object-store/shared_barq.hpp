@@ -425,7 +425,7 @@ public:
     /**
      * Deletes the following files for the given `barq_file_path` if they exist:
      * - the Barq file itself
-     * - the .management folder
+     * - the .control folder
      * - the .note file
      * - the .log file
      *

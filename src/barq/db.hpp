@@ -403,7 +403,7 @@ public:
     enum CoreFileType : uint8_t {
         Lock,
         Storage,
-        Management,
+        Control,
         Note,
         Log,
     };

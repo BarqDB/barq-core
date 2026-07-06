@@ -1024,7 +1024,7 @@ BARQ_API bool barq_convert_with_path(const barq_t* barq, const char* path, barq_
 /**
  * Deletes the following files for the given `barq_file_path` if they exist:
  * - the Barq file itself
- * - the .management folder
+ * - the .control folder
  * - the .note file
  * - the .log file
  *

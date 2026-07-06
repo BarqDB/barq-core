@@ -119,25 +119,25 @@ TEST_CASE("sync_file: URL manipulation APIs", "[sync][file]") {
     }
 
     SECTION("properly concatenates an extension when the path has a trailing dot") {
-        const std::string expected = "/foo.management";
+        const std::string expected = "/foo.control";
         const std::string path = "/foo.";
-        const std::string component = "management";
+        const std::string component = "control";
         auto actual = file_path_by_appending_extension(path, component);
         REQUIRE(fs::path(actual) == expected);
     }
 
     SECTION("properly concatenates a path when the extension has a leading dot") {
-        const std::string expected = "/foo.management";
+        const std::string expected = "/foo.control";
         const std::string path = "/foo";
-        const std::string component = ".management";
+        const std::string component = ".control";
         auto actual = file_path_by_appending_extension(path, component);
         REQUIRE(fs::path(actual) == expected);
     }
 
     SECTION("properly concatenates a path when both arguments have dots") {
-        const std::string expected = "/foo.management";
+        const std::string expected = "/foo.control";
         const std::string path = "/foo.";
-        const std::string component = ".management";
+        const std::string component = ".control";
         auto actual = file_path_by_appending_extension(path, component);
         REQUIRE(fs::path(actual) == expected);
     }
@@ -172,13 +172,13 @@ TEST_CASE("sync_file: SyncFileManager APIs", "[sync][file]") {
             REQUIRE_NOTHROW(create_dummy_barq(expected_paths.current_preferred_path));
             REQUIRE(File::exists(expected_paths.current_preferred_path));
             REQUIRE(File::exists(expected_paths.current_preferred_path + ".lock"));
-            REQUIRE_DIR_EXISTS(expected_paths.current_preferred_path + ".management");
+            REQUIRE_DIR_EXISTS(expected_paths.current_preferred_path + ".control");
             // Delete the Barq
             REQUIRE(manager.remove_barq(identity, legacy_identities, relative_path, partition));
             // Ensure the files don't exist anymore
             REQUIRE(!File::exists(expected_paths.current_preferred_path));
             REQUIRE(!File::exists(expected_paths.current_preferred_path + ".lock"));
-            REQUIRE_DIR_DOES_NOT_EXIST(expected_paths.current_preferred_path + ".management");
+            REQUIRE_DIR_DOES_NOT_EXIST(expected_paths.current_preferred_path + ".control");
         }
 
         SECTION("deleting a Barq for an invalid user") {

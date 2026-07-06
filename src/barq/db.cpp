@@ -932,7 +932,7 @@ void DB::open(const std::string& path, const DBOptions& options)
         return;
     }
     std::string lockfile_path = get_core_file(path, CoreFileType::Lock);
-    std::string coordination_dir = get_core_file(path, CoreFileType::Management);
+    std::string coordination_dir = get_core_file(path, CoreFileType::Control);
     std::string lockfile_prefix = coordination_dir + "/access_control";
     m_alloc.set_read_only(false);
 
@@ -2636,7 +2636,7 @@ bool DB::call_with_lock(const std::string& barq_path, CallbackWithLock&& callbac
     File lockfile;
     lockfile.open(lockfile_path, File::access_ReadWrite, File::create_Auto, 0); // Throws
     File::CloseGuard fcg(lockfile);
-    lockfile.set_fifo_path(barq_path + ".management", "lock.fifo");
+    lockfile.set_fifo_path(get_core_file(barq_path, CoreFileType::Control), "lock.fifo");
     if (lockfile.try_rw_lock_exclusive()) { // Throws
         callback(barq_path);
         return true;
@@ -2651,8 +2651,8 @@ std::string DB::get_core_file(const std::string& base_path, CoreFileType type)
             return base_path + ".lock";
         case CoreFileType::Storage:
             return base_path;
-        case CoreFileType::Management:
-            return base_path + ".management";
+        case CoreFileType::Control:
+            return base_path + ".control";
         case CoreFileType::Note:
             return base_path + ".note";
         case CoreFileType::Log:
@@ -2669,7 +2669,7 @@ void DB::delete_files(const std::string& base_path, bool* did_delete, bool delet
 
     File::try_remove(get_core_file(base_path, CoreFileType::Note));
     File::try_remove(get_core_file(base_path, CoreFileType::Log));
-    util::try_remove_dir_recursive(get_core_file(base_path, CoreFileType::Management));
+    util::try_remove_dir_recursive(get_core_file(base_path, CoreFileType::Control));
 
     if (delete_lockfile) {
         File::try_remove(get_core_file(base_path, CoreFileType::Lock));
