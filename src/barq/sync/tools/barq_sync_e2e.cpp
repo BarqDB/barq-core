@@ -57,6 +57,12 @@ sync::Session::Config make_session_config(sync::port_type port, const std::share
                                                        std::optional<sync::SessionErrorInfo> error) {
         if (state == sync::ConnectionState::disconnected && error) {
             logger->error("sync disconnected: %1 (fatal=%2)", error->status, error->is_fatal);
+            if (error->is_fatal) {
+                // A fatal session error (e.g. the server denied the access token)
+                // never completes the sync waits, so report it and exit cleanly.
+                std::cerr << "REJECTED by server: " << error->status << "\n";
+                std::exit(3);
+            }
         }
     };
     return config;

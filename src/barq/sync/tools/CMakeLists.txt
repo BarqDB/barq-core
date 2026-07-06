@@ -29,6 +29,12 @@ set_target_properties(BarqSyncE2E PROPERTIES
                       DEBUG_POSTFIX "${CMAKE_DEBUG_POSTFIX}")
 target_link_libraries(BarqSyncE2E Sync Storage)
 
+add_executable(BarqEncryptionTest barq_encryption_test.cpp)
+set_target_properties(BarqEncryptionTest PROPERTIES
+                      OUTPUT_NAME "barq-encryption-test"
+                      DEBUG_POSTFIX "${CMAKE_DEBUG_POSTFIX}")
+target_link_libraries(BarqEncryptionTest Storage)
+
 install(TARGETS
     HistCommand
     ApplyToStateCommand
