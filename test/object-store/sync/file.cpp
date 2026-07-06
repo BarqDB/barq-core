@@ -1,0 +1,282 @@
+////////////////////////////////////////////////////////////////////////////
+//
+// Copyright 2016 Realm Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+////////////////////////////////////////////////////////////////////////////
+
+#include <util/test_utils.hpp>
+#include <util/test_file.hpp>
+#include <util/sync/sync_test_utils.hpp>
+
+#include <util/test_path.hpp>
+#include <barq/object-store/shared_barq.hpp>
+#include <barq/object-store/sync/sync_manager.hpp>
+
+#include <barq/util/file.hpp>
+#include <barq/util/hex_dump.hpp>
+#include <barq/util/sha_crypto.hpp>
+
+#include <array>
+
+using namespace barq;
+using namespace barq::util;
+using File = barq::util::File;
+
+static std::string hashed_partition_name(const std::string& partition)
+{
+    std::array<unsigned char, 32> hash;
+    util::sha256(partition.data(), partition.size(), hash.data());
+    return "p_" + util::hex_dump(hash.data(), hash.size(), "");
+}
+
+TEST_CASE("sync_file: percent-encoding APIs", "[sync][file]") {
+    SECTION("does not encode a string that has no restricted characters") {
+        const std::string expected = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
+        auto actual = make_percent_encoded_string(expected);
+        REQUIRE(actual == expected);
+    }
+
+    SECTION("properly encodes a sample Barq URL") {
+        const std::string expected = "barqs%3A%2F%2Fexample.com%2F%7E%2Ffoo_bar%2Fuser-barq";
+        const std::string raw_string = "barqs://example.com/~/foo_bar/user-barq";
+        auto actual = make_percent_encoded_string(raw_string);
+        REQUIRE(actual == expected);
+    }
+
+    SECTION("properly decodes a sample Barq URL") {
+        const std::string expected = "barqs://example.com/~/foo_bar/user-barq";
+        const std::string encoded_string = "barqs%3A%2F%2Fexample.com%2F%7E%2Ffoo_bar%2Fuser-barq";
+        auto actual = make_raw_string(encoded_string);
+        REQUIRE(actual == expected);
+    }
+
+    SECTION("properly encodes non-latin characters") {
+        const std::string expected = "%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82";
+        const std::string raw_string = "\xd0\xbf\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82";
+        auto actual = make_percent_encoded_string(raw_string);
+        REQUIRE(actual == expected);
+    }
+
+    SECTION("properly decodes non-latin characters") {
+        const std::string expected = "\xd0\xbf\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82";
+        const std::string encoded_string = "%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82";
+        auto actual = make_raw_string(encoded_string);
+        REQUIRE(actual == expected);
+    }
+}
+
+TEST_CASE("sync_file: URL manipulation APIs", "[sync][file]") {
+    SECTION("properly concatenates a path when the path has a trailing slash") {
+        const std::string expected = "/foo/bar";
+        const std::string path = "/foo";
+        const std::string component = "bar";
+        auto actual = file_path_by_appending_component(path, component);
+        REQUIRE(fs::path(actual) == expected);
+    }
+
+    SECTION("properly concatenates a path when the component has a leading slash") {
+        const std::string expected = "/foo/bar";
+        const std::string path = "/foo";
+        const std::string component = "bar";
+        auto actual = file_path_by_appending_component(path, component);
+        REQUIRE(fs::path(actual) == expected);
+    }
+
+    SECTION("properly concatenates a path when both arguments have slashes") {
+        const std::string expected = "/foo/bar";
+        const std::string path = "/foo";
+        const std::string component = "bar";
+        auto actual = file_path_by_appending_component(path, component);
+        REQUIRE(fs::path(actual) == expected);
+    }
+
+    SECTION("properly concatenates a directory path when the component doesn't have a trailing slash") {
+        const std::string expected = "/foo/bar/";
+        const std::string path = "/foo";
+        const std::string component = "bar";
+        auto actual = file_path_by_appending_component(path, component, FilePathType::Directory);
+        REQUIRE(fs::path(actual) == expected);
+    }
+
+    SECTION("properly concatenates a directory path when the component has a trailing slash") {
+        const std::string expected = "/foo/bar/";
+        const std::string path = "/foo";
+        const std::string component = "bar";
+        auto actual = file_path_by_appending_component(path, component, FilePathType::Directory);
+        REQUIRE(fs::path(actual) == expected);
+    }
+
+    SECTION("properly concatenates an extension when the path has a trailing dot") {
+        const std::string expected = "/foo.management";
+        const std::string path = "/foo.";
+        const std::string component = "management";
+        auto actual = file_path_by_appending_extension(path, component);
+        REQUIRE(fs::path(actual) == expected);
+    }
+
+    SECTION("properly concatenates a path when the extension has a leading dot") {
+        const std::string expected = "/foo.management";
+        const std::string path = "/foo";
+        const std::string component = ".management";
+        auto actual = file_path_by_appending_extension(path, component);
+        REQUIRE(fs::path(actual) == expected);
+    }
+
+    SECTION("properly concatenates a path when both arguments have dots") {
+        const std::string expected = "/foo.management";
+        const std::string path = "/foo.";
+        const std::string component = ".management";
+        auto actual = file_path_by_appending_extension(path, component);
+        REQUIRE(fs::path(actual) == expected);
+    }
+}
+
+TEST_CASE("sync_file: SyncFileManager APIs", "[sync][file]") {
+    barq::test_util::TestDirGuard test_dir(make_temp_dir(), false);
+    const std::string identity = "abcdefghi";
+    const std::vector<std::string> legacy_identities = {"legacy1", "legacy2"};
+    const auto& local_identity = legacy_identities[0];
+    const std::string app_id = "test_app_id*$#@!%1";
+    const std::string partition = random_string(10);
+    const std::string expected_clean_app_id = "test_app_id%2A%24%23%40%21%251";
+    const auto manager_base_path = fs::path{test_dir.c_str()}.make_preferred() / "file-manager";
+    util::try_make_dir(manager_base_path.string());
+    const auto manager_path = manager_base_path / "barq-sync" / expected_clean_app_id / "";
+    auto manager = SyncFileManager(manager_base_path.string(), app_id);
+    REQUIRE(manager.app_path() == manager_path);
+
+    SECTION("Barq path APIs") {
+        auto relative_path = hashed_partition_name(partition);
+        ExpectedBarqPaths expected_paths(manager_base_path.string(), app_id, identity, legacy_identities, partition);
+
+        SECTION("getting a Barq path") {
+            auto actual = manager.barq_file_path(identity, legacy_identities, relative_path, partition);
+            REQUIRE(expected_paths.current_preferred_path == actual);
+        }
+
+        SECTION("deleting a Barq for a valid user") {
+            manager.barq_file_path(identity, legacy_identities, relative_path, partition);
+            // Create the required files
+            REQUIRE_NOTHROW(create_dummy_barq(expected_paths.current_preferred_path));
+            REQUIRE(File::exists(expected_paths.current_preferred_path));
+            REQUIRE(File::exists(expected_paths.current_preferred_path + ".lock"));
+            REQUIRE_DIR_EXISTS(expected_paths.current_preferred_path + ".management");
+            // Delete the Barq
+            REQUIRE(manager.remove_barq(identity, legacy_identities, relative_path, partition));
+            // Ensure the files don't exist anymore
+            REQUIRE(!File::exists(expected_paths.current_preferred_path));
+            REQUIRE(!File::exists(expected_paths.current_preferred_path + ".lock"));
+            REQUIRE_DIR_DOES_NOT_EXIST(expected_paths.current_preferred_path + ".management");
+        }
+
+        SECTION("deleting a Barq for an invalid user") {
+            REQUIRE(!manager.remove_barq("invalid_user", legacy_identities, relative_path, partition));
+        }
+
+        SECTION("hashed path is used if it already exists") {
+            util::try_make_dir(manager_path.string());
+
+            REQUIRE(!File::exists(expected_paths.fallback_hashed_path));
+            REQUIRE(!File::exists(expected_paths.current_preferred_path));
+            REQUIRE_NOTHROW(create_dummy_barq(expected_paths.fallback_hashed_path));
+            REQUIRE(File::exists(expected_paths.fallback_hashed_path));
+            REQUIRE(!File::exists(expected_paths.current_preferred_path));
+            auto actual = manager.barq_file_path(identity, legacy_identities, relative_path, partition);
+            REQUIRE(actual == expected_paths.fallback_hashed_path);
+            REQUIRE(File::exists(expected_paths.fallback_hashed_path));
+            REQUIRE(!File::exists(expected_paths.current_preferred_path));
+        }
+
+        SECTION("legacy local identity path is detected and used") {
+            util::try_make_dir(manager_path.string());
+            util::try_make_dir((manager_path / local_identity).string());
+            REQUIRE(!File::exists(expected_paths.legacy_local_id_path));
+            REQUIRE(!File::exists(expected_paths.current_preferred_path));
+            REQUIRE_NOTHROW(create_dummy_barq(expected_paths.legacy_local_id_path));
+            REQUIRE(File::exists(expected_paths.legacy_local_id_path));
+            REQUIRE(!File::exists(expected_paths.current_preferred_path));
+
+            auto actual = manager.barq_file_path(identity, legacy_identities, relative_path, partition);
+            REQUIRE(actual == expected_paths.legacy_local_id_path);
+            REQUIRE(File::exists(expected_paths.legacy_local_id_path));
+            REQUIRE(!File::exists(expected_paths.current_preferred_path));
+        }
+
+        SECTION("multiple legacy local identities are supported") {
+            // ExpectedBarqPaths uses the first legacy identity, so construct
+            // a second one with only the second identity
+            const std::vector<std::string> legacy_identities_2 = {"legacy2"};
+            const auto& local_identity_2 = legacy_identities_2[0];
+            ExpectedBarqPaths expected_paths_2(manager_base_path.string(), app_id, identity, legacy_identities_2,
+                                                partition);
+
+            util::try_make_dir(manager_path.string());
+            util::try_make_dir((manager_path / local_identity_2).string());
+            REQUIRE_NOTHROW(create_dummy_barq(expected_paths_2.legacy_local_id_path));
+
+            // Note: intentionally not legacy_identities_2. We're passing both
+            // in and validating that it'll open the second one.
+            auto actual = manager.barq_file_path(identity, legacy_identities, relative_path, partition);
+            REQUIRE(actual == expected_paths_2.legacy_local_id_path);
+            REQUIRE(File::exists(expected_paths_2.legacy_local_id_path));
+            REQUIRE(!File::exists(expected_paths_2.current_preferred_path));
+        }
+
+        SECTION("legacy sync paths are detected and used") {
+            REQUIRE(!File::exists(expected_paths.legacy_sync_path));
+            REQUIRE(!File::exists(expected_paths.current_preferred_path));
+            for (auto& dir : expected_paths.legacy_sync_directories_to_make) {
+                util::try_make_dir(dir);
+            }
+            REQUIRE_NOTHROW(create_dummy_barq(expected_paths.legacy_sync_path));
+            REQUIRE(File::exists(expected_paths.legacy_sync_path));
+            REQUIRE(!File::exists(expected_paths.current_preferred_path));
+            auto actual = manager.barq_file_path(identity, legacy_identities, relative_path, partition);
+            REQUIRE(actual == expected_paths.legacy_sync_path);
+            REQUIRE(File::exists(expected_paths.legacy_sync_path));
+            REQUIRE(!File::exists(expected_paths.current_preferred_path));
+        }
+
+        SECTION("paths have a fallback hashed location if the preferred path is too long") {
+            const std::string long_path_name = std::string(500, 'a');
+            REQUIRE(long_path_name.length() > 255); // linux name length limit
+            auto actual = manager.barq_file_path(identity, legacy_identities, long_path_name, partition);
+            REQUIRE(actual.length() < 500);
+            REQUIRE_NOTHROW(create_dummy_barq(actual));
+        }
+
+        SECTION("paths have a fallbach hashed location if the preferred length is 240 > length < 255") {
+            const std::string long_path_name = std::string(241, 'a');
+            auto actual = manager.barq_file_path(identity, legacy_identities, long_path_name, partition);
+            REQUIRE_NOTHROW(create_dummy_barq(actual));
+            REQUIRE(File::exists(actual));
+        }
+    }
+
+    SECTION("Utility path APIs") {
+        const auto metadata_dir = manager_path / "server-utility" / "metadata";
+
+        SECTION("getting the metadata path") {
+            REQUIRE(manager.metadata_path() == metadata_dir / "sync_metadata.barq");
+        }
+
+        SECTION("removing the metadata Barq") {
+            manager.metadata_path();
+            REQUIRE_DIR_PATH_EXISTS(metadata_dir);
+            manager.remove_metadata_barq();
+            REQUIRE_DIR_PATH_DOES_NOT_EXIST(metadata_dir);
+        }
+    }
+}

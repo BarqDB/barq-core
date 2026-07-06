@@ -1,0 +1,277 @@
+/*************************************************************************
+ *
+ * Copyright 2016 Realm Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ **************************************************************************/
+
+#include <barq/array_backlink.hpp>
+#include <barq/util/assert.hpp>
+#include <barq/table.hpp>
+#include <barq/group.hpp>
+#include <barq/list.hpp>
+#include <barq/set.hpp>
+#include <barq/dictionary.hpp>
+
+using namespace barq;
+
+// nullify forward links corresponding to any backward links at index 'ndx'.
+void ArrayBacklink::nullify_fwd_links(size_t ndx, CascadeState& state)
+{
+    uint64_t value = Array::get(ndx);
+    if (value == 0) {
+        return;
+    }
+
+    // Naming: Links go from source to target.
+    // Backlinks go from target to source.
+    // This array holds backlinks, hence it is the target.
+    // The table which holds the corresponding fwd links is the source.
+
+    // determine target table, column and key.
+    BARQ_ASSERT_DEBUG(dynamic_cast<Cluster*>(get_parent()));
+    auto cluster = static_cast<Cluster*>(get_parent());
+    const Table* target_table = cluster->get_owning_table();
+    ColKey target_col_key = cluster->get_col_key(get_ndx_in_parent());
+    ObjKey target_key = cluster->get_real_key(ndx);
+
+    // determine the source table/col - which is the one holding the forward links
+    TableRef source_table = target_table->get_opposite_table(target_col_key);
+    ColKey src_col_key = target_table->get_opposite_column(target_col_key);
+
+    // Now follow all backlinks to their origin and clear forward links.
+    if ((value & 1) != 0) {
+        // just a single one
+        state.enqueue_for_nullification(*source_table, src_col_key, ObjKey(value >> 1),
+                                        {target_table->get_key(), target_key});
+    }
+    else {
+        // There is more than one backlink - Iterate through them all
+        ref_type ref = to_ref(value);
+        BPlusTree<int64_t> backlink_list(m_alloc);
+        backlink_list.init_from_ref(ref);
+
+        size_t sz = backlink_list.size();
+        for (size_t i = 0; i < sz; i++) {
+            state.enqueue_for_nullification(*source_table, src_col_key, ObjKey(backlink_list.get(i)),
+                                            {target_table->get_key(), target_key});
+        }
+    }
+}
+
+void ArrayBacklink::add(size_t ndx, ObjKey key)
+{
+    uint64_t value = Array::get(ndx);
+
+    // A backlink list of size 1 is stored as a single non-ref column value.
+    if (value == 0) {
+        set(ndx, key.value << 1 | 1); // Throws
+        return;
+    }
+
+    // When increasing the size of the backlink list from 1 to 2, we need to
+    // convert from the single non-ref column value representation, to a B+-tree
+    // representation.
+    BPlusTree<int64_t> backlink_list(m_alloc);
+    if ((value & 1) != 0) {
+        // Create new column to hold backlinks
+        backlink_list.create();
+        set_as_ref(ndx, backlink_list.get_ref());
+        backlink_list.add(value >> 1);
+    }
+    else {
+        backlink_list.init_from_ref(to_ref(value));
+        backlink_list.set_parent(this, ndx);
+        backlink_list.split_if_needed();
+    }
+    backlink_list.add(key.value); // Throws
+}
+
+// Return true if the last link was removed
+bool ArrayBacklink::remove(size_t ndx, ObjKey key)
+{
+    uint64_t value = Array::get(ndx);
+    BARQ_ASSERT_DEBUG(value != 0);
+    if (value == 0)
+        return true;
+
+    // If there is only a single backlink, it can be stored as
+    // a tagged value
+    if ((value & 1) != 0) {
+        BARQ_ASSERT_DEBUG(int64_t(value >> 1) == key.value);
+        if (int64_t(value >> 1) == key.value) {
+            set(ndx, 0);
+            return true;
+        }
+        return false;
+    }
+
+    // if there is a list of backlinks we have to find
+    // the right one and remove it.
+    BPlusTree<int64_t> backlink_list(m_alloc);
+    backlink_list.init_from_ref(ref_type(value));
+    backlink_list.set_parent(this, ndx);
+    backlink_list.split_if_needed();
+
+    size_t last_ndx = backlink_list.size() - 1;
+    size_t backlink_ndx = backlink_list.find_first(key.value);
+    BARQ_ASSERT_DEBUG(backlink_ndx != not_found);
+    if (backlink_ndx != not_found) {
+        if (backlink_ndx != last_ndx)
+            backlink_list.set(backlink_ndx, backlink_list.get(last_ndx));
+        backlink_list.erase(last_ndx); // Throws
+    }
+
+    // If there is only one backlink left we can inline it as tagged value
+    if (last_ndx == 1) {
+        uint64_t key_value = backlink_list.get(0);
+        backlink_list.destroy();
+
+        set(ndx, key_value << 1 | 1);
+    }
+
+    return false;
+}
+
+void ArrayBacklink::erase(size_t ndx)
+{
+    uint64_t value = Array::get(ndx);
+    if (value && (value & 1) == 0) {
+        Array::destroy_deep(ref_type(value), m_alloc);
+    }
+    Array::erase(ndx);
+}
+
+size_t ArrayBacklink::get_backlink_count(size_t ndx) const
+{
+    uint64_t value = Array::get(ndx);
+    if (value == 0) {
+        return 0;
+    }
+
+    // If there is only a single backlink, it can be stored as
+    // a tagged value
+    if ((value & 1) != 0) {
+        return 1;
+    }
+
+    // return size of list
+    MemRef mem(ref_type(value), m_alloc);
+    return BPlusTree<int64_t>::size_from_header(mem.get_addr());
+}
+
+ObjKey ArrayBacklink::get_backlink(size_t ndx, size_t index) const
+{
+    uint64_t value = Array::get(ndx);
+    BARQ_ASSERT(value != 0);
+
+    // If there is only a single backlink, it can be stored as
+    // a tagged value
+    if ((value & 1) != 0) {
+        BARQ_ASSERT(index == 0);
+        return ObjKey(int64_t(value >> 1));
+    }
+
+    BPlusTree<int64_t> backlink_list(m_alloc);
+    backlink_list.init_from_ref(ref_type(value));
+
+    BARQ_ASSERT(index < backlink_list.size());
+    return ObjKey(backlink_list.get(index));
+}
+
+void ArrayBacklink::verify() const
+{
+#ifdef BARQ_DEBUG
+    Array::verify();
+
+    BARQ_ASSERT(dynamic_cast<Cluster*>(get_parent()));
+    auto cluster = static_cast<Cluster*>(get_parent());
+    const Table* target_table = cluster->get_owning_table();
+    ColKey backlink_col_key = cluster->get_col_key(get_ndx_in_parent());
+
+    TableRef src_table = target_table->get_opposite_table(backlink_col_key);
+    ColKey src_col_key = target_table->get_opposite_column(backlink_col_key);
+
+    // Verify that each backlink has a corresponding forward link
+    for (size_t i = 0; i < size(); ++i) {
+        ObjKey target_key = cluster->get_real_key(i);
+        ObjLink target_link(target_table->get_key(), target_key);
+        auto cnt = get_backlink_count(i);
+        for (size_t j = 0; j < cnt; ++j) {
+            Obj src_obj = src_table->get_object(get_backlink(i, j));
+            if (src_col_key.is_dictionary()) {
+                BARQ_ASSERT(src_obj.get_dictionary_ptr(src_col_key)->find_any(target_link) != npos);
+                continue;
+            }
+
+            if (src_col_key.get_type() == col_type_Mixed) {
+                if (src_col_key.is_collection()) {
+                    BARQ_ASSERT(src_obj.get_collection_ptr(src_col_key)->find_any(target_link) != npos);
+                }
+                else {
+                    auto val = src_obj.get<Mixed>(src_col_key);
+                    if (val.is_type(type_TypedLink)) {
+                        BARQ_ASSERT(src_obj.get<Mixed>(src_col_key).get_link() == target_link);
+                    }
+                    else if (val.is_type(type_List)) {
+                        DummyParent parent(src_table, val.get_ref());
+                        Lst<Mixed> list(parent, 0);
+                        BARQ_ASSERT(list.find_any(target_link) != npos);
+                    }
+                    else if (val.is_type(type_Dictionary)) {
+                        DummyParent parent(src_table, val.get_ref());
+                        Dictionary dict(parent, 0);
+                        BARQ_ASSERT(dict.find_any(target_link) != npos);
+                    }
+                }
+                continue;
+            }
+
+            if (src_col_key.is_list()) {
+                BARQ_ASSERT(src_obj.get_list<ObjKey>(src_col_key).find_first(target_key) != npos);
+            }
+            else if (src_col_key.is_set()) {
+                BARQ_ASSERT(src_obj.get_set<ObjKey>(src_col_key).find(target_key) != npos);
+            }
+            else {
+                BARQ_ASSERT(src_obj.get_unfiltered_link(src_col_key) == target_key);
+            }
+        }
+    }
+#endif
+}
+
+bool ArrayBacklink::verify_backlink(size_t ndx, int64_t link)
+{
+#ifdef BARQ_DEBUG
+    uint64_t value = Array::get(ndx);
+    if (value == 0)
+        return false;
+
+    // If there is only a single backlink, it can be stored as
+    // a tagged value
+    if ((value & 1) != 0) {
+        return int64_t(value >> 1) == link;
+    }
+
+    BPlusTree<int64_t> backlink_list(m_alloc);
+    backlink_list.init_from_ref(ref_type(value));
+
+    return backlink_list.find_first(link) != barq::not_found;
+#else
+    static_cast<void>(ndx);
+    static_cast<void>(link);
+    return true;
+#endif
+}

@@ -1,0 +1,49 @@
+[
+  {
+    "primaryKey": "t1o1",
+    "int1": {
+      "$numberLong": "100"
+    },
+    "linkA": {
+      "$set": [
+        {
+          "$link": {
+            "table": "table2",
+            "key": "t2o2"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "primaryKey": "t1o3",
+    "int1": {
+      "$numberLong": "300"
+    },
+    "linkA": {
+      "$set": []
+    }
+  },
+  {
+    "primaryKey": "t1o2",
+    "int1": {
+      "$numberLong": "200"
+    },
+    "linkA": {
+      "$set": [
+        {
+          "$link": {
+            "table": "table2",
+            "key": "t2o2"
+          }
+        },
+        {
+          "$link": {
+            "table": "table2",
+            "key": "t2o3"
+          }
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,73 @@
+/*.d
+/*.o
+/util/*.d
+/util/*.o
+/impl/*.d
+/impl/*.o
+/*.libdeps
+
+# Coverage data
+/*.gcno
+/*.gcda
+/util/*.gcno
+/util/*.gcda
+/impl/*.gcno
+/impl/*.gcda
+
+# ASAN
+/*-asan
+/*-asan-noinst
+/*-asan-dbg
+/*-asan-dbg-noinst
+/*-asan-cov
+/*-asan-cov-noinst
+
+# TSAN
+/*-tsan
+/*-tsan-noinst
+/*-tsan-dbg
+/*-tsan-dbg-noinst
+/*-tsan-cov
+/*-tsan-cov-noinst
+
+/libbarq*.a
+/libbarq*.so
+/libbarq*.so.*
+/libbarq*.dylib
+
+/barq-import
+/barq-import-noinst
+/barq-import-dbg
+/barq-import-dbg-noinst
+/barq-import-cov
+/barq-import-cov-noinst
+
+/barqd
+/barqd-noinst
+/barqd-dbg
+/barqd-dbg-noinst
+/barqd-cov
+/barqd-cov-noinst
+
+/barq-config
+/barq-config-dbg
+
+/barq-config-macosx
+/barq-config-macosx-dbg
+
+# iPhone
+/barq-config-ios
+/barq-config-ios-dbg
+
+# Watch
+/barq-config-watchos
+/barq-config-watchos-dbg
+
+# TV
+/barq-config-tvos
+/barq-config-tvos-dbg
+
+/util/config.h
+
+/barq-schema-dump*
+/barq-schema-dump-dbg*

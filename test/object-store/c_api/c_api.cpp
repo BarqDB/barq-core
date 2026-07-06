@@ -1,0 +1,5900 @@
+////////////////////////////////////////////////////////////////////////////
+//
+// Copyright 2019 Realm Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+////////////////////////////////////////////////////////////////////////////
+
+#include "../util/test_file.hpp"
+#include "../util/event_loop.hpp"
+
+#include <barq.h>
+
+#include <barq/object-store/c_api/conversion.hpp>
+#include <barq/object-store/c_api/barq.hpp>
+#include <barq/object-store/c_api/types.hpp>
+#include <barq/object-store/impl/object_accessor_impl.hpp>
+#include <barq/object-store/object.hpp>
+#include <barq/object-store/sync/generic_network_transport.hpp>
+#include <barq/sync/binding_callback_thread_observer.hpp>
+#include <barq/util/base64.hpp>
+#include <barq/util/logger.hpp>
+
+#include <catch2/catch_all.hpp>
+
+#include <cstring>
+#include <numeric>
+#include <thread>
+#include <fstream>
+
+#if BARQ_ENABLE_SYNC
+#include <util/sync/sync_test_utils.hpp>
+#include "../util/test_path.hpp"
+
+#include <barq/object-store/c_api/types.hpp>
+#include <barq/object-store/sync/sync_user.hpp>
+#include <barq/sync/client_base.hpp>
+#include <barq/sync/network/websocket.hpp>
+#include <barq/sync/protocol.hpp>
+#include <barq/util/misc_errors.hpp>
+
+#include <external/json/json.hpp>
+#endif
+
+using namespace barq;
+
+extern "C" int barq_c_api_tests(const char* file);
+
+namespace {
+template <class T>
+T checked(T x)
+{
+    if (!x) {
+        barq_error_t err_info;
+        if (barq_get_last_error(&err_info)) {
+            FAIL(err_info.message);
+        }
+    }
+    return x;
+}
+
+barq_value_t barq_str_val(const char* str)
+{
+    barq_value_t val;
+    val.type = BARQ_TYPE_STRING;
+    val.string = barq_string_t{str, std::strlen(str)};
+    return val;
+}
+
+barq_value_t barq_int_val(int64_t n)
+{
+    barq_value_t val;
+    val.type = BARQ_TYPE_INT;
+    val.integer = n;
+    return val;
+}
+
+barq_value_t barq_float_val(float fnum)
+{
+    barq_value_t val;
+    val.type = BARQ_TYPE_FLOAT;
+    val.fnum = fnum;
+    return val;
+}
+
+barq_value_t barq_double_val(double dnum)
+{
+    barq_value_t val;
+    val.type = BARQ_TYPE_DOUBLE;
+    val.dnum = dnum;
+    return val;
+}
+
+barq_value_t barq_object_id_val(const char* hex_digits)
+{
+    size_t len = strlen(hex_digits);
+    BARQ_ASSERT(len == 12);
+    barq_value_t val;
+    val.type = BARQ_TYPE_OBJECT_ID;
+    for (size_t i = 0; i < 12; ++i) {
+        val.object_id.bytes[i] = uint8_t(hex_digits[i]);
+    }
+    return val;
+}
+
+barq_value_t barq_timestamp_val(int64_t seconds, int32_t nanoseconds)
+{
+    barq_value_t val;
+    val.type = BARQ_TYPE_TIMESTAMP;
+    val.timestamp.seconds = seconds;
+    val.timestamp.nanoseconds = nanoseconds;
+    return val;
+}
+
+barq_value_t barq_bool_val(bool b)
+{
+    barq_value_t val;
+    val.type = BARQ_TYPE_BOOL;
+    val.boolean = b;
+    return val;
+}
+
+barq_value_t barq_decimal_val(double d)
+{
+    barq_value_t val;
+    val.type = BARQ_TYPE_DECIMAL128;
+
+    barq::Decimal128 dec{d};
+    val.decimal128.w[0] = dec.raw()->w[0];
+    val.decimal128.w[1] = dec.raw()->w[1];
+
+    return val;
+}
+
+barq_value_t barq_decimal_nan()
+{
+    barq_value_t val;
+    val.type = BARQ_TYPE_DECIMAL128;
+
+    barq::Decimal128 dec = barq::Decimal128::nan("0");
+    val.decimal128.w[0] = dec.raw()->w[0];
+    val.decimal128.w[1] = dec.raw()->w[1];
+
+    return val;
+}
+
+barq_value_t barq_uuid_val(const char* str)
+{
+    barq_value_t val;
+    val.type = BARQ_TYPE_UUID;
+    barq::UUID uuid{barq::StringData{str}};
+    auto bytes = uuid.to_bytes();
+    for (size_t i = 0; i < 16; ++i) {
+        val.uuid.bytes[i] = bytes[i];
+    }
+    return val;
+}
+
+barq_value_t barq_binary_val(const uint8_t* bytes, size_t len)
+{
+    barq_value_t val;
+    val.type = BARQ_TYPE_BINARY;
+    val.binary.size = len;
+    val.binary.data = bytes;
+    return val;
+}
+
+barq_value_t barq_link_val(barq_class_key_t cls, barq_object_key_t obj)
+{
+    barq_value_t val;
+    val.type = BARQ_TYPE_LINK;
+    val.link.target_table = cls;
+    val.link.target = obj;
+    return val;
+}
+
+barq_value_t barq_null()
+{
+    barq_value_t null;
+    null.type = BARQ_TYPE_NULL;
+    return null;
+}
+
+std::string barq_stdstr(barq_value_t val)
+{
+    CHECK(val.type == BARQ_TYPE_STRING);
+    return std::string(val.string.data, 0, val.string.size);
+}
+
+bool barq_val_eq(barq_value_t lhs, barq_value_t rhs)
+{
+    if (lhs.type != rhs.type)
+        return false;
+
+    switch (lhs.type) {
+        case BARQ_TYPE_NULL:
+        case BARQ_TYPE_LIST:
+        case BARQ_TYPE_DICTIONARY:
+            return true;
+        case BARQ_TYPE_INT:
+            return lhs.integer == rhs.integer;
+        case BARQ_TYPE_BOOL:
+            return lhs.boolean == rhs.boolean;
+        case BARQ_TYPE_STRING:
+            return strncmp(lhs.string.data, rhs.string.data, lhs.string.size) == 0;
+        case BARQ_TYPE_BINARY:
+            return memcmp(lhs.binary.data, rhs.binary.data, lhs.binary.size) == 0;
+        case BARQ_TYPE_TIMESTAMP:
+            return lhs.timestamp.seconds == rhs.timestamp.seconds &&
+                   lhs.timestamp.nanoseconds == rhs.timestamp.nanoseconds;
+        case BARQ_TYPE_FLOAT:
+            return lhs.fnum == rhs.fnum;
+        case BARQ_TYPE_DOUBLE:
+            return lhs.dnum == rhs.dnum;
+        case BARQ_TYPE_DECIMAL128:
+            return lhs.decimal128.w[0] == rhs.decimal128.w[0] && lhs.decimal128.w[1] == rhs.decimal128.w[1];
+        case BARQ_TYPE_OBJECT_ID:
+            return memcmp(lhs.object_id.bytes, rhs.object_id.bytes, 12) == 0;
+        case BARQ_TYPE_LINK:
+            return lhs.link.target_table == rhs.link.target_table && lhs.link.target == rhs.link.target;
+        case BARQ_TYPE_UUID:
+            return memcmp(lhs.uuid.bytes, rhs.uuid.bytes, 16) == 0;
+    }
+    BARQ_TERMINATE("");
+}
+
+struct BarqReleaseDeleter {
+    void operator()(void* ptr)
+    {
+        barq_release(ptr);
+    }
+};
+
+template <class T>
+using CPtr = std::unique_ptr<T, BarqReleaseDeleter>;
+
+template <class T>
+CPtr<T> cptr(T* ptr)
+{
+    return CPtr<T>{ptr};
+}
+
+template <class T>
+CPtr<T> cptr_checked(T* ptr)
+{
+    return cptr(checked(ptr));
+}
+
+template <class T>
+CPtr<T> clone_cptr(const CPtr<T>& ptr)
+{
+    void* clone = barq_clone(ptr.get());
+    return CPtr<T>{static_cast<T*>(clone)};
+}
+
+template <class T>
+CPtr<T> clone_cptr(const T* ptr)
+{
+    void* clone = barq_clone(ptr);
+    return CPtr<T>{static_cast<T*>(clone)};
+}
+} // anonymous namespace
+
+#define CHECK_ERR(err)                                                                                               \
+    do {                                                                                                             \
+        barq_error_t _err;                                                                                          \
+        _err.message = "";                                                                                           \
+        _err.error = BARQ_ERR_NONE;                                                                                   \
+        CHECK(barq_get_last_error(&_err));                                                                          \
+        if (_err.error != err) {                                                                                     \
+            CHECK(_err.error == err);                                                                                \
+            CHECK(std::string{_err.message} == "");                                                                  \
+        }                                                                                                            \
+        else {                                                                                                       \
+            barq_clear_last_error();                                                                                \
+        }                                                                                                            \
+    } while (false);
+
+#define CHECK_ERR_CAT(err, category)                                                                                 \
+    do {                                                                                                             \
+        barq_error_t _err;                                                                                          \
+        _err.message = "";                                                                                           \
+        _err.categories = 0;                                                                                         \
+        _err.error = BARQ_ERR_NONE;                                                                                   \
+        CHECK(barq_get_last_error(&_err));                                                                          \
+        CHECK((_err.categories ^ category) == 0);                                                                    \
+        if (_err.error != err) {                                                                                     \
+            CHECK(_err.error == err);                                                                                \
+            CHECK(std::string{_err.message} == "");                                                                  \
+        }                                                                                                            \
+        else {                                                                                                       \
+            barq_clear_last_error();                                                                                \
+        }                                                                                                            \
+    } while (false);
+
+TEST_CASE("C API (C)", "[c_api]") {
+    TestFile file;
+    CHECK(barq_c_api_tests(file.path.c_str()) == 0);
+}
+
+TEST_CASE("C API (non-database)", "[c_api]") {
+    SECTION("barq_get_library_version_numbers()") {
+        int major, minor, patch;
+        const char* extra;
+        barq_get_library_version_numbers(&major, &minor, &patch, &extra);
+
+        CHECK(major == BARQ_VERSION_MAJOR);
+        CHECK(minor == BARQ_VERSION_MINOR);
+        CHECK(patch == BARQ_VERSION_PATCH);
+        CHECK(std::string{extra} == BARQ_VERSION_EXTRA);
+    }
+
+    SECTION("barq_get_library_version()") {
+        const char* version = barq_get_library_version();
+        CHECK(std::string{version} == BARQ_VERSION_STRING);
+    }
+
+    SECTION("barq_release(NULL)") {
+        // Just check that it doesn't crash.
+        barq_release(nullptr);
+    }
+
+    SECTION("barq_get_last_error()") {
+        CHECK(!barq_get_last_error(nullptr));
+        CHECK(!barq_clear_last_error());
+
+        auto synthetic = []() {
+            throw std::runtime_error("Synthetic error");
+        };
+        CHECK(!barq_wrap_exceptions(synthetic));
+
+        barq_error_t err;
+        CHECK(barq_get_last_error(&err));
+        CHECK(err.error == BARQ_ERR_RUNTIME);
+        CHECK(std::string{err.message} == "Synthetic error");
+        barq_clear_last_error();
+    }
+
+    SECTION("barq_get_last_error_as_async_error()") {
+        CHECK(!barq_get_last_error_as_async_error());
+
+        auto synthetic = []() {
+            throw std::runtime_error("Synthetic error");
+        };
+        CHECK(!barq_wrap_exceptions(synthetic));
+
+        barq_async_error_t* async_err = barq_get_last_error_as_async_error();
+        CHECK(async_err);
+
+        barq_error_t err;
+        CHECK(barq_get_async_error(async_err, &err));
+        CHECK_FALSE(barq_get_async_error(nullptr, &err));
+
+        CHECK(err.error == BARQ_ERR_RUNTIME);
+        CHECK(std::string{err.message} == "Synthetic error");
+
+        SECTION("barq_clone()") {
+            auto cloned = clone_cptr(async_err);
+            CHECK(barq_equals(async_err, cloned.get()));
+            barq_error_t err2;
+            CHECK(barq_get_async_error(cloned.get(), &err2));
+            CHECK(err2.error == BARQ_ERR_RUNTIME);
+            CHECK(std::string{err2.message} == "Synthetic error");
+        }
+
+        SECTION("barq_equals()") {
+            auto config = cptr(barq_config_new());
+            CHECK(!barq_equals(config.get(), async_err));
+            CHECK(!barq_equals(async_err, config.get()));
+        }
+
+        barq_release(async_err);
+        barq_clear_last_error();
+    }
+
+    SECTION("barq_clear_last_error()") {
+        auto synthetic = []() {
+            throw std::runtime_error("Synthetic error");
+        };
+        CHECK(!barq_wrap_exceptions(synthetic));
+
+        CHECK(barq_clear_last_error());
+        CHECK(!barq_get_last_error(nullptr));
+    }
+
+    SECTION("barq_clone() error") {
+        // barq_config_t is not clonable
+        auto config = cptr(barq_config_new());
+        CHECK(!barq_clone(config.get()));
+        CHECK_ERR(BARQ_ERR_NOT_CLONABLE);
+    }
+
+    SECTION("barq_create_thread_safe_reference() error") {
+        // barq_config_t is not sendable between threads
+        auto config = cptr(barq_config_new());
+        CHECK(!barq_create_thread_safe_reference(config.get()));
+        CHECK_ERR(BARQ_ERR_ILLEGAL_OPERATION);
+    }
+
+    SECTION("barq_is_frozen() false by default") {
+        // barq_config_t cannot be frozen, so is never frozen
+        auto config = cptr(barq_config_new());
+        CHECK(!barq_is_frozen(config.get()));
+    }
+
+    SECTION("barq_equals() with different object types returns false") {
+        auto config = cptr(barq_config_new());
+        auto schema = cptr(barq_schema_new(nullptr, 0, nullptr));
+        CHECK(!barq_equals(config.get(), schema.get()));
+        CHECK(!barq_equals(schema.get(), config.get()));
+    }
+
+    SECTION("barq_config_t") {
+        auto config = cptr(barq_config_new());
+
+        SECTION("barq_config_set_path()") {
+            barq_config_set_path(config.get(), "hello");
+            CHECK(std::string{barq_config_get_path(config.get())} == "hello");
+        }
+
+        SECTION("barq_config_set_encryption_key()") {
+            uint8_t key[64] = {0};
+            std::iota(std::begin(key), std::end(key), 0);
+            CHECK(barq_config_set_encryption_key(config.get(), key, 64));
+
+            uint8_t buffer[64];
+            size_t len = barq_config_get_encryption_key(config.get(), buffer);
+            CHECK(len == 64);
+
+            CHECK(!barq_config_set_encryption_key(config.get(), key, 63));
+            CHECK_ERR(BARQ_ERR_INVALID_ENCRYPTION_KEY);
+        }
+
+        SECTION("barq_config_set_schema()") {
+            auto empty_schema = cptr(barq_schema_new(nullptr, 0, nullptr));
+            barq_config_set_schema(config.get(), empty_schema.get());
+            auto schema = cptr(barq_config_get_schema(config.get()));
+            CHECK(schema);
+            CHECK(barq_equals(empty_schema.get(), schema.get()));
+            barq_config_set_schema(config.get(), nullptr);
+            CHECK(barq_config_get_schema(config.get()) == nullptr);
+        }
+
+        SECTION("barq_config_set_schema_version()") {
+            barq_config_set_schema_version(config.get(), 26);
+            CHECK(barq_config_get_schema_version(config.get()) == 26);
+        }
+
+        SECTION("barq_config_set_schema_mode()") {
+            auto check_mode = [&](barq_schema_mode_e mode) {
+                barq_config_set_schema_mode(config.get(), mode);
+                CHECK(barq_config_get_schema_mode(config.get()) == mode);
+            };
+            check_mode(BARQ_SCHEMA_MODE_AUTOMATIC);
+            check_mode(BARQ_SCHEMA_MODE_IMMUTABLE);
+            check_mode(BARQ_SCHEMA_MODE_READ_ONLY);
+            check_mode(BARQ_SCHEMA_MODE_SOFT_RESET_FILE);
+            check_mode(BARQ_SCHEMA_MODE_HARD_RESET_FILE);
+            check_mode(BARQ_SCHEMA_MODE_ADDITIVE_EXPLICIT);
+            check_mode(BARQ_SCHEMA_MODE_ADDITIVE_DISCOVERED);
+            check_mode(BARQ_SCHEMA_MODE_MANUAL);
+        }
+
+        SECTION("barq_config_set_schema_subset_mode()") {
+            auto check_subset_mode = [&](barq_schema_subset_mode_e mode) {
+                barq_config_set_schema_subset_mode(config.get(), mode);
+                CHECK(barq_config_get_schema_subset_mode(config.get()) == mode);
+            };
+            check_subset_mode(BARQ_SCHEMA_SUBSET_MODE_ALL_CLASSES);
+            check_subset_mode(BARQ_SCHEMA_SUBSET_MODE_ALL_PROPERTIES);
+            check_subset_mode(BARQ_SCHEMA_SUBSET_MODE_COMPLETE);
+            check_subset_mode(BARQ_SCHEMA_SUBSET_MODE_STRICT);
+        }
+
+        SECTION("barq_config_set_disable_format_upgrade()") {
+            barq_config_set_disable_format_upgrade(config.get(), true);
+            CHECK(barq_config_get_disable_format_upgrade(config.get()) == true);
+            barq_config_set_disable_format_upgrade(config.get(), false);
+            CHECK(barq_config_get_disable_format_upgrade(config.get()) == false);
+        }
+
+        SECTION("barq_config_set_automatic_change_notifications()") {
+            barq_config_set_automatic_change_notifications(config.get(), true);
+            CHECK(barq_config_get_automatic_change_notifications(config.get()) == true);
+            barq_config_set_automatic_change_notifications(config.get(), false);
+            CHECK(barq_config_get_automatic_change_notifications(config.get()) == false);
+        }
+
+        SECTION("barq_config_set_force_sync_history()") {
+            barq_config_set_force_sync_history(config.get(), true);
+            CHECK(barq_config_get_force_sync_history(config.get()) == true);
+            barq_config_set_force_sync_history(config.get(), false);
+            CHECK(barq_config_get_force_sync_history(config.get()) == false);
+        }
+
+        SECTION("barq_config_set_max_number_of_active_versions()") {
+            barq_config_set_max_number_of_active_versions(config.get(), 999);
+            CHECK(barq_config_get_max_number_of_active_versions(config.get()) == 999);
+        }
+
+        SECTION("barq_config_set_in_memory()") {
+            barq_config_set_in_memory(config.get(), true);
+            CHECK(barq_config_get_in_memory(config.get()) == true);
+        }
+
+        SECTION("barq_config_set_fifo_path()") {
+            barq_config_set_fifo_path(config.get(), "test_path.FIFO");
+            CHECK(std::string{barq_config_get_fifo_path(config.get())} == "test_path.FIFO");
+        }
+    }
+
+    SECTION("barq_error_t is properly initialized from Status") {
+        Status status(ErrorCodes::RuntimeError, "I am a runtime error!");
+        barq_error_t c_err = c_api::to_capi(status);
+        REQUIRE(c_err.error == BARQ_ERR_RUNTIME);
+        REQUIRE(c_err.message == status.reason());
+        REQUIRE(c_err.categories == BARQ_ERR_CAT_RUNTIME);
+        REQUIRE(c_err.path == nullptr);
+        REQUIRE(c_err.user_code_error == nullptr);
+    }
+
+#if BARQ_ENABLE_SYNC
+    SECTION("sync_client_config_t") {
+        auto test_sync_client_config = cptr(barq_sync_client_config_new());
+        auto sync_client_config = test_sync_client_config.get();
+
+        barq_sync_client_config_set_reconnect_mode(sync_client_config, BARQ_SYNC_CLIENT_RECONNECT_MODE_TESTING);
+        CHECK(sync_client_config->reconnect_mode ==
+              static_cast<ReconnectMode>(BARQ_SYNC_CLIENT_RECONNECT_MODE_TESTING));
+        barq_sync_client_config_set_multiplex_sessions(sync_client_config, true);
+        CHECK(sync_client_config->multiplex_sessions);
+        barq_sync_client_config_set_multiplex_sessions(sync_client_config, false);
+        barq_sync_client_config_set_user_agent_binding_info(sync_client_config, "some user agent stg");
+        barq_sync_client_config_set_user_agent_application_info(sync_client_config, "some application");
+        barq_sync_client_config_set_connect_timeout(sync_client_config, 666);
+        barq_sync_client_config_set_connection_linger_time(sync_client_config, 999);
+        barq_sync_client_config_set_ping_keepalive_period(sync_client_config, 555);
+        barq_sync_client_config_set_pong_keepalive_timeout(sync_client_config, 100000);
+        barq_sync_client_config_set_fast_reconnect_limit(sync_client_config, 1099);
+        barq_sync_client_config_set_resumption_delay_interval(sync_client_config, 1024);
+        barq_sync_client_config_set_max_resumption_delay_interval(sync_client_config, 600024);
+        barq_sync_client_config_set_resumption_delay_backoff_multiplier(sync_client_config, 1010);
+        auto verify_sync_client_config = [](SyncClientConfig* config) {
+            CHECK_FALSE(config->multiplex_sessions);
+            CHECK(config->user_agent_binding_info == "some user agent stg");
+            CHECK(config->user_agent_application_info == "some application");
+            CHECK(config->timeouts.connect_timeout == 666);
+            CHECK(config->timeouts.connection_linger_time == 999);
+            CHECK(config->timeouts.ping_keepalive_period == 555);
+            CHECK(config->timeouts.pong_keepalive_timeout == 100000);
+            CHECK(config->timeouts.fast_reconnect_limit == 1099);
+            CHECK(config->timeouts.reconnect_backoff_info.resumption_delay_interval.count() == 1024);
+            CHECK(config->timeouts.reconnect_backoff_info.max_resumption_delay_interval.count() == 600024);
+            CHECK(config->timeouts.reconnect_backoff_info.resumption_delay_backoff_multiplier == 1010);
+        };
+        verify_sync_client_config(sync_client_config);
+    }
+
+    SECTION("barq sync manager") {
+        auto config = cptr(barq_sync_client_config_new());
+        auto sync_manager = cptr(barq_sync_manager_create(config.get()));
+    }
+
+    SECTION("barq custom user") {
+        struct CustomUser {
+            CustomUser(std::string app_id, std::string user_id)
+                : m_app_id(app_id)
+                , m_user_id(user_id)
+                , m_access_token(util::format("access token for %1", m_user_id))
+                , m_refresh_token(util::format("refresh token for %1", m_user_id))
+            {
+                m_fake_app_error.message = "my fake error message";
+                m_fake_app_error.error = BARQ_ERR_CUSTOM_ERROR;
+                m_fake_app_error.http_status_code = 42;
+                m_fake_app_error.link_to_server_logs = "link to fake logs";
+                m_fake_app_error.categories = 0;
+            }
+
+            std::string m_app_id;
+            std::string m_user_id;
+            std::string m_access_token;
+            std::string m_refresh_token;
+            SyncUser::State m_state = SyncUser::State::LoggedIn;
+            bool m_access_token_refresh_required = false;
+            std::shared_ptr<SyncManager> m_sync_manager;
+            size_t m_log_out_requested_count = 0;
+            barq_app_error_t m_fake_app_error;
+            std::string m_track_barq_state;
+            std::string m_file_action_state;
+
+            const char* get_access_token()
+            {
+                return m_access_token.data();
+            }
+            const char* get_refresh_token()
+            {
+                return m_refresh_token.data();
+            }
+        };
+
+        auto cb_access_token = [](barq_userdata_t data) -> const char* {
+            CustomUser* user = static_cast<CustomUser*>(data);
+            return user->get_access_token();
+        };
+        auto cb_refresh_token = [](barq_userdata_t data) -> const char* {
+            CustomUser* user = static_cast<CustomUser*>(data);
+            return user->get_refresh_token();
+        };
+        auto cb_state = [](barq_userdata_t data) -> barq_user_state_e {
+            CustomUser* user = static_cast<CustomUser*>(data);
+            return barq_user_state_e(user->m_state);
+        };
+        auto cb_atrr = [](barq_userdata_t data) -> bool {
+            CustomUser* user = static_cast<CustomUser*>(data);
+            return user->m_access_token_refresh_required;
+        };
+        auto cb_sync_manager = [](barq_userdata_t data) -> barq_sync_manager_t* {
+            CustomUser* user = static_cast<CustomUser*>(data);
+            return static_cast<barq_sync_manager_t*>(&user->m_sync_manager);
+        };
+        auto cb_request_log_out = [](barq_userdata_t data) {
+            CustomUser* user = static_cast<CustomUser*>(data);
+            ++user->m_log_out_requested_count;
+        };
+        auto cb_request_refresh_location = [](barq_userdata_t data, barq_user_void_completion_func_t cb,
+                                              barq_userdata_t cb_data) {
+            CustomUser* user = static_cast<CustomUser*>(data);
+            cb(cb_data, &user->m_fake_app_error);
+        };
+        auto cb_request_access_token = [](barq_userdata_t data, barq_user_void_completion_func_t cb,
+                                          barq_userdata_t cb_data) {
+            CustomUser* user = static_cast<CustomUser*>(data);
+            cb(cb_data, &user->m_fake_app_error);
+        };
+        auto cb_track_barq = [](barq_userdata_t data, const char* path) {
+            CustomUser* user = static_cast<CustomUser*>(data);
+            user->m_track_barq_state = util::format("tracked_%1", path);
+        };
+        auto cb_create_file_action = [](barq_userdata_t data, barq_sync_file_action_e action,
+                                        const char* original_path,
+                                        const char* requested_recovery_dir) -> const char* {
+            CustomUser* user = static_cast<CustomUser*>(data);
+            user->m_file_action_state =
+                util::format("action_%1_%2_%3", action, original_path, requested_recovery_dir);
+            return user->m_file_action_state.data();
+        };
+
+        TestSyncManager test_sync_manager;
+        CustomUser custom_user("my_app_id", "User1");
+
+        barq_sync_user_create_config_t config;
+        config.userdata = &custom_user;
+        config.free_func = nullptr;
+        config.app_id = custom_user.m_app_id.data();
+        config.user_id = custom_user.m_user_id.data();
+        config.access_token_cb = cb_access_token;
+        config.refresh_token_cb = cb_refresh_token;
+        config.state_cb = cb_state;
+        config.atrr_cb = cb_atrr;
+        config.sync_manager_cb = cb_sync_manager;
+        config.request_log_out_cb = cb_request_log_out;
+        config.request_refresh_location_cb = cb_request_refresh_location;
+        config.request_access_token_cb = cb_request_access_token;
+        config.track_barq_cb = cb_track_barq;
+        config.create_fa_cb = cb_create_file_action;
+
+        auto sync_user = cptr(barq_user_new(config));
+        SyncUser* cxx_user = (*(sync_user.get())).get();
+
+        {
+            auto access_token = cxx_user->access_token();
+            CHECK(access_token == "access token for User1");
+        }
+        {
+            auto refresh_token = cxx_user->refresh_token();
+            CHECK(refresh_token == "refresh token for User1");
+        }
+        {
+            CHECK(cxx_user->state() == SyncUser::State::LoggedIn);
+            custom_user.m_state = SyncUser::State::LoggedOut;
+            CHECK(cxx_user->state() == SyncUser::State::LoggedOut);
+            custom_user.m_state = SyncUser::State::Removed;
+            CHECK(cxx_user->state() == SyncUser::State::Removed);
+        }
+        {
+            CHECK(!cxx_user->access_token_refresh_required());
+            custom_user.m_access_token_refresh_required = true;
+            CHECK(cxx_user->access_token_refresh_required());
+        }
+        {
+            CHECK(!cxx_user->sync_manager());
+            custom_user.m_sync_manager = test_sync_manager.sync_manager();
+            CHECK(cxx_user->sync_manager());
+        }
+        {
+            CHECK(custom_user.m_log_out_requested_count == 0);
+            cxx_user->request_log_out();
+            cxx_user->request_log_out();
+            CHECK(custom_user.m_log_out_requested_count == 2);
+        }
+        size_t completions = 0;
+        auto verify_completion = [&custom_user, &completions](std::optional<barq::app::AppError> err) {
+            CHECK(err);
+            CHECK(int(err->code()) == int(custom_user.m_fake_app_error.error));
+            CHECK(err->reason() == custom_user.m_fake_app_error.message);
+            CHECK(err->link_to_server_logs == custom_user.m_fake_app_error.link_to_server_logs);
+            CHECK(err->additional_status_code == custom_user.m_fake_app_error.http_status_code);
+            ++completions;
+        };
+        {
+            cxx_user->request_refresh_location(verify_completion);
+            CHECK(completions == 1);
+        }
+        {
+            cxx_user->request_access_token(verify_completion);
+            CHECK(completions == 2);
+        }
+        {
+            CHECK(custom_user.m_track_barq_state == "");
+            cxx_user->track_barq("foobar");
+            CHECK(custom_user.m_track_barq_state == "tracked_foobar");
+        }
+        {
+            CHECK(custom_user.m_file_action_state == "");
+            cxx_user->create_file_action(SyncFileAction::BackUpThenDeleteBarq, "some-path", "dir-requested");
+            CHECK(custom_user.m_file_action_state == "action_1_some-path_dir-requested");
+        }
+    }
+
+#endif // BARQ_ENABLE_SYNC
+}
+
+namespace {
+
+/// Generate barq_property_info_t for all possible property types.
+std::vector<barq_property_info_t> all_property_types(const char* link_target)
+{
+    std::vector<barq_property_info_t> properties;
+
+    static const char* names[] = {
+        "int", "bool", "string", "binary", "timestamp", "float", "double", "decimal", "object_id", "uuid",
+    };
+    static const char* nullable_names[] = {
+        "nullable_int",   "nullable_bool",   "nullable_string",  "nullable_binary",    "nullable_timestamp",
+        "nullable_float", "nullable_double", "nullable_decimal", "nullable_object_id", "nullable_uuid",
+    };
+    static const char* list_names[] = {
+        "int_list",   "bool_list",   "string_list",  "binary_list",    "timestamp_list",
+        "float_list", "double_list", "decimal_list", "object_id_list", "uuid_list",
+    };
+    static const char* nullable_list_names[] = {
+        "nullable_int_list",       "nullable_bool_list",  "nullable_string_list", "nullable_binary_list",
+        "nullable_timestamp_list", "nullable_float_list", "nullable_double_list", "nullable_decimal_list",
+        "nullable_object_id_list", "nullable_uuid_list",
+    };
+    static const char* set_names[] = {
+        "int_set",   "bool_set",   "string_set",  "binary_set",    "timestamp_set",
+        "float_set", "double_set", "decimal_set", "object_id_set", "uuid_set",
+    };
+    static const char* nullable_set_names[] = {
+        "nullable_int_set",       "nullable_bool_set",  "nullable_string_set", "nullable_binary_set",
+        "nullable_timestamp_set", "nullable_float_set", "nullable_double_set", "nullable_decimal_set",
+        "nullable_object_id_set", "nullable_uuid_set",
+    };
+    static const char* dict_names[] = {
+        "int_dict",   "bool_dict",   "string_dict",  "binary_dict",    "timestamp_dict",
+        "float_dict", "double_dict", "decimal_dict", "object_id_dict", "uuid_dict",
+    };
+    static const char* nullable_dict_names[] = {
+        "nullable_int_dict",       "nullable_bool_dict",  "nullable_string_dict", "nullable_binary_dict",
+        "nullable_timestamp_dict", "nullable_float_dict", "nullable_double_dict", "nullable_decimal_dict",
+        "nullable_object_id_dict", "nullable_uuid_dict",
+    };
+    static const barq_property_type_e types[] = {
+        BARQ_PROPERTY_TYPE_INT,       BARQ_PROPERTY_TYPE_BOOL,  BARQ_PROPERTY_TYPE_STRING, BARQ_PROPERTY_TYPE_BINARY,
+        BARQ_PROPERTY_TYPE_TIMESTAMP, BARQ_PROPERTY_TYPE_FLOAT, BARQ_PROPERTY_TYPE_DOUBLE, BARQ_PROPERTY_TYPE_DECIMAL128,
+        BARQ_PROPERTY_TYPE_OBJECT_ID, BARQ_PROPERTY_TYPE_UUID,
+    };
+
+    size_t num_names = std::distance(std::begin(names), std::end(names));
+    size_t num_nullable_names = std::distance(std::begin(nullable_names), std::end(nullable_names));
+    size_t num_list_names = std::distance(std::begin(list_names), std::end(list_names));
+    size_t num_nullable_list_names = std::distance(std::begin(nullable_list_names), std::end(nullable_list_names));
+    size_t num_set_names = std::distance(std::begin(set_names), std::end(set_names));
+    size_t num_nullable_set_names = std::distance(std::begin(nullable_set_names), std::end(nullable_set_names));
+    size_t num_dict_names = std::distance(std::begin(dict_names), std::end(dict_names));
+    size_t num_nullable_dict_names = std::distance(std::begin(nullable_dict_names), std::end(nullable_dict_names));
+    size_t num_types = std::distance(std::begin(types), std::end(types));
+
+    BARQ_ASSERT(num_names == num_types);
+    BARQ_ASSERT(num_nullable_names == num_types);
+    BARQ_ASSERT(num_list_names == num_types);
+    BARQ_ASSERT(num_nullable_list_names == num_types);
+    BARQ_ASSERT(num_set_names == num_types);
+    BARQ_ASSERT(num_nullable_set_names == num_types);
+    BARQ_ASSERT(num_dict_names == num_types);
+    BARQ_ASSERT(num_nullable_dict_names == num_types);
+
+    for (size_t i = 0; i < num_names; ++i) {
+        const char* public_name = i == 0 ? "public_int" : "";
+        barq_property_info_t normal{
+            names[i],
+            public_name,
+            types[i],
+            BARQ_COLLECTION_TYPE_NONE,
+            "",
+            "",
+            BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NORMAL,
+        };
+        barq_property_info_t nullable{
+            nullable_names[i],     "", types[i], BARQ_COLLECTION_TYPE_NONE, "", "", BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NULLABLE,
+        };
+        barq_property_info_t list{
+            list_names[i],       "", types[i], BARQ_COLLECTION_TYPE_LIST, "", "", BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NORMAL,
+        };
+        barq_property_info_t nullable_list{
+            nullable_list_names[i], "", types[i], BARQ_COLLECTION_TYPE_LIST, "", "", BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NULLABLE,
+        };
+        barq_property_info_t set{
+            set_names[i],        "", types[i], BARQ_COLLECTION_TYPE_SET, "", "", BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NORMAL,
+        };
+        barq_property_info_t nullable_set{
+            nullable_set_names[i], "", types[i], BARQ_COLLECTION_TYPE_SET, "", "", BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NULLABLE,
+        };
+        barq_property_info_t dict{
+            dict_names[i],       "", types[i], BARQ_COLLECTION_TYPE_DICTIONARY, "", "", BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NORMAL,
+        };
+        barq_property_info_t nullable_dict{
+            nullable_dict_names[i], "", types[i], BARQ_COLLECTION_TYPE_DICTIONARY, "", "", BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NULLABLE,
+        };
+
+        properties.push_back(normal);
+        properties.push_back(nullable);
+        properties.push_back(list);
+        properties.push_back(nullable_list);
+        properties.push_back(set);
+        properties.push_back(nullable_set);
+        properties.push_back(dict);
+        properties.push_back(nullable_dict);
+    }
+
+    barq_property_info_t link{
+        "link",      "", BARQ_PROPERTY_TYPE_OBJECT, BARQ_COLLECTION_TYPE_NONE,
+        link_target, "", BARQ_INVALID_PROPERTY_KEY, BARQ_PROPERTY_NULLABLE,
+    };
+    barq_property_info_t link_list{
+        "link_list", "", BARQ_PROPERTY_TYPE_OBJECT, BARQ_COLLECTION_TYPE_LIST,
+        link_target, "", BARQ_INVALID_PROPERTY_KEY, BARQ_PROPERTY_NORMAL,
+    };
+    barq_property_info_t link_set{
+        "link_set",  "", BARQ_PROPERTY_TYPE_OBJECT, BARQ_COLLECTION_TYPE_SET,
+        link_target, "", BARQ_INVALID_PROPERTY_KEY, BARQ_PROPERTY_NORMAL,
+    };
+    barq_property_info_t link_dict{
+        "link_dict", "", BARQ_PROPERTY_TYPE_OBJECT, BARQ_COLLECTION_TYPE_DICTIONARY,
+        link_target, "", BARQ_INVALID_PROPERTY_KEY, BARQ_PROPERTY_NULLABLE,
+    };
+
+    properties.push_back(link);
+    properties.push_back(link_list);
+    properties.push_back(link_set);
+    properties.push_back(link_dict);
+
+    barq_property_info_t mixed{
+        "mixed", "", BARQ_PROPERTY_TYPE_MIXED,  BARQ_COLLECTION_TYPE_NONE,
+        "",      "", BARQ_INVALID_PROPERTY_KEY, BARQ_PROPERTY_NULLABLE,
+    };
+    // barq_property_info_t mixed_list{
+    //     "mixed_list", "", BARQ_PROPERTY_TYPE_MIXED,  BARQ_COLLECTION_TYPE_LIST,
+    //     "",           "", BARQ_INVALID_PROPERTY_KEY, BARQ_PROPERTY_NORMAL,
+    // };
+
+    properties.push_back(mixed);
+    // properties.push_back(mixed_list);
+
+    return properties;
+}
+
+CPtr<barq_schema_t> make_schema()
+{
+    auto foo_properties = all_property_types("Bar");
+
+    const barq_class_info_t classes[3] = {
+        {
+            "Foo",
+            "",                    // primary key
+            foo_properties.size(), // properties
+            0,                     // computed_properties
+            BARQ_INVALID_CLASS_KEY,
+            BARQ_CLASS_NORMAL,
+        },
+        {
+            "Bar",
+            "int", // primary key
+            5,     // properties
+            1,     // computed properties,
+            BARQ_INVALID_CLASS_KEY,
+            BARQ_CLASS_NORMAL,
+        },
+        {
+            "Embedded",
+            "", // primary key
+            1,  // properties
+            0,  // computed properties,
+            BARQ_INVALID_CLASS_KEY,
+            BARQ_CLASS_EMBEDDED,
+        },
+    };
+
+    const barq_property_info_t bar_properties[6] = {
+        {
+            "int",
+            "",
+            BARQ_PROPERTY_TYPE_INT,
+            BARQ_COLLECTION_TYPE_NONE,
+            "",
+            "",
+            BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_INDEXED | BARQ_PROPERTY_PRIMARY_KEY,
+        },
+        {
+            "strings",
+            "",
+            BARQ_PROPERTY_TYPE_STRING,
+            BARQ_COLLECTION_TYPE_LIST,
+            "",
+            "",
+            BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NORMAL | BARQ_PROPERTY_NULLABLE,
+        },
+        {
+            "doubles",
+            "",
+            BARQ_PROPERTY_TYPE_DOUBLE,
+            BARQ_COLLECTION_TYPE_NONE,
+            "",
+            "",
+            BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NORMAL,
+        },
+        {
+            "sub",
+            "",
+            BARQ_PROPERTY_TYPE_OBJECT,
+            BARQ_COLLECTION_TYPE_NONE,
+            "Embedded",
+            "",
+            BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NULLABLE,
+        },
+        {
+            "sub_list",
+            "",
+            BARQ_PROPERTY_TYPE_OBJECT,
+            BARQ_COLLECTION_TYPE_LIST,
+            "Embedded",
+            "",
+            BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NORMAL,
+        },
+        {
+            "linking_objects",
+            "",
+            BARQ_PROPERTY_TYPE_LINKING_OBJECTS,
+            BARQ_COLLECTION_TYPE_LIST,
+            "Foo",
+            "link_list",
+            BARQ_INVALID_PROPERTY_KEY,
+            BARQ_PROPERTY_NORMAL,
+        },
+    };
+
+    const barq_property_info_t embedded_properties[1] = {{
+        "int",
+        "",
+        BARQ_PROPERTY_TYPE_INT,
+        BARQ_COLLECTION_TYPE_NONE,
+        "",
+        "",
+        BARQ_INVALID_PROPERTY_KEY,
+        BARQ_PROPERTY_NORMAL,
+    }};
+    const barq_property_info_t* class_properties[3] = {foo_properties.data(), bar_properties, embedded_properties};
+
+    return cptr(barq_schema_new(classes, 3, class_properties));
+}
+
+CPtr<barq_config_t> make_config(const char* filename, bool set_schema = true)
+{
+    auto config = cptr(barq_config_new());
+    barq_config_set_path(config.get(), filename);
+    barq_config_set_schema_mode(config.get(), BARQ_SCHEMA_MODE_AUTOMATIC);
+
+    if (set_schema) {
+        auto schema = make_schema();
+        CHECK(checked(schema.get()));
+        REQUIRE(checked(barq_schema_validate(schema.get(), BARQ_SCHEMA_VALIDATION_BASIC)));
+        barq_config_set_schema(config.get(), schema.get());
+        barq_config_set_schema_version(config.get(), 0);
+    }
+
+    barq_config_set_automatic_change_notifications(config.get(), true);
+    barq_config_set_max_number_of_active_versions(config.get(), 1000);
+
+    return config;
+}
+
+struct ConfigUserdata {
+    size_t num_initializations = 0;
+    size_t num_migrations = 0;
+    size_t num_compact_on_launch = 0;
+};
+
+bool initialize_data(void* userdata_p, barq_t*)
+{
+    auto userdata = static_cast<ConfigUserdata*>(userdata_p);
+    ++userdata->num_initializations;
+    return true;
+}
+
+void free_data(void* userdata_p)
+{
+    free(userdata_p);
+}
+
+void delete_data(void* userdata_p)
+{
+    delete static_cast<ConfigUserdata*>(userdata_p);
+}
+
+bool migrate_schema(void* userdata_p, barq_t* old, barq_t* new_, const barq_schema_t*)
+{
+    auto userdata = static_cast<ConfigUserdata*>(userdata_p);
+    static_cast<void>(old);
+    static_cast<void>(new_);
+    ++userdata->num_migrations;
+    REQUIRE_FALSE((*old)->auto_refresh());
+    return true;
+}
+
+bool migrate_schema_delete_old_table(void* userdata_p, barq_t* old, barq_t* new_, const barq_schema_t*)
+{
+    auto userdata = static_cast<ConfigUserdata*>(userdata_p);
+    static_cast<void>(old);
+    static_cast<void>(new_);
+    ++userdata->num_migrations;
+    bool table_deleted = false;
+    CHECK(checked(barq_remove_table(new_, "Foo", &table_deleted)));
+    CHECK(table_deleted);
+    return table_deleted;
+}
+
+bool migrate_schema_rename_prop(void* userdata_p, barq_t* old, barq_t* new_, const barq_schema_t* schema)
+{
+    auto userdata = static_cast<ConfigUserdata*>(userdata_p);
+    static_cast<void>(old);
+    static_cast<void>(new_);
+    ++userdata->num_migrations;
+    CHECK(barq_schema_rename_property(new_, (barq_schema_t*)schema, "Foo", "int", "int_new"));
+    return true;
+}
+
+bool should_compact_on_launch(void* userdata_p, uint64_t, uint64_t)
+{
+    auto userdata = static_cast<ConfigUserdata*>(userdata_p);
+    ++userdata->num_compact_on_launch;
+    return false;
+}
+
+struct LogUserData {
+    std::vector<std::pair<std::string, std::string>> log;
+};
+
+void barq_log_func(barq_userdata_t u, const char* category, barq_log_level_e, const char* message)
+{
+    LogUserData* userdata = static_cast<LogUserData*>(u);
+    userdata->log.emplace_back(std::make_pair(category, message));
+}
+
+barq_t* open_barq(TestFile& test_file)
+{
+    auto schema = make_schema();
+    CHECK(checked(schema.get()));
+    REQUIRE(checked(barq_schema_validate(schema.get(), BARQ_SCHEMA_VALIDATION_BASIC)));
+
+    auto config = make_config(test_file.path.c_str(), false);
+
+    auto barq = barq_open(config.get());
+    REQUIRE(checked(barq));
+    REQUIRE(checked(barq_update_schema(barq, schema.get())));
+
+    CHECK(!barq_equals(barq, nullptr));
+
+    auto barq2 = cptr(barq_open(config.get()));
+    CHECK(checked(barq2.get()));
+    CHECK(!barq_equals(barq, barq2.get()));
+    CHECK(barq_equals(barq, barq));
+
+    return barq;
+}
+
+} // anonymous namespace
+
+TEST_CASE("C API - schema", "[c_api]") {
+    TestFile test_file;
+
+    SECTION("schema in config") {
+        TestFile test_file_2;
+
+        auto schema = make_schema();
+        CHECK(checked(schema.get()));
+        REQUIRE(checked(barq_schema_validate(schema.get(), BARQ_SCHEMA_VALIDATION_BASIC)));
+        auto config = cptr(barq_config_new());
+        barq_config_set_path(config.get(), test_file_2.path.c_str());
+        barq_config_set_schema_mode(config.get(), BARQ_SCHEMA_MODE_AUTOMATIC);
+        barq_config_set_schema_version(config.get(), 0);
+        barq_config_set_schema(config.get(), schema.get());
+
+        // no local schema version yet
+        REQUIRE(barq_get_persisted_schema_version(config.get()) == (uint64_t)-1);
+
+        SECTION("error on open") {
+            {
+                std::ofstream o(test_file_2.path.c_str());
+                o << "Mary had a little lamb" << std::endl;
+            }
+            CHECK(!barq_open(config.get()));
+            barq_error_t err;
+            CHECK(barq_get_last_error(&err));
+            REQUIRE(test_file_2.path == err.path);
+            CHECK(barq_clear_last_error());
+        }
+
+        SECTION("data initialization callback") {
+            ConfigUserdata userdata;
+            barq_config_set_data_initialization_function(config.get(), initialize_data, &userdata, nullptr);
+            auto barq = cptr_checked(barq_open(config.get()));
+            CHECK(userdata.num_initializations == 1);
+            REQUIRE(barq_get_persisted_schema_version(config.get()) == 0);
+        }
+
+        SECTION("data initialization callback error") {
+            ConfigUserdata* userdata = new ConfigUserdata();
+            barq_config_set_data_initialization_function(
+                config.get(),
+                [](void*, barq_t*) {
+                    return false;
+                },
+                userdata, delete_data);
+            CHECK(!barq_open(config.get()));
+            CHECK_ERR(BARQ_ERR_CALLBACK);
+        }
+
+        SECTION("migration callback") {
+            ConfigUserdata userdata;
+            barq_config_set_migration_function(config.get(), migrate_schema, &userdata, nullptr);
+            auto barq = cptr_checked(barq_open(config.get()));
+            CHECK(userdata.num_migrations == 0);
+            REQUIRE(barq_get_persisted_schema_version(config.get()) == 0);
+            barq.reset();
+
+            auto config2 = cptr(barq_config_new());
+            auto empty_schema = cptr(barq_schema_new(nullptr, 0, nullptr));
+            barq_config_set_path(config2.get(), test_file_2.path.c_str());
+            barq_config_set_schema_mode(config2.get(), BARQ_SCHEMA_MODE_AUTOMATIC);
+            barq_config_set_schema_version(config2.get(), 999);
+            barq_config_set_schema(config2.get(), empty_schema.get());
+            barq_config_set_migration_function(config2.get(), migrate_schema, &userdata, nullptr);
+            auto barq2 = cptr_checked(barq_open(config2.get()));
+            CHECK(userdata.num_migrations == 1);
+            REQUIRE(barq_get_persisted_schema_version(config2.get()) == 999);
+        }
+
+        SECTION("migrate schema and delete old table") {
+            TestFile test_file_3;
+            ConfigUserdata userdata;
+
+            barq_config_set_migration_function(config.get(), migrate_schema_delete_old_table, &userdata, nullptr);
+            const barq_class_info_t foo_class[1] = {{
+                "Foo",
+                "int",
+                1,
+                0,
+                BARQ_INVALID_CLASS_KEY,
+                BARQ_CLASS_NORMAL,
+            }};
+            const barq_class_info_t bar_class[1] = {{
+                "Bar",
+                "int",
+                1,
+                0,
+                BARQ_INVALID_CLASS_KEY,
+                BARQ_CLASS_NORMAL,
+            }};
+            const barq_property_info_t properties[1] = {
+                {
+                    "int",
+                    "",
+                    BARQ_PROPERTY_TYPE_INT,
+                    BARQ_COLLECTION_TYPE_NONE,
+                    "",
+                    "",
+                    BARQ_INVALID_PROPERTY_KEY,
+                    BARQ_PROPERTY_INDEXED | BARQ_PROPERTY_PRIMARY_KEY,
+                },
+            };
+            const barq_property_info_t* props[1] = {properties};
+            auto schema = cptr(barq_schema_new(foo_class, 1, props));
+            auto new_schema = cptr(barq_schema_new(bar_class, 1, props));
+            CHECK(checked(schema.get()));
+            CHECK(checked(new_schema.get()));
+            REQUIRE(checked(barq_schema_validate(schema.get(), BARQ_SCHEMA_VALIDATION_BASIC)));
+            REQUIRE(checked(barq_schema_validate(new_schema.get(), BARQ_SCHEMA_VALIDATION_BASIC)));
+            // barq with schema containing Foo
+            auto config = cptr(barq_config_new());
+            barq_config_set_path(config.get(), test_file_3.path.c_str());
+            barq_config_set_schema_mode(config.get(), BARQ_SCHEMA_MODE_AUTOMATIC);
+            barq_config_set_schema_version(config.get(), 0);
+            barq_config_set_schema(config.get(), schema.get());
+            auto barq = cptr_checked(barq_open(config.get()));
+            CHECK(userdata.num_migrations == 0);
+            barq.reset();
+            // migrate schema basically changing Foo into Bar
+            auto config2 = cptr(barq_config_new());
+            barq_config_set_path(config2.get(), test_file_3.path.c_str());
+            barq_config_set_schema_mode(config2.get(), BARQ_SCHEMA_MODE_AUTOMATIC);
+            barq_config_set_schema_version(config2.get(), 999);
+            barq_config_set_schema(config2.get(), new_schema.get());
+            barq_config_set_migration_function(config2.get(), migrate_schema_delete_old_table, &userdata, nullptr);
+            auto barq2 = cptr_checked(barq_open(config2.get()));
+            CHECK(userdata.num_migrations == 1);
+            auto new_db_schema = barq_get_schema(barq2.get());
+            CHECK(barq_equals(new_db_schema, new_schema.get()));
+            barq2.reset();
+            barq_release(new_db_schema);
+        }
+
+        SECTION("migration callback rename property") {
+            TestFile test_file_3;
+            ConfigUserdata userdata;
+
+            barq_config_set_migration_function(config.get(), migrate_schema_rename_prop, &userdata, nullptr);
+
+            const barq_class_info_t foo_class[1] = {{
+                "Foo",
+                "int",
+                1,
+                0,
+                BARQ_INVALID_CLASS_KEY,
+                BARQ_CLASS_NORMAL,
+            }};
+            const barq_property_info_t foo_properties[1] = {
+                {
+                    "int",
+                    "",
+                    BARQ_PROPERTY_TYPE_INT,
+                    BARQ_COLLECTION_TYPE_NONE,
+                    "",
+                    "",
+                    BARQ_INVALID_PROPERTY_KEY,
+                    BARQ_PROPERTY_INDEXED | BARQ_PROPERTY_PRIMARY_KEY,
+                },
+            };
+            const barq_property_info_t foo_properties_new[1] = {
+                {
+                    "int_new",
+                    "",
+                    BARQ_PROPERTY_TYPE_INT,
+                    BARQ_COLLECTION_TYPE_NONE,
+                    "",
+                    "",
+                    BARQ_INVALID_PROPERTY_KEY,
+                    BARQ_PROPERTY_INDEXED | BARQ_PROPERTY_PRIMARY_KEY,
+                },
+            };
+            const barq_property_info_t* props[1] = {foo_properties};
+            const barq_property_info_t* props_new[1] = {foo_properties_new};
+
+            auto schema = cptr(barq_schema_new(foo_class, 1, props));
+            auto new_schema = cptr(barq_schema_new(foo_class, 1, props_new));
+            CHECK(checked(schema.get()));
+            CHECK(checked(new_schema.get()));
+            REQUIRE(checked(barq_schema_validate(schema.get(), BARQ_SCHEMA_VALIDATION_BASIC)));
+            REQUIRE(checked(barq_schema_validate(new_schema.get(), BARQ_SCHEMA_VALIDATION_BASIC)));
+            // barq with schema
+            auto config = cptr(barq_config_new());
+            barq_config_set_path(config.get(), test_file_3.path.c_str());
+            barq_config_set_schema_mode(config.get(), BARQ_SCHEMA_MODE_AUTOMATIC);
+            barq_config_set_schema_version(config.get(), 0);
+            barq_config_set_schema(config.get(), schema.get());
+            auto barq = cptr_checked(barq_open(config.get()));
+            CHECK(userdata.num_migrations == 0);
+            barq.reset();
+            // barq with new schema
+            auto config2 = cptr(barq_config_new());
+            barq_config_set_path(config2.get(), test_file_3.path.c_str());
+            barq_config_set_schema_mode(config2.get(), BARQ_SCHEMA_MODE_AUTOMATIC);
+            barq_config_set_schema_version(config2.get(), 999);
+            barq_config_set_schema(config2.get(), new_schema.get());
+            barq_config_set_migration_function(config2.get(), migrate_schema_rename_prop, &userdata, nullptr);
+            auto barq2 = cptr_checked(barq_open(config2.get()));
+            CHECK(userdata.num_migrations == 1);
+            auto new_db_schema = barq_get_schema(barq2.get());
+            CHECK(barq_equals(new_db_schema, new_schema.get()));
+            barq2.reset();
+            barq_release(new_db_schema);
+        }
+
+        SECTION("migration callback error") {
+            ConfigUserdata userdata;
+            auto barq = cptr_checked(barq_open(config.get()));
+            barq.reset();
+
+            auto config2 = cptr(barq_config_new());
+            auto empty_schema = cptr(barq_schema_new(nullptr, 0, nullptr));
+            barq_config_set_path(config2.get(), test_file_2.path.c_str());
+            barq_config_set_schema_mode(config2.get(), BARQ_SCHEMA_MODE_AUTOMATIC);
+            barq_config_set_schema_version(config2.get(), 999);
+            barq_config_set_schema(config2.get(), empty_schema.get());
+
+            barq_config_set_migration_function(
+                config2.get(),
+                [](void*, barq_t*, barq_t*, const barq_schema_t*) {
+                    return false;
+                },
+                &userdata, nullptr);
+            CHECK(!barq_open(config2.get()));
+            CHECK_ERR(BARQ_ERR_CALLBACK);
+        }
+
+        SECTION("should compact on launch callback") {
+            void* userdata_p = malloc(sizeof(ConfigUserdata));
+            memset(userdata_p, 0, sizeof(ConfigUserdata));
+            barq_config_set_should_compact_on_launch_function(config.get(), should_compact_on_launch, userdata_p,
+                                                               free_data);
+            auto barq = cptr_checked(barq_open(config.get()));
+            CHECK(static_cast<ConfigUserdata*>(userdata_p)->num_compact_on_launch == 1);
+        }
+
+        SECTION("should compact on launch and initialization callback") {
+            ConfigUserdata* userdata = new ConfigUserdata();
+            barq_config_set_should_compact_on_launch_function(config.get(), should_compact_on_launch, userdata,
+                                                               delete_data);
+            barq_config_set_data_initialization_function(config.get(), initialize_data, userdata,
+                                                          free_data); // should not update free function
+            auto barq = cptr_checked(barq_open(config.get()));
+            CHECK(userdata->num_initializations == 1);
+            CHECK(userdata->num_compact_on_launch == 1);
+        }
+
+        SECTION("migration callback register exception error") {
+            ConfigUserdata userdata;
+            auto barq = cptr_checked(barq_open(config.get()));
+            barq.reset();
+
+            auto config2 = cptr(barq_config_new());
+            auto empty_schema = cptr(barq_schema_new(nullptr, 0, nullptr));
+            barq_config_set_path(config2.get(), test_file_2.path.c_str());
+            barq_config_set_schema_mode(config2.get(), BARQ_SCHEMA_MODE_AUTOMATIC);
+            barq_config_set_schema_version(config2.get(), 999);
+            barq_config_set_schema(config2.get(), empty_schema.get());
+
+            struct MyExceptionWrapper {
+                std::exception_ptr m_ptr{nullptr};
+            };
+
+            barq_config_set_migration_function(
+                config2.get(),
+                [](void*, barq_t*, barq_t*, const barq_schema_t*) {
+                    try {
+                        throw std::runtime_error("Test error in callback");
+                    }
+                    catch (...) {
+                        auto wrapper = new MyExceptionWrapper();
+                        wrapper->m_ptr = std::current_exception();
+                        barq_register_user_code_callback_error((void*)(wrapper));
+                    }
+                    return false;
+                },
+                &userdata, nullptr);
+
+            CHECK(!barq_open(config2.get()));
+            barq_error_t _err;
+            _err.message = "";
+            _err.error = BARQ_ERR_NONE;
+            CHECK(barq_get_last_error(&_err));
+            CHECK(_err.error == BARQ_ERR_CALLBACK);
+            CHECK(std::string{_err.message} == "User-provided callback failed");
+            REQUIRE(_err.user_code_error); // this is the error registered inside the callback
+            auto ex = (MyExceptionWrapper*)_err.user_code_error;
+            try {
+                std::rethrow_exception(ex->m_ptr);
+            }
+            catch (const std::exception& ex) {
+                CHECK(std::string{ex.what()} == std::string{"Test error in callback"});
+            }
+            CHECK(barq_clear_last_error());
+            delete ex;
+        }
+    }
+
+    auto barq = open_barq(test_file);
+
+    SECTION("schema is set after opening") {
+        const barq_class_info_t baz = {
+            "baz",
+            "", // primary key
+            1,  // properties
+            0,  // computed_properties
+            BARQ_INVALID_CLASS_KEY,
+            BARQ_CLASS_NORMAL,
+        };
+
+        auto int_property = barq_property_info_t{
+            "int", "", BARQ_PROPERTY_TYPE_INT,    BARQ_COLLECTION_TYPE_NONE,
+            "",    "", BARQ_INVALID_PROPERTY_KEY, BARQ_PROPERTY_NORMAL,
+        };
+        barq_property_info_t* baz_properties = &int_property;
+
+        // get class count
+        size_t num_classes = barq_get_num_classes(barq);
+        barq_class_key_t* out_keys = (barq_class_key_t*)malloc(sizeof(barq_class_key_t) * num_classes);
+        // get class keys
+        barq_get_class_keys(barq, out_keys, num_classes, nullptr);
+        barq_class_info_t* classes = (barq_class_info_t*)malloc(sizeof(barq_class_info_t) * (num_classes + 1));
+        const barq_property_info_t** properties =
+            (const barq_property_info_t**)malloc(sizeof(barq_property_info_t*) * (num_classes + 1));
+        // iterating through each class, "recreate" the old schema
+        for (size_t i = 0; i < num_classes; i++) {
+            barq_get_class(barq, out_keys[i], &classes[i]);
+            size_t out_n;
+            barq_get_class_properties(barq, out_keys[i], nullptr, 0, &out_n);
+            barq_property_info_t* out_props = (barq_property_info_t*)malloc(sizeof(barq_property_info_t) * out_n);
+            barq_get_class_properties(barq, out_keys[i], out_props, out_n, nullptr);
+            properties[i] = out_props;
+        }
+        // add the new class and its properties to the arrays
+        classes[num_classes] = baz;
+
+        properties[num_classes] = baz_properties;
+
+        // create a new schema and update the barq
+        auto new_schema = barq_schema_new(classes, num_classes + 1, properties);
+
+        // check that the schema changed callback fires with the new schema
+        struct Context {
+            barq_schema_t* expected_schema;
+            bool result;
+        } context = {new_schema, false};
+        auto token = barq_add_schema_changed_callback(
+            barq,
+            [](void* userdata, auto* new_schema) {
+                auto& ctx = *reinterpret_cast<Context*>(userdata);
+                ctx.result = barq_equals(new_schema, ctx.expected_schema);
+            },
+            &context, [](void*) {});
+
+        CHECK(checked(barq_update_schema(barq, new_schema)));
+        CHECK(context.result);
+        auto new_num_classes = barq_get_num_classes(barq);
+        CHECK(new_num_classes == (num_classes + 1));
+
+        bool found;
+        barq_class_info_t baz_info;
+        CHECK(checked(barq_find_class(barq, "baz", &found, &baz_info)));
+        CHECK(found);
+        barq_property_info_t baz_int_property;
+        CHECK(checked(barq_find_property(barq, baz_info.key, "int", &found, &baz_int_property)));
+        CHECK(found);
+
+        free(out_keys);
+        free(classes);
+        for (size_t i = 0; i < num_classes; i++) {
+            free((barq_property_info_t*)properties[i]);
+        }
+        free(properties);
+        barq_release(new_schema);
+        barq_release(token);
+    }
+
+    SECTION("schema validates") {
+        auto schema = barq_get_schema(barq);
+        CHECK(checked(schema));
+        CHECK(checked(barq_schema_validate(schema, barq_schema_validation_mode::BARQ_SCHEMA_VALIDATION_BASIC)));
+
+        auto schema2 = barq_get_schema(barq);
+        CHECK(checked(schema2));
+        CHECK(barq_equals(schema, schema2));
+        barq_release(schema2);
+        barq_release(schema);
+    }
+
+    SECTION("clone schema") {
+        auto schema = cptr(barq_get_schema(barq));
+        auto schema2 = clone_cptr(schema);
+        CHECK(schema.get() != schema2.get());
+        CHECK(barq_equals(schema.get(), schema2.get()));
+    }
+
+    barq_close(barq);
+    REQUIRE(barq_is_closed(barq));
+    barq_release(barq);
+}
+
+TEST_CASE("C API - barq", "[c_api]") {
+    TestFile test_file;
+    barq_t* barq = open_barq(test_file);
+
+    CHECK(barq_get_num_classes(barq) == 3);
+
+    SECTION("cached barq") {
+        auto config2 = make_config(test_file.path.c_str(), false);
+        barq_config_set_cached(config2.get(), true);
+        REQUIRE(barq_config_get_cached(config2.get()));
+        auto barq2 = cptr(barq_open(config2.get()));
+        CHECK(!barq_equals(barq, barq2.get()));
+        auto barq3 = cptr(barq_open(config2.get()));
+        REQUIRE(barq_equals(barq3.get(), barq2.get()));
+    }
+
+    SECTION("native ptr conversion") {
+        barq::SharedBarq native;
+        _barq_get_native_ptr(barq, &native, sizeof(native));
+        auto path = native->config().path;
+        CHECK(path == test_file.path);
+
+        auto barq2 = cptr_checked(_barq_from_native_ptr(&native, sizeof(native)));
+        CHECK(barq_equals(barq2.get(), barq));
+    }
+
+    SECTION("barq changed notification") {
+        bool barq_changed_callback_called = false;
+        auto token = cptr(barq_add_barq_changed_callback(
+            barq,
+            [](void* userdata) {
+                *reinterpret_cast<bool*>(userdata) = true;
+            },
+            &barq_changed_callback_called, [](void*) {}));
+
+        barq_begin_write(barq);
+        barq_commit(barq);
+        CHECK(barq_changed_callback_called);
+    }
+
+    SECTION("barq refresh registering while not in transaction") {
+        bool barq_refresh_callback_called = false;
+        auto token = cptr(barq_add_barq_refresh_callback(
+            barq,
+            [](void* userdata) {
+                *reinterpret_cast<bool*>(userdata) = true;
+            },
+            &barq_refresh_callback_called, [](void*) {}));
+        barq_begin_write(barq);
+        barq_commit(barq);
+        CHECK_FALSE(barq_refresh_callback_called);
+    }
+
+    SECTION("barq refresh registering callback in transaction but on the same version") {
+        bool barq_refresh_callback_called = false;
+        barq_begin_write(barq);
+        auto token = cptr(barq_add_barq_refresh_callback(
+            barq,
+            [](void* userdata) {
+                *reinterpret_cast<bool*>(userdata) = true;
+            },
+            &barq_refresh_callback_called, [](void*) {}));
+        barq_commit(barq);
+        CHECK_FALSE(barq_refresh_callback_called);
+    }
+
+    SECTION("barq async refresh - main use case") {
+        bool barq_refresh_callback_called = false;
+        auto config = make_config(test_file.path.c_str(), false);
+        auto barq2 = cptr(barq_open(config.get()));
+
+        barq_begin_write(barq);
+        barq_begin_read(barq2.get());
+        barq_commit(barq);
+
+        auto token = cptr(barq_add_barq_refresh_callback(
+            barq2.get(),
+            [](void* userdata) {
+                *reinterpret_cast<bool*>(userdata) = true;
+            },
+            &barq_refresh_callback_called, [](void*) {}));
+
+        barq_refresh(barq2.get(), nullptr);
+        REQUIRE(token);
+        CHECK(barq_refresh_callback_called);
+    }
+
+    SECTION("barq async refresh - main use case, multiple callbacks") {
+        std::atomic_int counter = 0;
+        auto config = make_config(test_file.path.c_str(), false);
+        auto barq2 = cptr(barq_open(config.get()));
+
+        barq_begin_write(barq);
+        barq_begin_read(barq2.get());
+        barq_commit(barq);
+
+        auto f = [](void* userdata) {
+            auto ptr = reinterpret_cast<std::atomic_int*>(userdata);
+            ptr->fetch_add(1);
+        };
+        auto token1 = cptr(barq_add_barq_refresh_callback(barq2.get(), f, &counter, [](void*) {}));
+        auto token2 = cptr(barq_add_barq_refresh_callback(barq2.get(), f, &counter, [](void*) {}));
+        barq_refresh(barq2.get(), nullptr);
+        REQUIRE(token1);
+        REQUIRE(token2);
+        CHECK(counter.load() == 2);
+    }
+
+    SECTION("barq refresh read transaction frozen - register on unfrozen barq") {
+        bool barq_refresh_callback_called = false;
+        barq_begin_read(barq);
+
+        auto barq2 = cptr_checked(barq_freeze(barq));
+        CHECK(!barq_is_frozen(barq));
+        CHECK(barq_is_frozen(barq2.get()));
+        CHECK(barq != barq2.get());
+
+        auto token = cptr(barq_add_barq_refresh_callback(
+            barq,
+            [](void* userdata) {
+                *reinterpret_cast<bool*>(userdata) = true;
+            },
+            &barq_refresh_callback_called, [](void*) {}));
+
+        barq_refresh(barq, nullptr);
+        CHECK_FALSE(barq_refresh_callback_called);
+    }
+
+    SECTION("barq refresh read transaction frozen - register on frozen barq") {
+        bool barq_refresh_callback_called = false;
+        barq_begin_read(barq);
+
+        auto barq2 = cptr_checked(barq_freeze(barq));
+        CHECK(!barq_is_frozen(barq));
+        CHECK(barq_is_frozen(barq2.get()));
+        CHECK(barq != barq2.get());
+
+        auto token = cptr(barq_add_barq_refresh_callback(
+            barq2.get(),
+            [](void* userdata) {
+                *reinterpret_cast<bool*>(userdata) = true;
+            },
+            &barq_refresh_callback_called, [](void*) {}));
+
+        barq_refresh(barq, nullptr);
+        CHECK(token == nullptr);
+        CHECK_FALSE(barq_refresh_callback_called);
+    }
+
+    SECTION("barq_freeze()") {
+        auto barq2 = cptr_checked(barq_freeze(barq));
+        CHECK(!barq_is_frozen(barq));
+        CHECK(barq_is_frozen(barq2.get()));
+    }
+
+    SECTION("barq_compact()") {
+        bool did_compact = false;
+        CHECK(checked(barq_compact(barq, &did_compact)));
+        CHECK(did_compact);
+    }
+
+    barq_close(barq);
+    REQUIRE(barq_is_closed(barq));
+    barq_release(barq);
+}
+
+TEST_CASE("C API logging", "[c_api]") {
+    TestFile test_file;
+
+    LogUserData userdata;
+    const char* category_names[20];
+    auto num_categories = barq_get_category_names(20, category_names);
+    auto log_level_old = barq_get_log_level_category("Barq");
+
+    barq_set_log_callback(barq_log_func, &userdata, nullptr);
+    barq_set_log_level(BARQ_LOG_LEVEL_DEBUG);
+    for (size_t n = 0; n < num_categories; n++) {
+        CHECK(barq_get_log_level_category(category_names[n]) == BARQ_LOG_LEVEL_DEBUG);
+    }
+
+    auto prev_level = barq_set_log_level_category("Barq.Storage.Object", BARQ_LOG_LEVEL_OFF);
+    CHECK(prev_level == BARQ_LOG_LEVEL_DEBUG);
+    CHECK(barq_get_log_level_category("Barq.Storage.Object") == BARQ_LOG_LEVEL_OFF);
+    auto config = make_config(test_file.path.c_str(), true);
+    barq_t* barq = barq_open(config.get());
+    barq_begin_write(barq);
+    barq_class_info_t class_foo;
+    barq_find_class(barq, "Foo", nullptr, &class_foo);
+    barq_property_info_t info;
+    barq_find_property(barq, class_foo.key, "int", nullptr, &info);
+    auto obj1 = cptr_checked(barq_object_create(barq, class_foo.key));
+    barq_set_value(obj1.get(), info.key, barq_int_val(123), false);
+    barq_commit(barq);
+    CHECK(userdata.log.size() == 11);
+    barq_set_log_level(BARQ_LOG_LEVEL_INFO);
+    // Commit begin/end should not be logged at INFO level
+    barq_begin_write(barq);
+    barq_commit(barq);
+    CHECK(userdata.log.size() == 11);
+    // We only expect Barq.Storage category logs
+    for (size_t n = 0; n < userdata.log.size(); n++) {
+        CHECK(userdata.log.at(n).first.rfind("Barq.Storage", 0) == 0);
+    }
+    barq_release(barq);
+    userdata.log.clear();
+    barq_set_log_level(BARQ_LOG_LEVEL_ERROR);
+    barq = barq_open(config.get());
+    barq_release(barq);
+    CHECK(userdata.log.empty());
+
+    // Remove this logger again
+    barq_set_log_callback(nullptr, nullptr, nullptr);
+    // Restore old log level
+    barq_set_log_level(log_level_old);
+}
+
+TEST_CASE("C API - scheduler", "[c_api]") {
+    TestFile test_file;
+    barq_t* barq;
+
+    struct SchedulerData {
+        bool free_called = false;
+        barq_work_queue_t* work_queue;
+        std::mutex mutex;
+        std::condition_variable cond;
+        void wait()
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            cond.wait(lk);
+        }
+        void notify(barq_work_queue_t* wq)
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            work_queue = wq;
+            cond.notify_one();
+        }
+        void execute()
+        {
+            barq_scheduler_perform_work(work_queue);
+        }
+    } scheduler_data;
+
+    struct NotifierData {
+        bool notify_called = false;
+    } notifier_data;
+
+    {
+        auto config = make_config(test_file.path.c_str());
+        auto scheduler = barq_scheduler_new(
+            &scheduler_data,
+            [](void* data) {
+                static_cast<SchedulerData*>(data)->free_called = true;
+            },
+            [](void* data, barq_work_queue_t* work_queue) {
+                static_cast<SchedulerData*>(data)->notify(work_queue);
+            },
+            [](void*) {
+                return true;
+            },
+            nullptr, nullptr);
+        barq_config_set_scheduler(config.get(), scheduler);
+        barq = barq_open(config.get());
+        barq_release(scheduler);
+    }
+
+    bool found = false;
+    barq_class_info_t class_foo;
+    barq_find_class(barq, "Foo", &found, &class_foo);
+    auto res = barq_object_find_all(barq, class_foo.key);
+    auto token = barq_results_add_notification_callback(res, &notifier_data, nullptr, nullptr,
+                                                         [](void* data, const barq_collection_changes_t*) {
+                                                             static_cast<NotifierData*>(data)->notify_called = true;
+                                                         });
+
+    barq_begin_write(barq);
+    auto obj = barq_object_create(barq, class_foo.key);
+    barq_release(obj);
+    barq_commit(barq);
+
+    scheduler_data.wait();
+
+    notifier_data.notify_called = false;
+    scheduler_data.execute();
+    CHECK(notifier_data.notify_called);
+
+    CHECK(!scheduler_data.free_called);
+    barq_release(token);
+    barq_release(res);
+    barq_release(barq);
+    CHECK(scheduler_data.free_called);
+}
+
+TEST_CASE("C API - properties", "[c_api]") {
+    TestFile test_file;
+    barq_t* barq = open_barq(test_file);
+
+    auto write = [&](auto&& f) {
+        checked(barq_begin_write(barq));
+        f();
+        checked(barq_commit(barq));
+        checked(barq_refresh(barq, nullptr));
+    };
+
+    bool found = false;
+
+    barq_class_info_t class_foo, class_bar, class_embedded;
+    CHECK(checked(barq_find_class(barq, "Foo", &found, &class_foo)));
+    REQUIRE(found);
+    CHECK(checked(barq_find_class(barq, "Bar", &found, &class_bar)));
+    REQUIRE(found);
+    CHECK(checked(barq_find_class(barq, "Embedded", &found, &class_embedded)));
+    REQUIRE(found);
+
+    std::map<std::string, barq_property_key_t> foo_properties;
+    for (const auto& p : all_property_types("Bar")) {
+        barq_property_info_t info;
+        bool found = false;
+        REQUIRE(barq_find_property(barq, class_foo.key, p.name, &found, &info));
+        REQUIRE(found);
+        CHECK(p.key == BARQ_INVALID_PROPERTY_KEY);
+        CHECK(info.key != BARQ_INVALID_PROPERTY_KEY);
+        CHECK(info.type == p.type);
+        CHECK(std::string{info.public_name} == p.public_name);
+        CHECK(info.collection_type == p.collection_type);
+        CHECK(std::string{info.link_target} == p.link_target);
+        CHECK(std::string{info.link_origin_property_name} == p.link_origin_property_name);
+        foo_properties[info.name] = info.key;
+    }
+
+    std::map<std::string, barq_property_key_t> bar_properties;
+    {
+        barq_property_info_t info;
+        bool found = false;
+        REQUIRE(checked(barq_find_property(barq, class_bar.key, "int", &found, &info)));
+        REQUIRE(found);
+        bar_properties["int"] = info.key;
+
+        REQUIRE(checked(barq_find_property(barq, class_bar.key, "strings", &found, &info)));
+        REQUIRE(found);
+        bar_properties["strings"] = info.key;
+
+        REQUIRE(checked(barq_find_property(barq, class_bar.key, "doubles", &found, &info)));
+        REQUIRE(found);
+        bar_properties["doubles"] = info.key;
+
+        REQUIRE(checked(barq_find_property(barq, class_bar.key, "linking_objects", &found, &info)));
+        REQUIRE(found);
+        bar_properties["linking_objects"] = info.key;
+    }
+
+    barq_property_key_t foo_int_key = foo_properties["int"];
+    barq_property_key_t foo_str_key = foo_properties["string"];
+    barq_property_key_t foo_links_key = foo_properties["link_list"];
+    barq_property_key_t bar_int_key = bar_properties["int"];
+    barq_property_key_t bar_strings_key = bar_properties["strings"];
+    barq_property_key_t bar_doubles_key = bar_properties["doubles"];
+
+    SECTION("barq_find_class() errors") {
+        bool found = true;
+        CHECK(barq_find_class(barq, "does not exist", &found, nullptr));
+        CHECK(!found);
+    }
+
+    SECTION("barq_remove_table()") {
+        bool table_deleted = true;
+        CHECK(!barq_remove_table(barq, "Foo", &table_deleted));
+        CHECK_ERR(BARQ_ERR_INVALID_SCHEMA_CHANGE);
+        CHECK(!table_deleted);
+    }
+
+    SECTION("barq_get_class_keys()") {
+        barq_class_key_t keys[2];
+        // return total number of keys present, copy only if there is enough space in the vector passed in
+        size_t found = 0;
+        CHECK(checked(barq_get_class_keys(barq, keys, 2, &found)));
+        CHECK(found == 3);
+        CHECK(checked(barq_get_class_keys(barq, keys, 1, &found)));
+        CHECK(found == 3);
+    }
+
+    SECTION("barq_find_property() errors") {
+        barq_property_info_t dummy;
+        CHECK(!barq_find_property(barq, 123123123, "Foo", &found, &dummy));
+        CHECK_ERR(BARQ_ERR_NO_SUCH_TABLE);
+        CHECK(!barq_find_property(barq, 123123123, "Foo", &found, nullptr));
+        CHECK_ERR(BARQ_ERR_NO_SUCH_TABLE);
+
+        bool found;
+        CHECK(checked(barq_find_property(barq, class_foo.key, "int", nullptr, nullptr)));
+        CHECK(checked(barq_find_property(barq, class_foo.key, "int", &found, nullptr)));
+        CHECK(found);
+
+        found = true;
+        CHECK(checked(barq_find_property(barq, class_foo.key, "i don't exist", &found, nullptr)));
+        CHECK(!found);
+    }
+
+    SECTION("barq_find_property_by_public_name()") {
+        barq_property_info_t property;
+        bool found = false;
+        CHECK(checked(barq_find_property_by_public_name(barq, class_foo.key, "public_int", &found, &property)));
+        CHECK(found);
+        CHECK(property.key == foo_int_key);
+
+        found = false;
+        CHECK(checked(barq_find_property_by_public_name(barq, class_foo.key, "string", &found, &property)));
+        CHECK(found);
+        CHECK(property.key == foo_properties["string"]);
+
+        CHECK(checked(barq_find_property_by_public_name(barq, class_foo.key, "I don't exist", &found, &property)));
+        CHECK(!found);
+    }
+
+    SECTION("barq_get_property_keys()") {
+        size_t num_found = 0;
+        size_t properties_found = 0;
+
+        // discover how many properties there are.
+        CHECK(checked(barq_get_property_keys(barq, class_foo.key, nullptr, 0, &properties_found)));
+        barq_property_key_t* properties_foo =
+            (barq_property_key_t*)malloc(sizeof(barq_property_key_t) * properties_found);
+        CHECK(checked(barq_get_property_keys(barq, class_foo.key, properties_foo, properties_found, &num_found)));
+        CHECK(num_found == properties_found);
+        CHECK(properties_foo[0] == foo_properties["int"]);
+        barq_free(properties_foo);
+
+        num_found = 0;
+        properties_found = 0;
+        // discover how many properties there are.
+        CHECK(checked(barq_get_property_keys(barq, class_bar.key, nullptr, 0, &properties_found)));
+        barq_property_key_t* properties_bar =
+            (barq_property_key_t*)malloc(sizeof(barq_property_key_t) * properties_found);
+        CHECK(checked(barq_get_property_keys(barq, class_bar.key, properties_bar, properties_found, &num_found)));
+        CHECK(num_found == properties_found);
+        CHECK(properties_bar[2] == bar_properties["doubles"]);
+        CHECK(properties_bar[0] == bar_properties["int"]);
+        barq_free(properties_bar);
+
+        num_found = 0;
+        CHECK(checked(barq_get_property_keys(barq, class_foo.key, nullptr, 0, &num_found)));
+        CHECK(num_found == class_foo.num_properties + class_foo.num_computed_properties);
+
+        std::vector<barq_property_key_t> ps;
+        ps.resize(1000);
+        CHECK(checked(barq_get_property_keys(barq, class_foo.key, ps.data(), ps.size(), &num_found)));
+        CHECK(num_found == class_foo.num_properties + class_foo.num_computed_properties);
+
+        CHECK(checked(barq_get_property_keys(barq, class_bar.key, ps.data(), ps.size(), &num_found)));
+        CHECK(num_found == 6);
+    }
+
+    SECTION("barq_get_property()") {
+        barq_property_info_t prop;
+        CHECK(checked(barq_get_property(barq, class_bar.key, bar_properties["linking_objects"], &prop)));
+        CHECK(prop.key == bar_properties["linking_objects"]);
+        CHECK(std::string{prop.name} == "linking_objects");
+
+        CHECK(!barq_get_property(barq, class_bar.key, 123123123, &prop));
+        CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+    }
+
+    SECTION("barq_object_create() errors") {
+        SECTION("invalid table") {
+            write([&]() {
+                auto p = barq_object_create(barq, 123123123);
+                CHECK(!p);
+                CHECK_ERR(BARQ_ERR_NO_SUCH_TABLE);
+            });
+        }
+
+        SECTION("missing primary key") {
+            write([&]() {
+                auto p = barq_object_create(barq, class_bar.key);
+                CHECK(!p);
+                CHECK_ERR(BARQ_ERR_MISSING_PRIMARY_KEY);
+            });
+        }
+
+        SECTION("embedded object") {
+            write([&]() {
+                auto p = barq_object_create(barq, class_embedded.key);
+                CHECK(!p);
+                CHECK_ERR(BARQ_ERR_ILLEGAL_OPERATION);
+            });
+        }
+
+        SECTION("wrong primary key type") {
+            write([&]() {
+                auto p = barq_object_create_with_primary_key(barq, class_bar.key, barq_str_val("Hello"));
+                CHECK(!p);
+                CHECK_ERR(BARQ_ERR_PROPERTY_TYPE_MISMATCH);
+            });
+
+            write([&]() {
+                auto p = barq_object_create_with_primary_key(barq, class_bar.key, barq_null());
+                CHECK(!p);
+                CHECK_ERR(BARQ_ERR_PROPERTY_NOT_NULLABLE);
+            });
+        }
+
+        SECTION("class does not have a primary key") {
+            write([&]() {
+                CHECK(!barq_object_create_with_primary_key(barq, class_foo.key, barq_int_val(123)));
+                CHECK_ERR(BARQ_ERR_UNEXPECTED_PRIMARY_KEY);
+            });
+        }
+
+        SECTION("duplicate primary key") {
+            write([&]() {
+                cptr_checked(barq_object_create_with_primary_key(barq, class_bar.key, barq_int_val(123)));
+                auto p = barq_object_create_with_primary_key(barq, class_bar.key, barq_int_val(123));
+                CHECK(!p);
+                CHECK_ERR(BARQ_ERR_OBJECT_ALREADY_EXISTS);
+            });
+        }
+
+        SECTION("not in a transaction") {
+            CHECK(!barq_object_create(barq, class_foo.key));
+            CHECK_ERR(BARQ_ERR_WRONG_TRANSACTION_STATE);
+        }
+    }
+
+
+    SECTION("objects") {
+        CPtr<barq_object_t> obj1;
+        CPtr<barq_object_t> obj2;
+        auto int_val1 = barq_int_val(123);
+        auto int_val2 = barq_int_val(456);
+        write([&]() {
+            obj1 = cptr_checked(barq_object_create(barq, class_foo.key));
+            CHECK(obj1);
+            CHECK(checked(barq_set_value(obj1.get(), foo_int_key, int_val1, false)));
+            CHECK(checked(barq_set_value(obj1.get(), foo_str_key, barq_str_val("Hello, World!"), false)));
+            obj2 = cptr_checked(barq_object_create_with_primary_key(barq, class_bar.key, barq_int_val(1)));
+            CHECK(obj2);
+            CPtr<barq_object_t> obj3 = cptr_checked(barq_object_create(barq, class_foo.key));
+            CHECK(obj3);
+            CHECK(checked(barq_set_value(obj3.get(), foo_int_key, int_val2, false)));
+            CPtr<barq_object_t> obj4 = cptr_checked(barq_object_create(barq, class_foo.key));
+            CHECK(obj3);
+            CHECK(checked(barq_set_value(obj4.get(), foo_int_key, int_val1, false)));
+        });
+
+        size_t foo_count, bar_count;
+        CHECK(checked(barq_get_num_objects(barq, class_foo.key, &foo_count)));
+        CHECK(checked(barq_get_num_objects(barq, class_bar.key, &bar_count)));
+        REQUIRE(foo_count == 3);
+        REQUIRE(bar_count == 1);
+
+        SECTION("barq_get_value_by_property_index") {
+            barq_value value;
+            CHECK(checked(barq_get_value_by_property_index(obj1.get(), 0, &value)));
+            CHECK(value.integer == int_val1.integer);
+            CHECK(checked(barq_get_value_by_property_index(obj1.get(), 16, &value)));
+            CHECK(value.string.data == std::string{"Hello, World!"});
+        }
+
+        SECTION("barq_clone()") {
+            auto obj1a = clone_cptr(obj1);
+            CHECK(barq_equals(obj1a.get(), obj1.get()));
+        }
+
+        SECTION("native pointer mapping") {
+            auto object = *static_cast<const barq::Object*>(_barq_object_get_native_ptr(obj1.get()));
+            auto obj = object.get_obj();
+            CHECK(obj.get<int64_t>(barq::ColKey(foo_int_key)) == int_val1.integer);
+
+            auto obj1a = cptr_checked(_barq_object_from_native_copy(&object, sizeof(object)));
+            CHECK(barq_equals(obj1.get(), obj1a.get()));
+            auto obj1b = cptr_checked(_barq_object_from_native_move(&object, sizeof(object)));
+            CHECK(barq_equals(obj1.get(), obj1b.get()));
+        }
+
+        SECTION("barq_get_num_objects()") {
+            size_t num_foos, num_bars;
+            CHECK(checked(barq_get_num_objects(barq, class_foo.key, &num_foos)));
+            CHECK(checked(barq_get_num_objects(barq, class_bar.key, &num_bars)));
+            CHECK(num_foos == 3);
+            CHECK(num_bars == 1);
+
+            CHECK(checked(barq_get_num_objects(barq, class_bar.key, nullptr)));
+            CHECK(!barq_get_num_objects(barq, 123123123, nullptr));
+            CHECK_ERR(BARQ_ERR_NO_SUCH_TABLE);
+        }
+
+        SECTION("barq_get_object()") {
+            barq_object_key_t obj1_key = barq_object_get_key(obj1.get());
+            auto obj1a = cptr_checked(barq_get_object(barq, class_foo.key, obj1_key));
+            CHECK(obj1a);
+            CHECK(barq_equals(obj1a.get(), obj1.get()));
+
+            barq_object_key_t invalid_key = 123123123;
+            CHECK(!barq_get_object(barq, class_foo.key, invalid_key));
+            CHECK_ERR(BARQ_ERR_NO_SUCH_OBJECT);
+
+            barq_class_key_t invalid_class_key = 123123123;
+            CHECK(!barq_get_object(barq, invalid_class_key, obj1_key));
+            CHECK_ERR(BARQ_ERR_NO_SUCH_TABLE);
+        }
+
+        SECTION("create object with primary key that already exists") {
+            bool did_create;
+            auto obj2a = cptr_checked(
+                barq_object_get_or_create_with_primary_key(barq, class_bar.key, barq_int_val(1), &did_create));
+            CHECK(!did_create);
+            CHECK(barq_equals(obj2a.get(), obj2.get()));
+        }
+
+        SECTION("barq_get_value()") {
+            barq_value_t value;
+            CHECK(checked(barq_get_value(obj1.get(), foo_int_key, &value)));
+            CHECK(value.type == BARQ_TYPE_INT);
+            CHECK(value.integer == 123);
+
+            CHECK(checked(barq_get_value(obj1.get(), foo_str_key, &value)));
+            CHECK(value.type == BARQ_TYPE_STRING);
+            CHECK(strncmp(value.string.data, "Hello, World!", value.string.size) == 0);
+
+            CHECK(checked(barq_get_value(obj1.get(), foo_int_key, nullptr)));
+
+            CHECK(!barq_get_value(obj1.get(), 123123123, &value));
+            CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+
+            CHECK(!barq_get_value(obj1.get(), 123123123, nullptr));
+            CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+
+            // Cannot use barq_get_value() to get a list.
+            CHECK(!barq_get_value(obj1.get(), foo_links_key, &value));
+            CHECK_ERR(BARQ_ERR_PROPERTY_TYPE_MISMATCH);
+
+            write([&]() {
+                CHECK(checked(barq_object_delete(obj1.get())));
+            });
+            CHECK(!barq_get_value(obj1.get(), foo_int_key, &value));
+            CHECK_ERR(BARQ_ERR_INVALIDATED_OBJECT);
+        }
+
+        SECTION("barq_get_values()") {
+            barq_value_t values[3];
+
+            barq_property_key_t keys1[3] = {foo_int_key, foo_str_key, foo_int_key};
+            CHECK(checked(barq_get_values(obj1.get(), 3, keys1, values)));
+
+            CHECK(values[0].type == BARQ_TYPE_INT);
+            CHECK(values[1].type == BARQ_TYPE_STRING);
+            CHECK(values[2].type == BARQ_TYPE_INT);
+
+            CHECK(values[0].integer == 123);
+            CHECK(strncmp(values[1].string.data, "Hello, World!", values[1].string.size) == 0);
+            CHECK(values[2].integer == 123);
+
+            barq_property_key_t keys2[3] = {foo_int_key, 123123123, foo_str_key};
+            CHECK(!barq_get_values(obj1.get(), 3, keys2, values));
+            CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+
+            write([&]() {
+                CHECK(checked(barq_object_delete(obj1.get())));
+            });
+            CHECK(!barq_get_values(obj1.get(), 3, keys1, values));
+            CHECK_ERR(BARQ_ERR_INVALIDATED_OBJECT);
+        }
+
+        SECTION("barq_set_value() errors") {
+            CHECK(!barq_set_value(obj1.get(), foo_int_key, barq_int_val(456), false));
+            CHECK_ERR(BARQ_ERR_WRONG_TRANSACTION_STATE);
+
+            write([&]() {
+                CHECK(!barq_set_value(obj1.get(), foo_int_key, barq_null(), false));
+                CHECK_ERR(BARQ_ERR_PROPERTY_NOT_NULLABLE);
+
+                CHECK(!barq_set_value(obj1.get(), foo_int_key, barq_str_val("a"), false));
+                CHECK_ERR(BARQ_ERR_PROPERTY_TYPE_MISMATCH);
+
+                CHECK(!barq_set_value(obj1.get(), 123123123, barq_int_val(123), false));
+                CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+            });
+        }
+
+        SECTION("barq_set_values() errors") {
+            barq_value_t int456 = barq_int_val(456);
+            CHECK(!barq_set_values(obj1.get(), 1, &foo_int_key, &int456, false));
+            CHECK_ERR(BARQ_ERR_WRONG_TRANSACTION_STATE);
+
+            write([&]() {
+                barq_value_t value;
+                barq_property_key_t keys1[3] = {foo_int_key, foo_str_key, foo_int_key};
+                barq_property_key_t keys2[3] = {foo_int_key, 123123123, foo_str_key};
+
+                // No error; check that the last value wins when there are
+                // duplicate keys.
+                barq_value_t values1[3] = {barq_int_val(234), barq_str_val("aaa"), barq_int_val(345)};
+                CHECK(checked(barq_set_values(obj1.get(), 3, keys1, values1, false)));
+
+                barq_get_value(obj1.get(), foo_int_key, &value);
+                CHECK(value.type == BARQ_TYPE_INT);
+                CHECK(value.integer == 345);
+                barq_get_value(obj1.get(), foo_str_key, &value);
+                CHECK(value.type == BARQ_TYPE_STRING);
+                CHECK(strncmp("aaa", value.string.data, value.string.size) == 0);
+
+                // Type mismatch error.
+                barq_value_t values2[3] = {barq_int_val(111), barq_str_val("bbb"), barq_str_val("ccc")};
+                CHECK(!barq_set_values(obj1.get(), 3, keys1, values2, false));
+                CHECK_ERR(BARQ_ERR_PROPERTY_TYPE_MISMATCH);
+                // Properties should remain unchanged.
+                barq_get_value(obj1.get(), foo_int_key, &value);
+                CHECK(value.type == BARQ_TYPE_INT);
+                CHECK(value.integer == 345);
+                barq_get_value(obj1.get(), foo_str_key, &value);
+                CHECK(value.type == BARQ_TYPE_STRING);
+
+                // Invalid property key error.
+                CHECK(!barq_set_values(obj1.get(), 3, keys2, values2, false));
+                CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+                // Properties should remain unchanged.
+                barq_get_value(obj1.get(), foo_int_key, &value);
+                CHECK(value.type == BARQ_TYPE_INT);
+                CHECK(value.integer == 345);
+                barq_get_value(obj1.get(), foo_str_key, &value);
+                CHECK(value.type == BARQ_TYPE_STRING);
+            });
+        }
+
+        SECTION("barq_object_add_int errors") {
+            SECTION("SUCCESS") {
+                barq_begin_write(barq);
+                CHECK(barq_object_add_int(obj1.get(), foo_int_key, 10));
+                barq_commit(barq);
+            }
+            SECTION("ERROR") {
+                CHECK(!barq_object_add_int(obj1.get(), foo_int_key, 10));
+                CHECK_ERR(BARQ_ERR_WRONG_TRANSACTION_STATE);
+            }
+        }
+
+        SECTION("get/set all property types") {
+            barq_value_t null = barq_null();
+            barq_value_t integer = barq_int_val(987);
+            barq_value_t boolean = barq_bool_val(true);
+            barq_value_t string = barq_str_val("My string");
+            const uint8_t binary_data[] = {0, 1, 2, 3, 4, 5, 6, 7};
+            barq_value_t binary = barq_binary_val(binary_data, sizeof(binary_data));
+            barq_value_t timestamp = barq_timestamp_val(1000000, 123123123);
+            barq_value_t fnum = barq_float_val(123.f);
+            barq_value_t dnum = barq_double_val(456.0);
+            barq_value_t decimal = barq_decimal_val(999.0);
+            barq_value_t object_id = barq_object_id_val("abc123abc123");
+            barq_value_t uuid = barq_uuid_val("01234567-9abc-4def-9012-3456789abcde");
+            barq_value_t link = barq_link_val(class_bar.key, barq_object_get_key(obj2.get()));
+
+            write([&]() {
+                CHECK(barq_set_value(obj1.get(), foo_properties["int"], integer, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["bool"], boolean, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["string"], string, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["binary"], binary, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["timestamp"], timestamp, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["float"], fnum, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["double"], dnum, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["decimal"], decimal, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["object_id"], object_id, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["uuid"], uuid, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["mixed"], integer, false));
+
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_int"], integer, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_bool"], boolean, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_string"], string, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_binary"], binary, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_timestamp"], timestamp, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_float"], fnum, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_double"], dnum, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_decimal"], decimal, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_object_id"], object_id, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_uuid"], uuid, false));
+
+                CHECK(barq_set_value(obj1.get(), foo_properties["link"], link, false));
+            });
+
+            barq_value_t value;
+
+            CHECK(barq_get_value(obj1.get(), foo_properties["int"], &value));
+            CHECK(barq_val_eq(value, integer));
+            CHECK(barq_get_value(obj1.get(), foo_properties["bool"], &value));
+            CHECK(barq_val_eq(value, boolean));
+            CHECK(barq_get_value(obj1.get(), foo_properties["string"], &value));
+            CHECK(barq_val_eq(value, string));
+            CHECK(barq_get_value(obj1.get(), foo_properties["binary"], &value));
+            CHECK(barq_val_eq(value, binary));
+            CHECK(barq_get_value(obj1.get(), foo_properties["timestamp"], &value));
+            CHECK(barq_val_eq(value, timestamp));
+            CHECK(barq_get_value(obj1.get(), foo_properties["float"], &value));
+            CHECK(barq_val_eq(value, fnum));
+            CHECK(barq_get_value(obj1.get(), foo_properties["double"], &value));
+            CHECK(barq_val_eq(value, dnum));
+            CHECK(barq_get_value(obj1.get(), foo_properties["decimal"], &value));
+            CHECK(barq_val_eq(value, decimal));
+            CHECK(barq_get_value(obj1.get(), foo_properties["object_id"], &value));
+            CHECK(barq_val_eq(value, object_id));
+            CHECK(barq_get_value(obj1.get(), foo_properties["uuid"], &value));
+            CHECK(barq_val_eq(value, uuid));
+            CHECK(barq_get_value(obj1.get(), foo_properties["mixed"], &value));
+            CHECK(barq_val_eq(value, integer));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_int"], &value));
+            CHECK(barq_val_eq(value, integer));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_bool"], &value));
+            CHECK(barq_val_eq(value, boolean));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_string"], &value));
+            CHECK(barq_val_eq(value, string));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_binary"], &value));
+            CHECK(barq_val_eq(value, binary));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_timestamp"], &value));
+            CHECK(barq_val_eq(value, timestamp));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_float"], &value));
+            CHECK(barq_val_eq(value, fnum));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_double"], &value));
+            CHECK(barq_val_eq(value, dnum));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_decimal"], &value));
+            CHECK(barq_val_eq(value, decimal));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_object_id"], &value));
+            CHECK(barq_val_eq(value, object_id));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_uuid"], &value));
+            CHECK(barq_val_eq(value, uuid));
+            CHECK(barq_get_value(obj1.get(), foo_properties["link"], &value));
+            CHECK(barq_val_eq(value, link));
+
+            write([&]() {
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_int"], null, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_bool"], null, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_string"], null, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_binary"], null, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_timestamp"], null, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_float"], null, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_double"], null, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_decimal"], null, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_object_id"], null, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["nullable_uuid"], null, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["mixed"], null, false));
+                CHECK(barq_set_value(obj1.get(), foo_properties["link"], null, false));
+            });
+
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_int"], &value));
+            CHECK(barq_val_eq(value, null));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_bool"], &value));
+            CHECK(barq_val_eq(value, null));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_string"], &value));
+            CHECK(barq_val_eq(value, null));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_binary"], &value));
+            CHECK(barq_val_eq(value, null));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_timestamp"], &value));
+            CHECK(barq_val_eq(value, null));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_float"], &value));
+            CHECK(barq_val_eq(value, null));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_double"], &value));
+            CHECK(barq_val_eq(value, null));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_decimal"], &value));
+            CHECK(barq_val_eq(value, null));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_object_id"], &value));
+            CHECK(barq_val_eq(value, null));
+            CHECK(barq_get_value(obj1.get(), foo_properties["nullable_uuid"], &value));
+            CHECK(barq_val_eq(value, null));
+            CHECK(barq_get_value(obj1.get(), foo_properties["mixed"], &value));
+            CHECK(barq_val_eq(value, null));
+            CHECK(barq_get_value(obj1.get(), foo_properties["link"], &value));
+            CHECK(barq_val_eq(value, null));
+        }
+
+        SECTION("embedded") {
+            barq_property_info_t info;
+            bool found = false;
+            REQUIRE(checked(barq_find_property(barq, class_bar.key, "sub", &found, &info)));
+            REQUIRE(found);
+
+            auto embedded = cptr_checked(barq_get_linked_object(obj2.get(), info.key));
+            CHECK(!embedded);
+            write([&]() {
+                auto embedded = cptr_checked(barq_set_embedded(obj2.get(), info.key));
+                CHECK(embedded);
+            });
+            embedded = cptr_checked(barq_get_linked_object(obj2.get(), info.key));
+            CHECK(embedded);
+        }
+
+        SECTION("delete causes invalidation errors") {
+            write([&]() {
+                // Get a list instance for later
+                auto list = cptr_checked(barq_get_list(obj1.get(), foo_links_key));
+
+                CHECK(checked(barq_object_delete(obj1.get())));
+                CHECK(!barq_object_is_valid(obj1.get()));
+
+                barq_clear_last_error();
+                CHECK(!barq_object_delete(obj1.get()));
+                CHECK_ERR(BARQ_ERR_INVALIDATED_OBJECT);
+
+                barq_clear_last_error();
+                CHECK(!barq_set_value(obj1.get(), foo_int_key, barq_int_val(123), false));
+                CHECK_ERR(BARQ_ERR_INVALIDATED_OBJECT);
+
+                barq_clear_last_error();
+                auto list2 = barq_get_list(obj1.get(), foo_links_key);
+                CHECK(!list2);
+                CHECK_ERR(BARQ_ERR_INVALIDATED_OBJECT);
+
+                size_t size;
+                CHECK(!barq_list_size(list.get(), &size));
+                CHECK_ERR(BARQ_ERR_INVALIDATED_OBJECT);
+            });
+        }
+
+        SECTION("lists") {
+            SECTION("barq_get_list() errors") {
+                CHECK(!barq_get_list(obj2.get(), bar_int_key));
+                CHECK_ERR(BARQ_ERR_PROPERTY_TYPE_MISMATCH);
+
+                CHECK(!barq_get_list(obj2.get(), 123123123));
+                CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+            }
+
+            SECTION("nullable strings") {
+                auto strings = cptr_checked(barq_get_list(obj2.get(), bar_strings_key));
+                CHECK(strings);
+                CHECK(!barq_is_frozen(strings.get()));
+
+                barq_value_t a = barq_str_val("a");
+                barq_value_t b = barq_str_val("b");
+                barq_value_t c = barq_null();
+
+                SECTION("barq_equals() type check") {
+                    CHECK(!barq_equals(strings.get(), obj1.get()));
+                }
+
+                SECTION("barq_clone()") {
+                    auto list2 = clone_cptr(strings.get());
+                    CHECK(barq_equals(strings.get(), list2.get()));
+                    CHECK(strings.get() != list2.get());
+                }
+
+                SECTION("insert, then get") {
+                    write([&]() {
+                        CHECK(checked(barq_list_insert(strings.get(), 0, a)));
+                        CHECK(checked(barq_list_insert(strings.get(), 1, b)));
+                        CHECK(checked(barq_list_insert(strings.get(), 2, c)));
+
+                        barq_value_t a2, b2, c2;
+                        CHECK(checked(barq_list_get(strings.get(), 0, &a2)));
+                        CHECK(checked(barq_list_get(strings.get(), 1, &b2)));
+                        CHECK(checked(barq_list_get(strings.get(), 2, &c2)));
+
+                        CHECK(barq_stdstr(a2) == "a");
+                        CHECK(barq_stdstr(b2) == "b");
+                        CHECK(c2.type == BARQ_TYPE_NULL);
+
+                        size_t out_index = -1;
+                        bool found;
+                        CHECK(checked(barq_list_find(strings.get(), &a2, &out_index, &found)));
+                        CHECK(out_index == 0);
+                        CHECK(found);
+                        CHECK(checked(barq_list_find(strings.get(), &b2, &out_index, &found)));
+                        CHECK(out_index == 1);
+                        CHECK(found);
+                        CHECK(checked(barq_list_find(strings.get(), &c2, &out_index, &found)));
+                        CHECK(out_index == 2);
+                        CHECK(found);
+
+                        barq_value_t dummy = barq_str_val("c");
+                        CHECK(checked(barq_list_find(strings.get(), &dummy, &out_index, &found)));
+                        CHECK(!found);
+                        CHECK(out_index == barq::not_found);
+
+                        // verify that conversion to results works
+                        auto results = cptr_checked(barq_list_to_results(strings.get()));
+                        CHECK(checked(barq_results_find(results.get(), &a2, &out_index, &found)));
+                        CHECK(found);
+                        CHECK(out_index == 0);
+                        CHECK(checked(barq_results_find(results.get(), &b2, &out_index, &found)));
+                        CHECK(found);
+                        CHECK(out_index == 1);
+                        CHECK(checked(barq_results_find(results.get(), &c2, &out_index, &found)));
+                        CHECK(found);
+                        CHECK(out_index == 2);
+                    });
+                }
+
+                SECTION("equality") {
+                    auto strings2 = cptr_checked(barq_get_list(obj2.get(), bar_strings_key));
+                    CHECK(strings2);
+                    CHECK(barq_equals(strings.get(), strings2.get()));
+
+                    write([&]() {
+                        auto obj3 =
+                            cptr_checked(barq_object_create_with_primary_key(barq, class_bar.key, barq_int_val(2)));
+                        CHECK(obj3);
+                        auto strings3 = cptr_checked(barq_get_list(obj3.get(), bar_strings_key));
+                        CHECK(!barq_equals(strings.get(), strings3.get()));
+                    });
+                }
+            }
+
+            SECTION("get/insert all property types") {
+                barq_value_t null = barq_null();
+                barq_value_t integer = barq_int_val(987);
+                barq_value_t boolean = barq_bool_val(true);
+                barq_value_t string = barq_str_val("My string");
+                const uint8_t binary_data[] = {0, 1, 2, 3, 4, 5, 6, 7};
+                barq_value_t binary = barq_binary_val(binary_data, sizeof(binary_data));
+                barq_value_t timestamp = barq_timestamp_val(1000000, 123123123);
+                barq_value_t fnum = barq_float_val(123.f);
+                barq_value_t dnum = barq_double_val(456.0);
+                barq_value_t decimal = barq_decimal_val(999.0);
+                barq_value_t object_id = barq_object_id_val("abc123abc123");
+                barq_value_t uuid = barq_uuid_val("01234567-9abc-4def-9012-3456789abcde");
+
+                auto int_list = cptr_checked(barq_get_list(obj1.get(), foo_properties["int_list"]));
+                auto bool_list = cptr_checked(barq_get_list(obj1.get(), foo_properties["bool_list"]));
+                auto string_list = cptr_checked(barq_get_list(obj1.get(), foo_properties["string_list"]));
+                auto binary_list = cptr_checked(barq_get_list(obj1.get(), foo_properties["binary_list"]));
+                auto timestamp_list = cptr_checked(barq_get_list(obj1.get(), foo_properties["timestamp_list"]));
+                auto float_list = cptr_checked(barq_get_list(obj1.get(), foo_properties["float_list"]));
+                auto double_list = cptr_checked(barq_get_list(obj1.get(), foo_properties["double_list"]));
+                auto decimal_list = cptr_checked(barq_get_list(obj1.get(), foo_properties["decimal_list"]));
+                auto object_id_list = cptr_checked(barq_get_list(obj1.get(), foo_properties["object_id_list"]));
+                auto uuid_list = cptr_checked(barq_get_list(obj1.get(), foo_properties["uuid_list"]));
+                auto nullable_int_list =
+                    cptr_checked(barq_get_list(obj1.get(), foo_properties["nullable_int_list"]));
+                auto nullable_bool_list =
+                    cptr_checked(barq_get_list(obj1.get(), foo_properties["nullable_bool_list"]));
+                auto nullable_string_list =
+                    cptr_checked(barq_get_list(obj1.get(), foo_properties["nullable_string_list"]));
+                auto nullable_binary_list =
+                    cptr_checked(barq_get_list(obj1.get(), foo_properties["nullable_binary_list"]));
+                auto nullable_timestamp_list =
+                    cptr_checked(barq_get_list(obj1.get(), foo_properties["nullable_timestamp_list"]));
+                auto nullable_float_list =
+                    cptr_checked(barq_get_list(obj1.get(), foo_properties["nullable_float_list"]));
+                auto nullable_double_list =
+                    cptr_checked(barq_get_list(obj1.get(), foo_properties["nullable_double_list"]));
+                auto nullable_decimal_list =
+                    cptr_checked(barq_get_list(obj1.get(), foo_properties["nullable_decimal_list"]));
+                auto nullable_object_id_list =
+                    cptr_checked(barq_get_list(obj1.get(), foo_properties["nullable_object_id_list"]));
+                auto nullable_uuid_list =
+                    cptr_checked(barq_get_list(obj1.get(), foo_properties["nullable_uuid_list"]));
+
+                write([&]() {
+                    CHECK(barq_list_insert(int_list.get(), 0, integer));
+                    CHECK(barq_list_insert(bool_list.get(), 0, boolean));
+                    CHECK(barq_list_insert(string_list.get(), 0, string));
+                    CHECK(barq_list_insert(binary_list.get(), 0, binary));
+                    CHECK(barq_list_insert(timestamp_list.get(), 0, timestamp));
+                    CHECK(barq_list_insert(float_list.get(), 0, fnum));
+                    CHECK(barq_list_insert(double_list.get(), 0, dnum));
+                    CHECK(barq_list_insert(decimal_list.get(), 0, decimal));
+                    CHECK(barq_list_insert(object_id_list.get(), 0, object_id));
+                    CHECK(barq_list_insert(uuid_list.get(), 0, uuid));
+
+                    CHECK(barq_list_insert(nullable_int_list.get(), 0, integer));
+                    CHECK(barq_list_insert(nullable_bool_list.get(), 0, boolean));
+                    CHECK(barq_list_insert(nullable_string_list.get(), 0, string));
+                    CHECK(barq_list_insert(nullable_binary_list.get(), 0, binary));
+                    CHECK(barq_list_insert(nullable_timestamp_list.get(), 0, timestamp));
+                    CHECK(barq_list_insert(nullable_float_list.get(), 0, fnum));
+                    CHECK(barq_list_insert(nullable_double_list.get(), 0, dnum));
+                    CHECK(barq_list_insert(nullable_decimal_list.get(), 0, decimal));
+                    CHECK(barq_list_insert(nullable_object_id_list.get(), 0, object_id));
+                    CHECK(barq_list_insert(nullable_uuid_list.get(), 0, uuid));
+
+                    CHECK(barq_list_insert(nullable_int_list.get(), 1, null));
+                    CHECK(barq_list_insert(nullable_bool_list.get(), 1, null));
+                    CHECK(barq_list_insert(nullable_string_list.get(), 1, null));
+                    CHECK(barq_list_insert(nullable_binary_list.get(), 1, null));
+                    CHECK(barq_list_insert(nullable_timestamp_list.get(), 1, null));
+                    CHECK(barq_list_insert(nullable_float_list.get(), 1, null));
+                    CHECK(barq_list_insert(nullable_double_list.get(), 1, null));
+                    CHECK(barq_list_insert(nullable_decimal_list.get(), 1, null));
+                    CHECK(barq_list_insert(nullable_object_id_list.get(), 1, null));
+                    CHECK(barq_list_insert(nullable_uuid_list.get(), 1, null));
+                });
+
+                auto find = ([&](auto* list, auto* value) {
+                    std::size_t index = -1;
+                    bool found = false;
+                    CHECK(checked(barq_list_find(list, value, &index, &found)));
+                    CHECK(index == 0);
+                    CHECK(found);
+                    return (index < list->size()) && found == true;
+                });
+
+                barq_value_t value;
+                CHECK(barq_list_get(int_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, integer));
+                CHECK(!barq_list_get_linked_object(int_list.get(), 0));
+                CHECK(find(int_list.get(), &value));
+                CHECK(barq_list_get(bool_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, boolean));
+                CHECK(find(bool_list.get(), &value));
+                CHECK(barq_list_get(string_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, string));
+                CHECK(find(string_list.get(), &value));
+                CHECK(barq_list_get(binary_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, binary));
+                CHECK(find(binary_list.get(), &value));
+                CHECK(barq_list_get(timestamp_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, timestamp));
+                CHECK(find(timestamp_list.get(), &value));
+                CHECK(barq_list_get(float_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, fnum));
+                CHECK(find(float_list.get(), &value));
+                CHECK(barq_list_get(double_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, dnum));
+                CHECK(find(double_list.get(), &value));
+                CHECK(barq_list_get(decimal_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, decimal));
+                CHECK(find(decimal_list.get(), &value));
+                CHECK(barq_list_get(object_id_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, object_id));
+                CHECK(find(object_id_list.get(), &value));
+                CHECK(barq_list_get(uuid_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, uuid));
+                CHECK(find(uuid_list.get(), &value));
+                CHECK(barq_list_get(nullable_int_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, integer));
+                CHECK(find(nullable_int_list.get(), &value));
+                CHECK(barq_list_get(nullable_bool_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, boolean));
+                CHECK(find(nullable_bool_list.get(), &value));
+                CHECK(barq_list_get(nullable_string_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, string));
+                CHECK(find(nullable_string_list.get(), &value));
+                CHECK(barq_list_get(nullable_binary_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, binary));
+                CHECK(find(nullable_binary_list.get(), &value));
+                CHECK(barq_list_get(nullable_timestamp_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, timestamp));
+                CHECK(find(nullable_timestamp_list.get(), &value));
+                CHECK(barq_list_get(nullable_float_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, fnum));
+                CHECK(find(nullable_float_list.get(), &value));
+                CHECK(barq_list_get(nullable_double_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, dnum));
+                CHECK(find(nullable_double_list.get(), &value));
+                CHECK(barq_list_get(nullable_decimal_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, decimal));
+                CHECK(find(nullable_decimal_list.get(), &value));
+                CHECK(barq_list_get(nullable_object_id_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, object_id));
+                CHECK(find(nullable_object_id_list.get(), &value));
+                CHECK(barq_list_get(nullable_uuid_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, uuid));
+                CHECK(find(nullable_uuid_list.get(), &value));
+
+                write([&]() {
+                    CHECK(barq_list_insert(nullable_int_list.get(), 0, null));
+                    CHECK(barq_list_insert(nullable_bool_list.get(), 0, null));
+                    CHECK(barq_list_insert(nullable_string_list.get(), 0, null));
+                    CHECK(barq_list_insert(nullable_binary_list.get(), 0, null));
+                    CHECK(barq_list_insert(nullable_timestamp_list.get(), 0, null));
+                    CHECK(barq_list_insert(nullable_float_list.get(), 0, null));
+                    CHECK(barq_list_insert(nullable_double_list.get(), 0, null));
+                    CHECK(barq_list_insert(nullable_decimal_list.get(), 0, null));
+                    CHECK(barq_list_insert(nullable_object_id_list.get(), 0, null));
+                    CHECK(barq_list_insert(nullable_uuid_list.get(), 0, null));
+                });
+
+                CHECK(barq_list_get(nullable_int_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_list_get(nullable_bool_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_list_get(nullable_string_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_list_get(nullable_binary_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_list_get(nullable_timestamp_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_list_get(nullable_float_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_list_get(nullable_double_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_list_get(nullable_decimal_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_list_get(nullable_object_id_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_list_get(nullable_uuid_list.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+            }
+
+            SECTION("move") {
+                auto int_list = cptr_checked(barq_get_list(obj1.get(), foo_properties["int_list"]));
+                write([&]() {
+                    for (int i = 0; i < 10; ++i) {
+                        CHECK(barq_list_insert(int_list.get(), i, barq_int_val(i)));
+                    }
+                });
+
+                barq_value_t value;
+                auto expected = std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+                for (int i = 0; i < 10; ++i) {
+                    CHECK(barq_list_get(int_list.get(), i, &value));
+                    CHECK(barq_val_eq(value, barq_int_val(expected[i])));
+                }
+
+                write([&]() {
+                    CHECK(barq_list_move(int_list.get(), 0, 1));
+                });
+
+                expected = std::vector<int64_t>{1, 0, 2, 3, 4, 5, 6, 7, 8, 9};
+                for (int i = 0; i < 10; ++i) {
+                    CHECK(barq_list_get(int_list.get(), i, &value));
+                    CHECK(barq_val_eq(value, barq_int_val(expected[i])));
+                }
+
+                write([&]() {
+                    CHECK(barq_list_move(int_list.get(), 3, 2));
+                });
+
+                expected = std::vector<int64_t>{1, 0, 3, 2, 4, 5, 6, 7, 8, 9};
+                for (int i = 0; i < 10; ++i) {
+                    CHECK(barq_list_get(int_list.get(), i, &value));
+                    CHECK(barq_val_eq(value, barq_int_val(expected[i])));
+                }
+            }
+
+            SECTION("links") {
+                CPtr<barq_list_t> bars;
+
+                write([&]() {
+                    bars = cptr_checked(barq_get_list(obj1.get(), foo_links_key));
+                    auto bar_link = barq_object_as_link(obj2.get());
+                    barq_value_t bar_link_val;
+                    bar_link_val.type = BARQ_TYPE_LINK;
+                    bar_link_val.link = bar_link;
+                    CHECK(checked(barq_list_insert(bars.get(), 0, bar_link_val)));
+                    CHECK(checked(barq_list_insert(bars.get(), 1, bar_link_val)));
+                    size_t size;
+                    CHECK(checked(barq_list_size(bars.get(), &size)));
+                    CHECK(size == 2);
+
+                    bool found = true;
+                    size_t index = -1;
+                    CHECK(checked(barq_list_find(bars.get(), &bar_link_val, &index, &found)));
+                    CHECK(index == 0);
+                    CHECK(found);
+
+                    barq_list_clear(bars.get());
+                    CHECK(checked(barq_list_find(bars.get(), &bar_link_val, &index, &found)));
+                    CHECK(index == barq::not_found);
+                    CHECK(!found);
+
+                    CHECK(checked(barq_list_insert(bars.get(), 0, bar_link_val)));
+                    CHECK(checked(barq_list_insert(bars.get(), 1, bar_link_val)));
+                });
+
+                SECTION("get") {
+                    barq_value_t val;
+                    CHECK(checked(barq_list_get(bars.get(), 0, &val)));
+                    CHECK(val.type == BARQ_TYPE_LINK);
+                    CHECK(val.link.target_table == class_bar.key);
+                    CHECK(val.link.target == barq_object_get_key(obj2.get()));
+
+                    CHECK(checked(barq_list_get(bars.get(), 1, &val)));
+                    CHECK(val.type == BARQ_TYPE_LINK);
+                    CHECK(val.link.target_table == class_bar.key);
+                    CHECK(val.link.target == barq_object_get_key(obj2.get()));
+
+                    auto result = barq_list_get(bars.get(), 2, &val);
+                    CHECK(!result);
+                    CHECK_ERR(BARQ_ERR_INDEX_OUT_OF_BOUNDS);
+                }
+
+                SECTION("set wrong type") {
+                    write([&]() {
+                        auto foo2 = cptr(barq_object_create(barq, class_foo.key));
+                        CHECK(foo2);
+                        barq_value_t foo2_link_val;
+                        foo2_link_val.type = BARQ_TYPE_LINK;
+                        foo2_link_val.link = barq_object_as_link(foo2.get());
+
+                        CHECK(!barq_list_set(bars.get(), 0, foo2_link_val));
+                        CHECK_ERR(BARQ_ERR_PROPERTY_TYPE_MISMATCH);
+                    });
+                }
+
+                SECTION("barq_list_clear()") {
+                    write([&]() {
+                        CHECK(barq_list_clear(bars.get()));
+                    });
+                    size_t size;
+                    CHECK(barq_list_size(bars.get(), &size));
+                    CHECK(size == 0);
+
+                    size_t num_bars;
+                    CHECK(barq_get_num_objects(barq, class_bar.key, &num_bars));
+                    CHECK(num_bars != 0);
+                }
+
+                SECTION("barq_list_remove_all()") {
+                    size_t num_bars;
+                    size_t size;
+
+                    write([&]() {
+                        CHECK(checked(barq_list_remove_all(bars.get())));
+                    });
+
+                    CHECK(barq_list_size(bars.get(), &size));
+                    CHECK(size == 0);
+
+                    CHECK(barq_get_num_objects(barq, class_bar.key, &num_bars));
+                    CHECK(num_bars == 0);
+                }
+            }
+
+            SECTION("embedded") {
+                CPtr<barq_list_t> subs;
+                barq_property_info_t info;
+                bool found = false;
+                REQUIRE(checked(barq_find_property(barq, class_bar.key, "sub_list", &found, &info)));
+                REQUIRE(found);
+                subs = cptr_checked(barq_get_list(obj2.get(), info.key));
+
+                write([&]() {
+                    auto embedded = cptr_checked(barq_list_insert_embedded(subs.get(), 0));
+                    CHECK(embedded);
+                });
+                auto embedded = cptr_checked(barq_list_get_linked_object(subs.get(), 0));
+                CHECK(embedded);
+            }
+
+            SECTION("notifications") {
+                struct State {
+                    CPtr<barq_collection_changes_t> changes;
+                    CPtr<barq_async_error_t> error;
+                    bool destroyed = false;
+                    bool called = false;
+                };
+
+                State state;
+
+                auto on_change = [](void* userdata, const barq_collection_changes_t* changes) {
+                    auto* state = static_cast<State*>(userdata);
+                    state->changes = clone_cptr(changes);
+                    state->called = true;
+                };
+
+                CPtr<barq_list_t> strings = cptr_checked(barq_get_list(obj2.get(), bar_strings_key));
+
+                auto str1 = barq_str_val("a");
+                auto str2 = barq_str_val("b");
+                auto null = barq_null();
+
+                auto require_change = [&]() {
+                    auto token = cptr_checked(
+                        barq_list_add_notification_callback(strings.get(), &state, nullptr, nullptr, on_change));
+                    checked(barq_refresh(barq, nullptr));
+                    return token;
+                };
+
+                SECTION("userdata is freed when the token is destroyed") {
+                    auto token = cptr_checked(barq_list_add_notification_callback(
+                        strings.get(), &state,
+                        [](void* p) {
+                            static_cast<State*>(p)->destroyed = true;
+                        },
+                        nullptr, nullptr));
+                    CHECK(!state.destroyed);
+                    token.reset();
+                    CHECK(state.destroyed);
+                }
+
+                SECTION("insertion sends a change callback") {
+                    auto token = require_change();
+                    write([&]() {
+                        checked(barq_list_insert(strings.get(), 0, str1));
+                        checked(barq_list_insert(strings.get(), 1, str2));
+                        checked(barq_list_insert(strings.get(), 2, null));
+                    });
+                    CHECK(!state.error);
+                    CHECK(state.changes);
+
+                    size_t num_deletion_ranges, num_insertion_ranges, num_modification_ranges, num_moves;
+                    barq_collection_changes_get_num_ranges(state.changes.get(), &num_deletion_ranges,
+                                                            &num_insertion_ranges, &num_modification_ranges,
+                                                            &num_moves);
+                    CHECK(num_deletion_ranges == 0);
+                    CHECK(num_insertion_ranges == 1);
+                    CHECK(num_modification_ranges == 0);
+                    CHECK(num_moves == 0);
+
+                    barq_index_range_t insertion_range;
+                    barq_collection_changes_get_ranges(state.changes.get(), nullptr, 0, &insertion_range, 1, nullptr,
+                                                        0, nullptr, 0, nullptr, 0);
+                    CHECK(insertion_range.from == 0);
+                    CHECK(insertion_range.to == 3);
+                }
+
+                SECTION("modifying target of list with a filter") {
+                    auto bars = cptr_checked(barq_get_list(obj1.get(), foo_links_key));
+                    write([&]() {
+                        auto bar_link = barq_object_as_link(obj2.get());
+                        barq_value_t bar_link_val;
+                        bar_link_val.type = BARQ_TYPE_LINK;
+                        bar_link_val.link = bar_link;
+                        CHECK(checked(barq_list_insert(bars.get(), 0, bar_link_val)));
+                    });
+
+                    SECTION("using valid key") {
+                        const char* bar_strings[1] = {"doubles"};
+                        auto key_path_array = barq_create_key_path_array(barq, class_bar.key, 1, bar_strings);
+                        REQUIRE(key_path_array);
+                        auto token = cptr_checked(barq_list_add_notification_callback(bars.get(), &state, nullptr,
+                                                                                       key_path_array, on_change));
+                        barq_release(key_path_array);
+                        checked(barq_refresh(barq, nullptr));
+
+                        state.called = false;
+                        write([&]() {
+                            checked(barq_set_value(obj2.get(), bar_doubles_key, barq_double_val(5.0), false));
+                        });
+                        REQUIRE(state.called);
+                        CHECK(!state.error);
+                        CHECK(state.changes);
+
+                        state.called = false;
+                        write([&]() {
+                            checked(barq_list_insert(strings.get(), 0, str1));
+                            checked(barq_list_insert(strings.get(), 1, str2));
+                            checked(barq_list_insert(strings.get(), 2, null));
+                        });
+                        REQUIRE(!state.called);
+                    }
+                    SECTION("using invalid key") {
+                        const char* bar_strings[1] = {"dobles"};
+                        auto key_path_array = barq_create_key_path_array(barq, class_bar.key, 1, bar_strings);
+                        REQUIRE(!key_path_array);
+                        barq_clear_last_error();
+                    }
+                    SECTION("Embedded objects") {
+                        barq_property_info_t info;
+                        bool found = false;
+                        bool to_be_called = true;
+                        barq_key_path_array_t* key_path_array = nullptr;
+                        barq_find_property(barq, class_bar.key, "sub", &found, &info);
+                        auto bar_sub_key = info.key;
+                        barq_find_property(barq, class_embedded.key, "int", &found, &info);
+                        auto embedded_int_key = info.key;
+                        CPtr<barq_object_t> embedded;
+                        write([&]() {
+                            embedded = cptr_checked(barq_set_embedded(obj2.get(), bar_sub_key));
+                        });
+
+                        SECTION("using empty keypath") {
+                            const char* bar_strings[1] = {""};
+                            key_path_array = barq_create_key_path_array(barq, class_bar.key, 0, bar_strings);
+                            to_be_called = false;
+                        }
+                        SECTION("using valid nesting") {
+                            const char* bar_strings[1] = {"sub.int"};
+                            key_path_array = barq_create_key_path_array(barq, class_bar.key, 1, bar_strings);
+                        }
+                        SECTION("using star notation") {
+                            const char* bar_strings[1] = {"*.int"};
+                            key_path_array = barq_create_key_path_array(barq, class_bar.key, 1, bar_strings);
+                            // (*barq)->print_key_path_array(*key_path_array);
+                        }
+
+                        REQUIRE(key_path_array);
+                        auto token = cptr_checked(barq_list_add_notification_callback(bars.get(), &state, nullptr,
+                                                                                       key_path_array, on_change));
+                        barq_release(key_path_array);
+
+                        checked(barq_refresh(barq, nullptr));
+
+                        state.called = false;
+                        state.changes = nullptr;
+                        write([&]() {
+                            checked(barq_set_value(embedded.get(), embedded_int_key, barq_int_val(999), false));
+                        });
+                        REQUIRE(state.called == to_be_called);
+                        CHECK(!state.error);
+                        if (to_be_called)
+                            CHECK(state.changes);
+                    }
+                    SECTION("using backlink") {
+                        const char* bar_strings[1] = {"linking_objects.public_int"};
+                        auto key_path_array = barq_create_key_path_array(barq, class_bar.key, 1, bar_strings);
+                        REQUIRE(key_path_array);
+                        auto token = cptr_checked(barq_list_add_notification_callback(bars.get(), &state, nullptr,
+                                                                                       key_path_array, on_change));
+                        barq_release(key_path_array);
+                        checked(barq_refresh(barq, nullptr));
+
+                        state.called = false;
+                        write([&]() {
+                            checked(barq_set_value(obj1.get(), foo_int_key, barq_int_val(999), false));
+                        });
+                        REQUIRE(state.called);
+                        CHECK(!state.error);
+                        CHECK(state.changes);
+                    }
+                    SECTION("using invalid nesting") {
+                        const char* bar_strings[1] = {"doubles.age"};
+                        auto key_path_array = barq_create_key_path_array(barq, class_bar.key, 1, bar_strings);
+                        REQUIRE(!key_path_array);
+                        barq_clear_last_error();
+                    }
+                }
+
+                SECTION("insertion, deletion, modification, modification after") {
+                    write([&]() {
+                        checked(barq_list_insert(strings.get(), 0, str1));
+                        checked(barq_list_insert(strings.get(), 1, str2));
+                        checked(barq_list_insert(strings.get(), 2, str1));
+                    });
+
+                    auto token = require_change();
+
+                    write([&]() {
+                        checked(barq_list_erase(strings.get(), 1));
+                        checked(barq_list_insert(strings.get(), 0, null));
+                        checked(barq_list_insert(strings.get(), 1, null));
+
+                        // This element was previously at 0, and ends up at 2.
+                        checked(barq_list_set(strings.get(), 2, str1));
+                    });
+                    CHECK(!state.error);
+                    CHECK(state.changes);
+
+                    size_t num_deletion_ranges, num_insertion_ranges, num_modification_ranges, num_moves;
+                    barq_collection_changes_get_num_ranges(state.changes.get(), &num_deletion_ranges,
+                                                            &num_insertion_ranges, &num_modification_ranges,
+                                                            &num_moves);
+                    CHECK(num_deletion_ranges == 1);
+                    CHECK(num_insertion_ranges == 1);
+                    CHECK(num_modification_ranges == 1);
+                    CHECK(num_moves == 0);
+
+                    size_t num_deletions, num_insertions, num_modifications;
+                    bool collection_cleared = false;
+                    barq_collection_changes_get_num_changes(state.changes.get(), &num_deletions, &num_insertions,
+                                                             &num_modifications, &num_moves, &collection_cleared,
+                                                             nullptr);
+                    CHECK(num_deletions == 1);
+                    CHECK(num_insertions == 2);
+                    CHECK(num_modifications == 1);
+                    CHECK(collection_cleared == false);
+
+                    barq_index_range_t deletions, insertions, modifications, modifications_after;
+                    barq_collection_move_t moves;
+                    barq_collection_changes_get_ranges(state.changes.get(), &deletions, 1, &insertions, 1,
+                                                        &modifications, 1, &modifications_after, 1, &moves, 1);
+                    CHECK(deletions.from == 1);
+                    CHECK(deletions.to == 2);
+
+                    CHECK(insertions.from == 0);
+                    CHECK(insertions.to == 2);
+
+                    CHECK(modifications.from == 0);
+                    CHECK(modifications.to == 1);
+
+                    CHECK(modifications_after.from == 2);
+                    CHECK(modifications_after.to == 3);
+
+                    std::vector<size_t> deletions_v, insertions_v, modifications_v, modifications_after_v;
+                    std::vector<barq_collection_move_t> moves_v;
+                    deletions_v.resize(100, size_t(-1));
+                    insertions_v.resize(100, size_t(-1));
+                    modifications_v.resize(100, size_t(-1));
+                    modifications_after_v.resize(100, size_t(-1));
+                    moves_v.resize(100, barq_collection_move_t{size_t(-1), size_t(-1)});
+                    barq_collection_changes_get_changes(state.changes.get(), deletions_v.data(), 100,
+                                                         insertions_v.data(), 100, modifications_v.data(), 100,
+                                                         modifications_after_v.data(), 100, moves_v.data(), 100);
+                    CHECK(deletions_v[0] == 1);
+                    CHECK(deletions_v[1] == size_t(-1));
+                    CHECK(insertions_v[0] == 0);
+                    CHECK(insertions_v[1] == 1);
+                    CHECK(insertions_v[2] == size_t(-1));
+                    CHECK(modifications_v[0] == 0);
+                    CHECK(modifications_v[1] == size_t(-1));
+                    CHECK(modifications_after_v[0] == 2);
+                    CHECK(modifications_after_v[1] == size_t(-1));
+
+                    write([&]() {
+                        checked(barq_list_clear(strings.get()));
+                    });
+
+                    barq_collection_changes_get_num_changes(state.changes.get(), &num_deletions, &num_insertions,
+                                                             &num_modifications, &num_moves, &collection_cleared,
+                                                             nullptr);
+                    CHECK(collection_cleared == true);
+                }
+            }
+        }
+
+        SECTION("sets") {
+            SECTION("barq_get_set() errors") {
+                CHECK(!barq_get_set(obj1.get(), foo_properties["int"]));
+                CHECK_ERR(BARQ_ERR_PROPERTY_TYPE_MISMATCH);
+
+                CHECK(!barq_get_set(obj1.get(), 123123123));
+                CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+            }
+
+            SECTION("nullable strings") {
+                auto strings = cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_string_set"]));
+                CHECK(strings);
+                CHECK(!barq_is_frozen(strings.get()));
+
+                barq_value_t a = barq_str_val("a");
+                barq_value_t b = barq_str_val("b");
+                barq_value_t c = barq_null();
+
+                SECTION("barq_equals() type check") {
+                    CHECK(!barq_equals(strings.get(), obj1.get()));
+                }
+
+                SECTION("barq_clone()") {
+                    auto set2 = clone_cptr(strings.get());
+                    CHECK(barq_equals(strings.get(), set2.get()));
+                    CHECK(strings.get() != set2.get());
+                }
+
+                SECTION("insert, then get, then erase") {
+                    write([&]() {
+                        bool inserted = false;
+                        CHECK(checked(barq_set_insert(strings.get(), a, nullptr, &inserted)));
+                        CHECK(inserted);
+                        CHECK(checked(barq_set_insert(strings.get(), b, nullptr, &inserted)));
+                        CHECK(inserted);
+                        CHECK(checked(barq_set_insert(strings.get(), c, nullptr, &inserted)));
+                        CHECK(inserted);
+
+                        size_t a_index, b_index, c_index;
+                        bool found = false;
+                        CHECK(checked(barq_set_find(strings.get(), a, &a_index, &found)));
+                        CHECK(found);
+                        CHECK(checked(barq_set_find(strings.get(), b, &b_index, &found)));
+                        CHECK(found);
+                        CHECK(checked(barq_set_find(strings.get(), c, &c_index, &found)));
+                        CHECK(found);
+
+                        barq_value_t a2, b2, c2;
+                        CHECK(checked(barq_set_get(strings.get(), a_index, &a2)));
+                        CHECK(checked(barq_set_get(strings.get(), b_index, &b2)));
+                        CHECK(checked(barq_set_get(strings.get(), c_index, &c2)));
+
+                        CHECK(barq_stdstr(a2) == "a");
+                        CHECK(barq_stdstr(b2) == "b");
+                        CHECK(c2.type == BARQ_TYPE_NULL);
+
+                        bool erased = false;
+                        CHECK(checked(barq_set_erase(strings.get(), a2, &erased)));
+                        CHECK(erased);
+                        CHECK(checked(barq_set_erase(strings.get(), barq_int_val(987), &erased)));
+                        CHECK(!erased);
+                    });
+                }
+
+                SECTION("equality") {
+                    auto strings2 = cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_string_set"]));
+                    CHECK(strings2);
+                    CHECK(barq_equals(strings.get(), strings2.get()));
+
+                    write([&]() {
+                        auto obj3 = cptr_checked(barq_object_create(barq, class_foo.key));
+                        CHECK(obj3);
+                        auto strings3 =
+                            cptr_checked(barq_get_set(obj3.get(), foo_properties["nullable_string_set"]));
+                        CHECK(!barq_equals(strings.get(), strings3.get()));
+                    });
+                }
+
+                SECTION("parse query for sets") {
+                    auto links = cptr_checked(barq_get_set(obj1.get(), foo_properties["link_set"]));
+                    CHECK(links);
+                    cptr_checked(barq_query_parse_for_set(links.get(), "TRUEPREDICATE", 0, nullptr));
+                }
+            }
+
+            SECTION("get/insert all property types") {
+                barq_value_t null = barq_null();
+                barq_value_t integer = barq_int_val(987);
+                barq_value_t boolean = barq_bool_val(true);
+                barq_value_t string = barq_str_val("My string");
+                const uint8_t binary_data[] = {0, 1, 2, 3, 4, 5, 6, 7};
+                barq_value_t binary = barq_binary_val(binary_data, sizeof(binary_data));
+                barq_value_t timestamp = barq_timestamp_val(1000000, 123123123);
+                barq_value_t fnum = barq_float_val(123.f);
+                barq_value_t dnum = barq_double_val(456.0);
+                barq_value_t decimal = barq_decimal_val(999.0);
+                barq_value_t object_id = barq_object_id_val("abc123abc123");
+                barq_value_t uuid = barq_uuid_val("01234567-9abc-4def-9012-3456789abcde");
+
+                auto int_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["int_set"]));
+                auto bool_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["bool_set"]));
+                auto string_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["string_set"]));
+                auto binary_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["binary_set"]));
+                auto timestamp_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["timestamp_set"]));
+                auto float_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["float_set"]));
+                auto double_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["double_set"]));
+                auto decimal_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["decimal_set"]));
+                auto object_id_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["object_id_set"]));
+                auto uuid_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["uuid_set"]));
+                auto nullable_int_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_int_set"]));
+                auto nullable_bool_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_bool_set"]));
+                auto nullable_string_set =
+                    cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_string_set"]));
+                auto nullable_binary_set =
+                    cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_binary_set"]));
+                auto nullable_timestamp_set =
+                    cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_timestamp_set"]));
+                auto nullable_float_set =
+                    cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_float_set"]));
+                auto nullable_double_set =
+                    cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_double_set"]));
+                auto nullable_decimal_set =
+                    cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_decimal_set"]));
+                auto nullable_object_id_set =
+                    cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_object_id_set"]));
+                auto nullable_uuid_set = cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_uuid_set"]));
+
+                write([&]() {
+                    CHECK(barq_set_insert(int_set.get(), integer, nullptr, nullptr));
+                    CHECK(barq_set_insert(bool_set.get(), boolean, nullptr, nullptr));
+                    CHECK(barq_set_insert(string_set.get(), string, nullptr, nullptr));
+                    CHECK(barq_set_insert(binary_set.get(), binary, nullptr, nullptr));
+                    CHECK(barq_set_insert(timestamp_set.get(), timestamp, nullptr, nullptr));
+                    CHECK(barq_set_insert(float_set.get(), fnum, nullptr, nullptr));
+                    CHECK(barq_set_insert(double_set.get(), dnum, nullptr, nullptr));
+                    CHECK(barq_set_insert(decimal_set.get(), decimal, nullptr, nullptr));
+                    CHECK(barq_set_insert(object_id_set.get(), object_id, nullptr, nullptr));
+                    CHECK(barq_set_insert(uuid_set.get(), uuid, nullptr, nullptr));
+
+                    CHECK(barq_set_insert(nullable_int_set.get(), integer, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_bool_set.get(), boolean, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_string_set.get(), string, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_binary_set.get(), binary, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_timestamp_set.get(), timestamp, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_float_set.get(), fnum, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_double_set.get(), dnum, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_decimal_set.get(), decimal, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_object_id_set.get(), object_id, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_uuid_set.get(), uuid, nullptr, nullptr));
+
+                    CHECK(barq_set_insert(nullable_int_set.get(), null, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_bool_set.get(), null, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_string_set.get(), null, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_binary_set.get(), null, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_timestamp_set.get(), null, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_float_set.get(), null, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_double_set.get(), null, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_decimal_set.get(), null, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_object_id_set.get(), null, nullptr, nullptr));
+                    CHECK(barq_set_insert(nullable_uuid_set.get(), null, nullptr, nullptr));
+                });
+
+                barq_value_t value;
+
+                CHECK(barq_set_get(int_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, integer));
+                CHECK(barq_set_get(bool_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, boolean));
+                CHECK(barq_set_get(string_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, string));
+                CHECK(barq_set_get(binary_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, binary));
+                CHECK(barq_set_get(timestamp_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, timestamp));
+                CHECK(barq_set_get(float_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, fnum));
+                CHECK(barq_set_get(double_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, dnum));
+                CHECK(barq_set_get(decimal_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, decimal));
+                CHECK(barq_set_get(object_id_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, object_id));
+                CHECK(barq_set_get(uuid_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, uuid));
+                CHECK(barq_set_get(nullable_int_set.get(), 1, &value));
+                CHECK(barq_val_eq(value, integer));
+                CHECK(barq_set_get(nullable_bool_set.get(), 1, &value));
+                CHECK(barq_val_eq(value, boolean));
+                CHECK(barq_set_get(nullable_string_set.get(), 1, &value));
+                CHECK(barq_val_eq(value, string));
+                CHECK(barq_set_get(nullable_binary_set.get(), 1, &value));
+                CHECK(barq_val_eq(value, binary));
+                CHECK(barq_set_get(nullable_timestamp_set.get(), 1, &value));
+                CHECK(barq_val_eq(value, timestamp));
+                CHECK(barq_set_get(nullable_float_set.get(), 1, &value));
+                CHECK(barq_val_eq(value, fnum));
+                CHECK(barq_set_get(nullable_double_set.get(), 1, &value));
+                CHECK(barq_val_eq(value, dnum));
+                CHECK(barq_set_get(nullable_decimal_set.get(), 1, &value));
+                CHECK(barq_val_eq(value, decimal));
+                CHECK(barq_set_get(nullable_object_id_set.get(), 1, &value));
+                CHECK(barq_val_eq(value, object_id));
+                CHECK(barq_set_get(nullable_uuid_set.get(), 1, &value));
+                CHECK(barq_val_eq(value, uuid));
+
+                write([&]() {
+                    size_t index;
+                    bool inserted;
+                    CHECK(barq_set_insert(nullable_int_set.get(), null, &index, &inserted));
+                    CHECK((index == 0 && !inserted));
+                    CHECK(barq_set_insert(nullable_bool_set.get(), null, &index, &inserted));
+                    CHECK((index == 0 && !inserted));
+                    CHECK(barq_set_insert(nullable_string_set.get(), null, &index, &inserted));
+                    CHECK((index == 0 && !inserted));
+                    CHECK(barq_set_insert(nullable_binary_set.get(), null, &index, &inserted));
+                    CHECK((index == 0 && !inserted));
+                    CHECK(barq_set_insert(nullable_timestamp_set.get(), null, &index, &inserted));
+                    CHECK((index == 0 && !inserted));
+                    CHECK(barq_set_insert(nullable_float_set.get(), null, &index, &inserted));
+                    CHECK((index == 0 && !inserted));
+                    CHECK(barq_set_insert(nullable_double_set.get(), null, &index, &inserted));
+                    CHECK((index == 0 && !inserted));
+                    CHECK(barq_set_insert(nullable_decimal_set.get(), null, &index, &inserted));
+                    CHECK((index == 0 && !inserted));
+                    CHECK(barq_set_insert(nullable_object_id_set.get(), null, &index, &inserted));
+                    CHECK((index == 0 && !inserted));
+                    CHECK(barq_set_insert(nullable_uuid_set.get(), null, &index, &inserted));
+                    CHECK((index == 0 && !inserted));
+                });
+
+                // Note: This relies on the fact that NULL is "less than" other
+                // values in the internal sort order.
+                CHECK(barq_set_get(nullable_int_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_set_get(nullable_bool_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_set_get(nullable_string_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_set_get(nullable_binary_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_set_get(nullable_timestamp_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_set_get(nullable_float_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_set_get(nullable_double_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_set_get(nullable_decimal_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_set_get(nullable_object_id_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_set_get(nullable_uuid_set.get(), 0, &value));
+                CHECK(barq_val_eq(value, null));
+            }
+
+            SECTION("links") {
+                CPtr<barq_set_t> bars;
+
+                write([&]() {
+                    bars = cptr_checked(barq_get_set(obj1.get(), foo_properties["link_set"]));
+                    auto bar_link = barq_object_as_link(obj2.get());
+                    barq_value_t bar_link_val;
+                    bar_link_val.type = BARQ_TYPE_LINK;
+                    bar_link_val.link = bar_link;
+                    size_t index;
+                    bool inserted;
+                    CHECK(checked(barq_set_insert(bars.get(), bar_link_val, &index, &inserted)));
+                    CHECK((index == 0 && inserted));
+                    CHECK(checked(barq_set_insert(bars.get(), bar_link_val, &index, &inserted)));
+                    CHECK((index == 0 && !inserted));
+                    size_t size;
+                    CHECK(checked(barq_set_size(bars.get(), &size)));
+                    CHECK(size == 1);
+
+                    auto results =
+                        cptr_checked(barq_get_backlinks(obj2.get(), class_foo.key, foo_properties["link_set"]));
+                    CHECK(results->size() == 1);
+                    auto mixed_link = results->get_any(0);
+                    CHECK(!mixed_link.is_unresolved_link());
+                    CHECK(mixed_link.is_type(type_TypedLink));
+                    auto link = mixed_link.get_link();
+                    CHECK(link.get_obj_key() == obj1->get_obj().get_key());
+                    CHECK(link.get_table_key() == obj1->get_obj().get_table()->get_key());
+                });
+
+                SECTION("get") {
+                    barq_value_t val;
+                    CHECK(checked(barq_set_get(bars.get(), 0, &val)));
+                    CHECK(val.type == BARQ_TYPE_LINK);
+                    CHECK(val.link.target_table == class_bar.key);
+                    CHECK(val.link.target == barq_object_get_key(obj2.get()));
+
+                    auto result = barq_set_get(bars.get(), 1, &val);
+                    CHECK(!result);
+                    CHECK_ERR(BARQ_ERR_INDEX_OUT_OF_BOUNDS);
+                }
+
+                SECTION("insert wrong type") {
+                    write([&]() {
+                        auto foo2 = cptr(barq_object_create(barq, class_foo.key));
+                        CHECK(foo2);
+                        barq_value_t foo2_link_val;
+                        foo2_link_val.type = BARQ_TYPE_LINK;
+                        foo2_link_val.link = barq_object_as_link(foo2.get());
+
+                        CHECK(!barq_set_insert(bars.get(), foo2_link_val, nullptr, nullptr));
+                        CHECK_ERR(BARQ_ERR_PROPERTY_TYPE_MISMATCH);
+                    });
+                }
+
+                SECTION("barq_set_clear()") {
+                    write([&]() {
+                        CHECK(barq_set_clear(bars.get()));
+                    });
+                    size_t size;
+                    CHECK(barq_set_size(bars.get(), &size));
+                    CHECK(size == 0);
+
+                    size_t num_bars;
+                    CHECK(barq_get_num_objects(barq, class_bar.key, &num_bars));
+                    CHECK(num_bars != 0);
+                }
+
+                SECTION("barq_set_remove_all()") {
+                    barq_value_t val;
+                    CHECK(checked(barq_set_get(bars.get(), 0, &val)));
+                    CHECK(val.type == BARQ_TYPE_LINK);
+                    CHECK(val.link.target_table == class_bar.key);
+                    CHECK(val.link.target == barq_object_get_key(obj2.get()));
+
+                    size_t num_bars;
+                    size_t size;
+
+                    write([&]() {
+                        CHECK(checked(barq_set_remove_all(bars.get())));
+                    });
+
+                    CHECK(barq_set_size(bars.get(), &size));
+                    CHECK(size == 0);
+
+                    CHECK(barq_get_num_objects(barq, class_bar.key, &num_bars));
+                    CHECK(num_bars == 0);
+                }
+            }
+
+            SECTION("notifications") {
+                struct State {
+                    CPtr<barq_collection_changes_t> changes;
+                    CPtr<barq_async_error_t> error;
+                    bool destroyed = false;
+                };
+
+                State state;
+
+                auto on_change = [](void* userdata, const barq_collection_changes_t* changes) {
+                    auto* state = static_cast<State*>(userdata);
+                    state->changes = clone_cptr(changes);
+                };
+
+                CPtr<barq_set_t> strings =
+                    cptr_checked(barq_get_set(obj1.get(), foo_properties["nullable_string_set"]));
+
+                auto str1 = barq_str_val("a");
+                auto str2 = barq_str_val("b");
+                auto null = barq_null();
+
+                auto require_change = [&]() {
+                    auto token = cptr_checked(
+                        barq_set_add_notification_callback(strings.get(), &state, nullptr, nullptr, on_change));
+                    checked(barq_refresh(barq, nullptr));
+                    return token;
+                };
+
+                SECTION("userdata is freed when the token is destroyed") {
+                    auto token = cptr_checked(barq_set_add_notification_callback(
+                        strings.get(), &state,
+                        [](void* p) {
+                            static_cast<State*>(p)->destroyed = true;
+                        },
+                        nullptr, nullptr));
+                    CHECK(!state.destroyed);
+                    token.reset();
+                    CHECK(state.destroyed);
+                }
+
+                SECTION("insertion,deletion sends a change callback") {
+                    write([&]() {
+                        checked(barq_set_insert(strings.get(), str1, nullptr, nullptr));
+                    });
+
+                    auto token = require_change();
+                    write([&]() {
+                        checked(barq_set_erase(strings.get(), str1, nullptr));
+                        checked(barq_set_insert(strings.get(), str2, nullptr, nullptr));
+                        checked(barq_set_insert(strings.get(), null, nullptr, nullptr));
+                    });
+                    CHECK(!state.error);
+                    CHECK(state.changes);
+
+                    size_t num_deletion_ranges, num_insertion_ranges, num_modification_ranges, num_moves;
+                    barq_collection_changes_get_num_ranges(state.changes.get(), &num_deletion_ranges,
+                                                            &num_insertion_ranges, &num_modification_ranges,
+                                                            &num_moves);
+                    CHECK(num_deletion_ranges == 1);
+                    CHECK(num_insertion_ranges == 1);
+                    CHECK(num_modification_ranges == 0);
+                    CHECK(num_moves == 0);
+
+                    barq_index_range_t insertion_range, deletion_range;
+                    barq_collection_changes_get_ranges(state.changes.get(), &deletion_range, 1, &insertion_range, 1,
+                                                        nullptr, 0, nullptr, 0, nullptr, 0);
+                    CHECK(deletion_range.from == 0);
+                    CHECK(deletion_range.to == 1);
+                    CHECK(insertion_range.from == 0);
+                    CHECK(insertion_range.to == 2);
+
+                    write([&]() {
+                        checked(barq_set_clear(strings.get()));
+                    });
+
+                    size_t num_deletions, num_insertions, num_modifications;
+                    bool collection_cleared = false;
+                    barq_collection_changes_get_num_changes(state.changes.get(), &num_deletions, &num_insertions,
+                                                             &num_modifications, &num_moves, &collection_cleared,
+                                                             nullptr);
+                    CHECK(collection_cleared == true);
+                }
+            }
+        }
+
+        SECTION("dictionaries") {
+            SECTION("barq_get_dictionary() errors") {
+                CHECK(!barq_get_dictionary(obj1.get(), foo_properties["int"]));
+                CHECK_ERR(BARQ_ERR_PROPERTY_TYPE_MISMATCH);
+
+                CHECK(!barq_get_dictionary(obj1.get(), 123123123));
+                CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+            }
+
+            SECTION("nullable strings") {
+                auto strings = cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_string_dict"]));
+                CHECK(strings);
+                CHECK(!barq_is_frozen(strings.get()));
+
+                barq_value_t a = barq_str_val("a");
+                barq_value_t b = barq_str_val("b");
+                barq_value_t c = barq_null();
+                barq_value_t key_a = barq_str_val("key_a");
+                barq_value_t key_b = barq_str_val("key_b");
+                barq_value_t key_c = barq_str_val("key_c");
+
+                SECTION("barq_equals() type check") {
+                    CHECK(!barq_equals(strings.get(), obj1.get()));
+                }
+
+                SECTION("barq_clone()") {
+                    auto dict2 = clone_cptr(strings.get());
+                    CHECK(barq_equals(strings.get(), dict2.get()));
+                    CHECK(strings.get() != dict2.get());
+                }
+
+                SECTION("insert, then get, then erase") {
+                    write([&]() {
+                        bool inserted = false;
+                        CHECK(checked(barq_dictionary_insert(strings.get(), key_a, a, nullptr, &inserted)));
+                        CHECK(inserted);
+                        CHECK(checked(barq_dictionary_insert(strings.get(), key_b, b, nullptr, &inserted)));
+                        CHECK(inserted);
+                        CHECK(checked(barq_dictionary_insert(strings.get(), key_c, c, nullptr, &inserted)));
+                        CHECK(inserted);
+
+                        barq_value_t a2, b2, c2;
+                        bool found = false;
+                        CHECK(checked(barq_dictionary_find(strings.get(), key_a, &a2, &found)));
+                        CHECK(found);
+                        CHECK(checked(barq_dictionary_find(strings.get(), key_b, &b2, &found)));
+                        CHECK(found);
+                        CHECK(checked(barq_dictionary_find(strings.get(), key_c, &c2, &found)));
+                        CHECK(found);
+
+                        CHECK(barq_stdstr(a2) == "a");
+                        CHECK(barq_stdstr(b2) == "b");
+                        CHECK(c2.type == BARQ_TYPE_NULL);
+
+                        bool erased = false;
+                        CHECK(checked(barq_dictionary_erase(strings.get(), key_a, &erased)));
+                        CHECK(erased);
+                        CHECK(checked(barq_dictionary_erase(strings.get(), barq_int_val(987), &erased)));
+                        CHECK(!erased);
+                    });
+                }
+
+                SECTION("equality") {
+                    auto strings2 =
+                        cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_string_dict"]));
+                    CHECK(strings2);
+                    CHECK(barq_equals(strings.get(), strings2.get()));
+
+                    write([&]() {
+                        auto obj3 = cptr_checked(barq_object_create(barq, class_foo.key));
+                        CHECK(obj3);
+                        auto strings3 =
+                            cptr_checked(barq_get_dictionary(obj3.get(), foo_properties["nullable_string_dict"]));
+                        CHECK(!barq_equals(strings.get(), strings3.get()));
+                    });
+                }
+            }
+
+            SECTION("get/insert all property types") {
+                barq_value_t key = barq_str_val("k");
+                barq_value_t key2 = barq_str_val("k2");
+
+                barq_value_t null = barq_null();
+                barq_value_t integer = barq_int_val(987);
+                barq_value_t boolean = barq_bool_val(true);
+                barq_value_t string = barq_str_val("My string");
+                const uint8_t binary_data[] = {0, 1, 2, 3, 4, 5, 6, 7};
+                barq_value_t binary = barq_binary_val(binary_data, sizeof(binary_data));
+                barq_value_t timestamp = barq_timestamp_val(1000000, 123123123);
+                barq_value_t fnum = barq_float_val(123.f);
+                barq_value_t dnum = barq_double_val(456.0);
+                barq_value_t decimal = barq_decimal_val(999.0);
+                barq_value_t object_id = barq_object_id_val("abc123abc123");
+                barq_value_t uuid = barq_uuid_val("01234567-9abc-4def-9012-3456789abcde");
+
+                auto int_dict = cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["int_dict"]));
+                auto bool_dict = cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["bool_dict"]));
+                auto string_dict = cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["string_dict"]));
+                auto binary_dict = cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["binary_dict"]));
+                auto timestamp_dict =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["timestamp_dict"]));
+                auto float_dict = cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["float_dict"]));
+                auto double_dict = cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["double_dict"]));
+                auto decimal_dict = cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["decimal_dict"]));
+                auto object_id_dict =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["object_id_dict"]));
+                auto uuid_dict = cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["uuid_dict"]));
+                auto nullable_int_dict =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_int_dict"]));
+                auto nullable_bool_dict =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_bool_dict"]));
+                auto nullable_string_dict =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_string_dict"]));
+                auto nullable_binary_dict =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_binary_dict"]));
+                auto nullable_timestamp_dict =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_timestamp_dict"]));
+                auto nullable_float_dict =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_float_dict"]));
+                auto nullable_double_dict =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_double_dict"]));
+                auto nullable_decimal_dict =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_decimal_dict"]));
+                auto nullable_object_id_dict =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_object_id_dict"]));
+                auto nullable_uuid_dict =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_uuid_dict"]));
+
+                write([&]() {
+                    size_t index;
+                    bool inserted;
+                    CHECK(!barq_dictionary_insert(int_dict.get(), barq_int_val(987), integer, &index, &inserted));
+
+                    CHECK(barq_dictionary_insert(int_dict.get(), key, integer, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(bool_dict.get(), key, boolean, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(string_dict.get(), key, string, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(binary_dict.get(), key, binary, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(timestamp_dict.get(), key, timestamp, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(float_dict.get(), key, fnum, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(double_dict.get(), key, dnum, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(decimal_dict.get(), key, decimal, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(object_id_dict.get(), key, object_id, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(uuid_dict.get(), key, uuid, &index, &inserted));
+                    CHECK((inserted && index == 0));
+
+                    CHECK(barq_dictionary_insert(nullable_int_dict.get(), key, integer, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(nullable_bool_dict.get(), key, boolean, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(nullable_string_dict.get(), key, string, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(nullable_binary_dict.get(), key, binary, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(nullable_timestamp_dict.get(), key, timestamp, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(nullable_float_dict.get(), key, fnum, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(nullable_double_dict.get(), key, dnum, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(nullable_decimal_dict.get(), key, decimal, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(nullable_object_id_dict.get(), key, object_id, &index, &inserted));
+                    CHECK((inserted && index == 0));
+                    CHECK(barq_dictionary_insert(nullable_uuid_dict.get(), key, uuid, &index, &inserted));
+                    CHECK((inserted && index == 0));
+
+                    CHECK(barq_dictionary_insert(nullable_int_dict.get(), key2, null, &index, &inserted));
+                    CHECK((inserted && index == 1));
+                    CHECK(barq_dictionary_insert(nullable_bool_dict.get(), key2, null, &index, &inserted));
+                    CHECK((inserted && index == 1));
+                    CHECK(barq_dictionary_insert(nullable_string_dict.get(), key2, null, &index, &inserted));
+                    CHECK((inserted && index == 1));
+                    CHECK(barq_dictionary_insert(nullable_binary_dict.get(), key2, null, &index, &inserted));
+                    CHECK((inserted && index == 1));
+                    CHECK(barq_dictionary_insert(nullable_timestamp_dict.get(), key2, null, &index, &inserted));
+                    CHECK((inserted && index == 1));
+                    CHECK(barq_dictionary_insert(nullable_float_dict.get(), key2, null, &index, &inserted));
+                    CHECK((inserted && index == 1));
+                    CHECK(barq_dictionary_insert(nullable_double_dict.get(), key2, null, &index, &inserted));
+                    CHECK((inserted && index == 1));
+                    CHECK(barq_dictionary_insert(nullable_decimal_dict.get(), key2, null, &index, &inserted));
+                    CHECK((inserted && index == 1));
+                    CHECK(barq_dictionary_insert(nullable_object_id_dict.get(), key2, null, &index, &inserted));
+                    CHECK((inserted && index == 1));
+                    CHECK(barq_dictionary_insert(nullable_uuid_dict.get(), key2, null, &index, &inserted));
+                    CHECK((inserted && index == 1));
+                });
+
+                barq_value_t k, value;
+
+                CHECK(barq_dictionary_get(int_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, integer));
+                CHECK(barq_dictionary_get(bool_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, boolean));
+                CHECK(barq_dictionary_get(string_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, string));
+                CHECK(barq_dictionary_get(binary_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, binary));
+                CHECK(barq_dictionary_get(timestamp_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, timestamp));
+                CHECK(barq_dictionary_get(float_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, fnum));
+                CHECK(barq_dictionary_get(double_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, dnum));
+                CHECK(barq_dictionary_get(decimal_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, decimal));
+                CHECK(barq_dictionary_get(object_id_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, object_id));
+                CHECK(barq_dictionary_get(uuid_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, uuid));
+                CHECK(barq_dictionary_get(nullable_int_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, integer));
+                CHECK(barq_dictionary_get(nullable_bool_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, boolean));
+                CHECK(barq_dictionary_get(nullable_string_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, string));
+                CHECK(barq_dictionary_get(nullable_binary_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, binary));
+                CHECK(barq_dictionary_get(nullable_timestamp_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, timestamp));
+                CHECK(barq_dictionary_get(nullable_float_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, fnum));
+                CHECK(barq_dictionary_get(nullable_double_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, dnum));
+                CHECK(barq_dictionary_get(nullable_decimal_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, decimal));
+                CHECK(barq_dictionary_get(nullable_object_id_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, object_id));
+                CHECK(barq_dictionary_get(nullable_uuid_dict.get(), 0, &k, &value));
+                CHECK(barq_val_eq(k, key));
+                CHECK(barq_val_eq(value, uuid));
+
+                write([&]() {
+                    size_t index;
+                    bool inserted;
+                    CHECK(barq_dictionary_insert(nullable_int_dict.get(), key2, null, &index, &inserted));
+                    CHECK(!inserted);
+                    CHECK(barq_dictionary_insert(nullable_bool_dict.get(), key2, null, &index, &inserted));
+                    CHECK(!inserted);
+                    CHECK(barq_dictionary_insert(nullable_string_dict.get(), key2, null, &index, &inserted));
+                    CHECK(!inserted);
+                    CHECK(barq_dictionary_insert(nullable_binary_dict.get(), key2, null, &index, &inserted));
+                    CHECK(!inserted);
+                    CHECK(barq_dictionary_insert(nullable_timestamp_dict.get(), key2, null, &index, &inserted));
+                    CHECK(!inserted);
+                    CHECK(barq_dictionary_insert(nullable_float_dict.get(), key2, null, &index, &inserted));
+                    CHECK(!inserted);
+                    CHECK(barq_dictionary_insert(nullable_double_dict.get(), key2, null, &index, &inserted));
+                    CHECK(!inserted);
+                    CHECK(barq_dictionary_insert(nullable_decimal_dict.get(), key2, null, &index, &inserted));
+                    CHECK(!inserted);
+                    CHECK(barq_dictionary_insert(nullable_object_id_dict.get(), key2, null, &index, &inserted));
+                    CHECK(!inserted);
+                    CHECK(barq_dictionary_insert(nullable_uuid_dict.get(), key2, null, &index, &inserted));
+                    CHECK(!inserted);
+                });
+
+                CHECK(barq_dictionary_find(int_dict.get(), barq_int_val(987), &value, &found));
+                CHECK(!found);
+                CHECK(barq_dictionary_find(int_dict.get(), barq_str_val("Boogeyman"), &value, &found));
+                CHECK(!found);
+                CHECK(barq_dictionary_find(int_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, integer));
+                CHECK(barq_dictionary_find(bool_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, boolean));
+                CHECK(barq_dictionary_find(string_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, string));
+                CHECK(barq_dictionary_find(binary_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, binary));
+                CHECK(barq_dictionary_find(timestamp_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, timestamp));
+                CHECK(barq_dictionary_find(float_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, fnum));
+                CHECK(barq_dictionary_find(double_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, dnum));
+                CHECK(barq_dictionary_find(decimal_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, decimal));
+                CHECK(barq_dictionary_find(object_id_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, object_id));
+                CHECK(barq_dictionary_find(uuid_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, uuid));
+                CHECK(barq_dictionary_find(nullable_int_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, integer));
+                CHECK(barq_dictionary_find(nullable_bool_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, boolean));
+                CHECK(barq_dictionary_find(nullable_string_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, string));
+                CHECK(barq_dictionary_find(nullable_binary_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, binary));
+                CHECK(barq_dictionary_find(nullable_timestamp_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, timestamp));
+                CHECK(barq_dictionary_find(nullable_float_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, fnum));
+                CHECK(barq_dictionary_find(nullable_double_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, dnum));
+                CHECK(barq_dictionary_find(nullable_decimal_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, decimal));
+                CHECK(barq_dictionary_find(nullable_object_id_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, object_id));
+                CHECK(barq_dictionary_find(nullable_uuid_dict.get(), key, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, uuid));
+
+                CHECK(barq_dictionary_find(nullable_int_dict.get(), key2, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_dictionary_find(nullable_bool_dict.get(), key2, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_dictionary_find(nullable_string_dict.get(), key2, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_dictionary_find(nullable_binary_dict.get(), key2, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_dictionary_find(nullable_timestamp_dict.get(), key2, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_dictionary_find(nullable_float_dict.get(), key2, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_dictionary_find(nullable_double_dict.get(), key2, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_dictionary_find(nullable_decimal_dict.get(), key2, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_dictionary_find(nullable_object_id_dict.get(), key2, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, null));
+                CHECK(barq_dictionary_find(nullable_uuid_dict.get(), key2, &value, &found));
+                CHECK(found);
+                CHECK(barq_val_eq(value, null));
+            }
+
+            SECTION("links") {
+                CPtr<barq_dictionary_t> bars;
+                barq_value_t key = barq_str_val("k");
+
+                write([&]() {
+                    bars = cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["link_dict"]));
+                    auto bar_link = barq_object_as_link(obj2.get());
+                    barq_value_t bar_link_val;
+                    bar_link_val.type = BARQ_TYPE_LINK;
+                    bar_link_val.link = bar_link;
+                    size_t index;
+                    bool inserted;
+                    CHECK(checked(barq_dictionary_insert(bars.get(), key, bar_link_val, &index, &inserted)));
+                    CHECK((index == 0 && inserted));
+                    CHECK(checked(barq_dictionary_insert(bars.get(), key, bar_link_val, &index, &inserted)));
+                    CHECK((index == 0 && !inserted));
+                    size_t size;
+                    CHECK(checked(barq_dictionary_size(bars.get(), &size)));
+                    CHECK(size == 1);
+                });
+
+                SECTION("get") {
+                    barq_value_t k, val;
+                    CHECK(checked(barq_dictionary_get(bars.get(), 0, &k, &val)));
+                    CHECK(barq_val_eq(k, key));
+                    CHECK(val.type == BARQ_TYPE_LINK);
+                    CHECK(val.link.target_table == class_bar.key);
+                    CHECK(val.link.target == barq_object_get_key(obj2.get()));
+
+                    auto result = barq_dictionary_get(bars.get(), 1, &k, &val);
+                    CHECK(!result);
+                    CHECK_ERR(BARQ_ERR_INDEX_OUT_OF_BOUNDS);
+                }
+
+                SECTION("insert wrong type") {
+                    write([&]() {
+                        auto foo2 = cptr(barq_object_create(barq, class_foo.key));
+                        CHECK(foo2);
+                        barq_value_t foo2_link_val;
+                        foo2_link_val.type = BARQ_TYPE_LINK;
+                        foo2_link_val.link = barq_object_as_link(foo2.get());
+
+                        CHECK(!barq_dictionary_insert(bars.get(), key, foo2_link_val, nullptr, nullptr));
+                        CHECK_ERR(BARQ_ERR_PROPERTY_TYPE_MISMATCH);
+                    });
+                }
+
+                SECTION("barq_dictionary_clear()") {
+                    write([&]() {
+                        CHECK(barq_dictionary_clear(bars.get()));
+                    });
+                    size_t size;
+                    CHECK(barq_dictionary_size(bars.get(), &size));
+                    CHECK(size == 0);
+
+                    size_t num_bars;
+                    CHECK(barq_get_num_objects(barq, class_bar.key, &num_bars));
+                    CHECK(num_bars != 0);
+                }
+            }
+
+            SECTION("notifications") {
+                struct State {
+                    CPtr<barq_collection_changes_t> changes;
+                    CPtr<barq_dictionary_changes_t> dictionary_changes;
+                    CPtr<barq_async_error_t> error;
+                    bool destroyed = false;
+                };
+
+                State state;
+                auto on_dictionary_change = [](void* userdata, const barq_dictionary_changes_t* changes) {
+                    auto* state = static_cast<State*>(userdata);
+                    state->dictionary_changes = clone_cptr(changes);
+                };
+
+                CPtr<barq_dictionary_t> strings =
+                    cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["nullable_string_dict"]));
+
+                auto str1 = barq_str_val("a");
+                auto str2 = barq_str_val("b");
+                auto null = barq_null();
+
+
+                auto require_change = [&]() {
+                    auto token = cptr_checked(barq_dictionary_add_notification_callback(
+                        strings.get(), &state, nullptr, nullptr, on_dictionary_change));
+                    checked(barq_refresh(barq, nullptr));
+                    return token;
+                };
+
+                SECTION("userdata is freed when the token is destroyed") {
+                    auto token = cptr_checked(barq_dictionary_add_notification_callback(
+                        strings.get(), &state,
+                        [](void* p) {
+                            static_cast<State*>(p)->destroyed = true;
+                        },
+                        nullptr, nullptr));
+                    CHECK(!state.destroyed);
+                    token.reset();
+                    CHECK(state.destroyed);
+                }
+
+                SECTION("insertion, deletions sends a change callback") {
+                    write([&]() {
+                        checked(barq_dictionary_insert(strings.get(), barq_str_val("a"), str1, nullptr, nullptr));
+                    });
+                    auto token = require_change();
+                    write([&]() {
+                        checked(barq_dictionary_erase(strings.get(), barq_str_val("a"), nullptr));
+                        checked(barq_dictionary_insert(strings.get(), barq_str_val("b"), str2, nullptr, nullptr));
+                        checked(barq_dictionary_insert(strings.get(), barq_str_val("c"), null, nullptr, nullptr));
+                    });
+                    CHECK(!state.error);
+                    CHECK(state.dictionary_changes);
+
+                    size_t num_deletions, num_insertions, num_modifications;
+                    barq_dictionary_get_changes(state.dictionary_changes.get(), &num_deletions, &num_insertions,
+                                                 &num_modifications, nullptr);
+                    CHECK(num_deletions == 1);
+                    CHECK(num_insertions == 2);
+                    CHECK(num_modifications == 0);
+                    barq_value_t *deletions = nullptr, *insertions = nullptr, *modifications = nullptr;
+                    bool collection_cleared = false;
+                    deletions = (barq_value_t*)malloc(sizeof(barq_value_t) * num_deletions);
+                    insertions = (barq_value_t*)malloc(sizeof(barq_value_t) * num_insertions);
+                    barq_dictionary_get_changed_keys(state.dictionary_changes.get(), deletions, &num_deletions,
+                                                      insertions, &num_insertions, modifications, &num_modifications,
+                                                      &collection_cleared);
+                    CHECK(deletions != nullptr);
+                    CHECK(insertions != nullptr);
+                    CHECK(modifications == nullptr);
+                    barq_free(deletions);
+                    barq_free(insertions);
+                    barq_free(modifications);
+
+                    write([&]() {
+                        checked(barq_dictionary_clear(strings.get()));
+                    });
+                    barq_dictionary_get_changed_keys(state.dictionary_changes.get(), deletions, &num_deletions,
+                                                      insertions, &num_insertions, modifications, &num_modifications,
+                                                      &collection_cleared);
+                    CHECK(collection_cleared == true);
+                }
+            }
+
+            SECTION("barq_dictionary_content_checks") {
+                auto ints = cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["int_dict"]));
+                CHECK(ints);
+                CHECK(!barq_is_frozen(ints.get()));
+                barq_value_t key1 = barq_str_val("k");
+                barq_value_t key2 = barq_str_val("k2");
+                barq_value_t integer1 = barq_int_val(987);
+                barq_value_t integer2 = barq_int_val(988);
+
+                write([&]() {
+                    bool inserted = false;
+                    CHECK(checked(barq_dictionary_insert(ints.get(), key1, integer1, nullptr, &inserted)));
+                    CHECK(inserted);
+                    CHECK(checked(barq_dictionary_insert(ints.get(), key2, integer2, nullptr, &inserted)));
+                    CHECK(inserted);
+                });
+
+                SECTION("barq_dictionary_get_keys") {
+                    size_t size = 0;
+                    barq_results_t* keys = nullptr;
+                    CHECK(checked(barq_dictionary_get_keys(ints.get(), &size, &keys)));
+                    CHECK(keys);
+                    CHECK((*keys).size() == size);
+                    barq_release(keys);
+                }
+
+                SECTION("barq_dictionary_contains_key") {
+                    bool found = false;
+                    CHECK(checked(barq_dictionary_contains_key(ints.get(), key1, &found)));
+                    CHECK(found);
+                    found = false;
+                    CHECK(checked(barq_dictionary_contains_key(ints.get(), key2, &found)));
+                    CHECK(found);
+                    barq_value_t key_no_present = barq_str_val("kkkk");
+                    CHECK(checked(barq_dictionary_contains_key(ints.get(), key_no_present, &found)));
+                    CHECK(!found);
+                }
+
+                SECTION("barq_dictionary_contains_value") {
+                    size_t index = -1;
+                    CHECK(checked(barq_dictionary_contains_value(ints.get(), integer1, &index)));
+                    CHECK(index == 0);
+                    CHECK(checked(barq_dictionary_contains_value(ints.get(), integer2, &index)));
+                    CHECK(index == 1);
+                    barq_value_t integer_no_present = barq_int_val(678);
+                    CHECK(checked(barq_dictionary_contains_value(ints.get(), integer_no_present, &index)));
+                    CHECK(index == barq::npos);
+                }
+            }
+        }
+
+        SECTION("notifications") {
+            struct State {
+                CPtr<barq_object_changes_t> changes;
+                CPtr<barq_async_error_t> error;
+                bool called;
+            };
+
+            State state;
+
+            auto on_change = [](void* userdata, const barq_object_changes_t* changes) {
+                auto state = static_cast<State*>(userdata);
+                state->changes = clone_cptr(changes);
+                state->called = true;
+            };
+
+            auto require_change = [&]() {
+                auto token =
+                    cptr(barq_object_add_notification_callback(obj1.get(), &state, nullptr, nullptr, on_change));
+                checked(barq_refresh(barq, nullptr));
+                return token;
+            };
+
+            SECTION("deleting the object sends a change notification") {
+                auto token = require_change();
+                write([&]() {
+                    checked(barq_object_delete(obj1.get()));
+                });
+                CHECK(!state.error);
+                CHECK(state.changes);
+                bool deleted = barq_object_changes_is_deleted(state.changes.get());
+                CHECK(deleted);
+            }
+
+            SECTION("modifying the object sends a change notification for the object, and for the changed column") {
+                auto token = require_change();
+                write([&]() {
+                    checked(barq_set_value(obj1.get(), foo_int_key, barq_int_val(999), false));
+                    checked(barq_set_value(obj1.get(), foo_str_key, barq_str_val("aaa"), false));
+                });
+                CHECK(!state.error);
+                CHECK(state.changes);
+                bool deleted = barq_object_changes_is_deleted(state.changes.get());
+                CHECK(!deleted);
+                size_t num_modified = barq_object_changes_get_num_modified_properties(state.changes.get());
+                CHECK(num_modified == 2);
+                barq_property_key_t modified_keys[2];
+                size_t n = barq_object_changes_get_modified_properties(state.changes.get(), modified_keys, 2);
+                CHECK(n == 2);
+                CHECK(modified_keys[0] == foo_int_key);
+                CHECK(modified_keys[1] == foo_str_key);
+
+                n = barq_object_changes_get_modified_properties(state.changes.get(), nullptr, 2);
+                CHECK(n == 2);
+
+                n = barq_object_changes_get_modified_properties(state.changes.get(), modified_keys, 0);
+                CHECK(n == 0);
+            }
+            SECTION("modifying the object while observing a specific value") {
+                const char* foo_strings[1] = {"public_int"};
+                auto key_path_array = barq_create_key_path_array(barq, class_foo.key, 1, foo_strings);
+                REQUIRE(key_path_array);
+                auto token = cptr(
+                    barq_object_add_notification_callback(obj1.get(), &state, nullptr, key_path_array, on_change));
+                barq_release(key_path_array);
+                checked(barq_refresh(barq, nullptr));
+                state.called = false;
+                write([&]() {
+                    checked(barq_set_value(obj1.get(), foo_int_key, barq_int_val(999), false));
+                });
+                REQUIRE(state.called);
+                CHECK(!state.error);
+                CHECK(state.changes);
+                barq_property_key_t modified_keys[2];
+                size_t n = barq_object_changes_get_modified_properties(state.changes.get(), modified_keys, 2);
+                CHECK(n == 1);
+                CHECK(modified_keys[0] == foo_int_key);
+
+                state.called = false;
+                write([&]() {
+                    // checked(barq_set_value(obj1.get(), foo_int_key, barq_int_val(999), false));
+                    checked(barq_set_value(obj1.get(), foo_str_key, barq_str_val("aaa"), false));
+                });
+                REQUIRE(!state.called);
+            }
+        }
+    }
+
+    SECTION("threads") {
+        CPtr<barq_object_t> foo_obj, bar_obj;
+        write([&]() {
+            foo_obj = cptr_checked(barq_object_create(barq, class_foo.key));
+            barq_set_value(foo_obj.get(), foo_int_key, barq_int_val(123), false);
+            bar_obj = cptr_checked(barq_object_create_with_primary_key(barq, class_bar.key, barq_int_val(123)));
+        });
+
+        auto list = cptr_checked(barq_get_list(foo_obj.get(), foo_properties["int_list"]));
+        auto set = cptr_checked(barq_get_set(foo_obj.get(), foo_properties["int_set"]));
+        auto dictionary = cptr_checked(barq_get_dictionary(foo_obj.get(), foo_properties["int_dict"]));
+        auto results = cptr_checked(barq_object_find_all(barq, class_foo.key));
+
+        SECTION("wrong thread") {
+            JoiningThread{[&] {
+                barq_value_t val;
+                CHECK(!barq_get_value(foo_obj.get(), foo_int_key, &val));
+                CHECK_ERR(BARQ_ERR_WRONG_THREAD);
+            }};
+        }
+
+        SECTION("thread-safe references") {
+            auto foo_obj_tsr = cptr_checked(barq_create_thread_safe_reference(foo_obj.get()));
+            auto bar_obj_tsr = cptr_checked(barq_create_thread_safe_reference(bar_obj.get()));
+            auto list_tsr = cptr_checked(barq_create_thread_safe_reference(list.get()));
+            auto set_tsr = cptr_checked(barq_create_thread_safe_reference(set.get()));
+            auto dict_tsr = cptr_checked(barq_create_thread_safe_reference(dictionary.get()));
+            auto results_tsr = cptr_checked(barq_create_thread_safe_reference(results.get()));
+
+            SECTION("resolve") {
+                JoiningThread{[&] {
+                    auto config = make_config(test_file.path.c_str());
+                    config->scheduler = util::Scheduler::make_dummy();
+                    auto barq2 = cptr_checked(barq_open(config.get()));
+                    auto foo_obj2 =
+                        cptr_checked(barq_object_from_thread_safe_reference(barq2.get(), foo_obj_tsr.get()));
+                    auto bar_obj2 =
+                        cptr_checked(barq_object_from_thread_safe_reference(barq2.get(), bar_obj_tsr.get()));
+                    auto results2 =
+                        cptr_checked(barq_results_from_thread_safe_reference(barq2.get(), results_tsr.get()));
+                    auto list2 = cptr_checked(barq_list_from_thread_safe_reference(barq2.get(), list_tsr.get()));
+                    auto set2 = cptr_checked(barq_set_from_thread_safe_reference(barq2.get(), set_tsr.get()));
+                    auto dict2 =
+                        cptr_checked(barq_dictionary_from_thread_safe_reference(barq2.get(), dict_tsr.get()));
+
+                    barq_value_t foo_obj_int;
+                    CHECK(barq_get_value(foo_obj2.get(), foo_int_key, &foo_obj_int));
+                    CHECK(barq_val_eq(foo_obj_int, barq_int_val(123)));
+
+                    size_t count;
+                    CHECK(barq_results_count(results2.get(), &count));
+                    CHECK(count == 1);
+                }};
+            }
+
+            SECTION("resolve in frozen") {
+                auto barq2 = cptr_checked(barq_freeze(barq));
+                CHECK(barq_is_frozen(barq2.get()));
+                CHECK(barq != barq2.get());
+
+                auto foo_obj2 =
+                    cptr_checked(barq_object_from_thread_safe_reference(barq2.get(), foo_obj_tsr.get()));
+                CHECK(barq_is_frozen(foo_obj2.get()));
+            }
+
+            SECTION("type error") {
+                CHECK(!barq_object_from_thread_safe_reference(barq, list_tsr.get()));
+                CHECK_ERR(BARQ_ERR_ILLEGAL_OPERATION);
+                CHECK(!barq_list_from_thread_safe_reference(barq, foo_obj_tsr.get()));
+                CHECK_ERR(BARQ_ERR_ILLEGAL_OPERATION);
+                CHECK(!barq_set_from_thread_safe_reference(barq, list_tsr.get()));
+                CHECK_ERR(BARQ_ERR_ILLEGAL_OPERATION);
+                CHECK(!barq_dictionary_from_thread_safe_reference(barq, set_tsr.get()));
+                CHECK_ERR(BARQ_ERR_ILLEGAL_OPERATION);
+                CHECK(!barq_results_from_thread_safe_reference(barq, list_tsr.get()));
+                CHECK_ERR(BARQ_ERR_ILLEGAL_OPERATION);
+                CHECK(!barq_from_thread_safe_reference(list_tsr.get(), nullptr));
+                CHECK_ERR(BARQ_ERR_ILLEGAL_OPERATION);
+            }
+
+            SECTION("non-sendable") {
+                auto c = cptr(barq_config_new());
+                CHECK(!barq_create_thread_safe_reference(c.get()));
+                CHECK_ERR(BARQ_ERR_ILLEGAL_OPERATION);
+            }
+        }
+    }
+
+    SECTION("freeze and thaw") {
+        SECTION("barq") {
+            auto frozen_barq = cptr_checked(barq_freeze(barq));
+            CHECK(!barq_is_frozen(barq));
+            CHECK(barq_is_frozen(frozen_barq.get()));
+        }
+
+        SECTION("objects") {
+            CPtr<barq_object_t> obj1;
+            barq_value_t value;
+
+            write([&]() {
+                obj1 = cptr_checked(barq_object_create(barq, class_foo.key));
+                CHECK(obj1);
+            });
+            CHECK(checked(barq_get_value(obj1.get(), foo_str_key, &value)));
+            CHECK(value.type == BARQ_TYPE_STRING);
+            CHECK(strncmp(value.string.data, "", value.string.size) == 0);
+
+            auto frozen_barq = cptr_checked(barq_freeze(barq));
+            barq_object_t* frozen_obj1;
+            CHECK(barq_object_resolve_in(obj1.get(), frozen_barq.get(), &frozen_obj1));
+
+            write([&]() {
+                CHECK(checked(barq_set_value(obj1.get(), foo_str_key, barq_str_val("Hello, World!"), false)));
+            });
+
+            CHECK(checked(barq_get_value(obj1.get(), foo_str_key, &value)));
+            CHECK(value.type == BARQ_TYPE_STRING);
+            CHECK(strncmp(value.string.data, "Hello, World!", value.string.size) == 0);
+
+            CHECK(checked(barq_get_value(frozen_obj1, foo_str_key, &value)));
+            CHECK(value.type == BARQ_TYPE_STRING);
+            CHECK(strncmp(value.string.data, "", value.string.size) == 0);
+            barq_object_t* thawed_obj1;
+            CHECK(barq_object_resolve_in(obj1.get(), barq, &thawed_obj1));
+            CHECK(thawed_obj1);
+            CHECK(checked(barq_get_value(thawed_obj1, foo_str_key, &value)));
+            CHECK(value.type == BARQ_TYPE_STRING);
+            CHECK(strncmp(value.string.data, "Hello, World!", value.string.size) == 0);
+
+            write([&]() {
+                CHECK(checked(barq_object_delete(obj1.get())));
+            });
+            barq_object_t* deleted_obj;
+            auto b = barq_object_resolve_in(frozen_obj1, barq, &deleted_obj);
+            CHECK(b);
+            CHECK(deleted_obj == nullptr);
+            barq_release(frozen_obj1);
+            barq_release(thawed_obj1);
+        }
+
+        SECTION("results") {
+            auto results = cptr_checked(barq_object_find_all(barq, class_foo.key));
+            barq_results_delete_all(results.get());
+
+            write([&]() {
+                // Ensure that we start from a known initial state
+                CHECK(barq_results_delete_all(results.get()));
+
+                auto obj1 = cptr_checked(barq_object_create(barq, class_foo.key));
+                CHECK(obj1);
+            });
+
+            size_t count;
+            barq_results_count(results.get(), &count);
+            CHECK(count == 1);
+
+            auto frozen_barq = cptr_checked(barq_freeze(barq));
+            auto frozen_results = cptr_checked(barq_results_resolve_in(results.get(), frozen_barq.get()));
+            write([&]() {
+                auto obj1 = cptr_checked(barq_object_create(barq, class_foo.key));
+                CHECK(obj1);
+            });
+            barq_results_count(frozen_results.get(), &count);
+            CHECK(count == 1);
+            barq_results_count(results.get(), &count);
+            CHECK(count == 2);
+
+            auto thawed_results = cptr_checked(barq_results_resolve_in(frozen_results.get(), barq));
+            barq_results_count(thawed_results.get(), &count);
+            CHECK(count == 2);
+        }
+
+        SECTION("lists") {
+            CPtr<barq_object_t> obj1;
+            size_t count;
+
+            write([&]() {
+                obj1 = cptr_checked(barq_object_create_with_primary_key(barq, class_bar.key, barq_int_val(1)));
+                CHECK(obj1);
+            });
+
+            auto list = cptr_checked(barq_get_list(obj1.get(), bar_properties["strings"]));
+            barq_list_size(list.get(), &count);
+            CHECK(count == 0);
+
+            auto frozen_barq = cptr_checked(barq_freeze(barq));
+            barq_list_t* frozen_list;
+            CHECK(barq_list_resolve_in(list.get(), frozen_barq.get(), &frozen_list));
+            barq_list_size(frozen_list, &count);
+            CHECK(count == 0);
+
+            write([&]() {
+                checked(barq_list_insert(list.get(), 0, barq_str_val("Hello")));
+            });
+
+            barq_list_size(frozen_list, &count);
+            CHECK(count == 0);
+            barq_list_size(list.get(), &count);
+            CHECK(count == 1);
+
+            barq_list_t* thawed_list;
+            CHECK(barq_list_resolve_in(frozen_list, barq, &thawed_list));
+            barq_list_size(thawed_list, &count);
+            CHECK(count == 1);
+
+            CHECK(barq_list_is_valid(thawed_list));
+            write([&]() {
+                CHECK(checked(barq_object_delete(obj1.get())));
+            });
+            CHECK(!barq_list_is_valid(thawed_list));
+            barq_release(thawed_list);
+            CHECK(barq_list_resolve_in(frozen_list, barq, &thawed_list));
+            CHECK(thawed_list == nullptr);
+            barq_release(frozen_list);
+        }
+
+        SECTION("sets") {
+            CPtr<barq_object_t> obj1;
+            size_t count;
+
+            write([&]() {
+                obj1 = cptr_checked(barq_object_create(barq, class_foo.key));
+                CHECK(obj1);
+            });
+
+            auto set = cptr_checked(barq_get_set(obj1.get(), foo_properties["string_set"]));
+            barq_set_size(set.get(), &count);
+            CHECK(count == 0);
+
+            auto frozen_barq = cptr_checked(barq_freeze(barq));
+            barq_set_t* frozen_set;
+            CHECK(barq_set_resolve_in(set.get(), frozen_barq.get(), &frozen_set));
+            barq_set_size(frozen_set, &count);
+            CHECK(count == 0);
+
+            write([&]() {
+                checked(barq_set_insert(set.get(), barq_str_val("Hello"), nullptr, nullptr));
+            });
+
+            barq_set_size(frozen_set, &count);
+            CHECK(count == 0);
+            barq_set_size(set.get(), &count);
+            CHECK(count == 1);
+
+            barq_set_t* thawed_set;
+            CHECK(barq_set_resolve_in(frozen_set, barq, &thawed_set));
+            barq_set_size(thawed_set, &count);
+            CHECK(count == 1);
+
+            CHECK(barq_set_is_valid(thawed_set));
+            write([&]() {
+                CHECK(checked(barq_object_delete(obj1.get())));
+            });
+            CHECK(!barq_set_is_valid(thawed_set));
+            barq_release(thawed_set);
+            CHECK(barq_set_resolve_in(frozen_set, barq, &thawed_set));
+            CHECK(thawed_set == nullptr);
+            barq_release(frozen_set);
+        }
+
+        SECTION("dictionaries") {
+            CPtr<barq_object_t> obj1;
+            size_t count;
+
+            write([&]() {
+                obj1 = cptr_checked(barq_object_create(barq, class_foo.key));
+                CHECK(obj1);
+            });
+
+            auto dictionary = cptr_checked(barq_get_dictionary(obj1.get(), foo_properties["string_dict"]));
+            barq_dictionary_size(dictionary.get(), &count);
+            CHECK(count == 0);
+
+            auto frozen_barq = cptr_checked(barq_freeze(barq));
+            barq_dictionary_t* frozen_dictionary;
+            CHECK(barq_dictionary_resolve_in(dictionary.get(), frozen_barq.get(), &frozen_dictionary));
+            barq_dictionary_size(frozen_dictionary, &count);
+            CHECK(count == 0);
+
+            write([&]() {
+                checked(barq_dictionary_insert(dictionary.get(), barq_str_val("Hello"), barq_str_val("world"), nullptr,
+                                                nullptr));
+            });
+
+            barq_dictionary_size(frozen_dictionary, &count);
+            CHECK(count == 0);
+            barq_dictionary_size(dictionary.get(), &count);
+            CHECK(count == 1);
+
+            barq_dictionary_t* thawed_dictionary;
+            CHECK(barq_dictionary_resolve_in(frozen_dictionary, barq, &thawed_dictionary));
+            barq_dictionary_size(thawed_dictionary, &count);
+            CHECK(count == 1);
+
+            CHECK(barq_dictionary_is_valid(thawed_dictionary));
+            write([&]() {
+                CHECK(checked(barq_object_delete(obj1.get())));
+            });
+            CHECK(!barq_dictionary_is_valid(thawed_dictionary));
+            barq_release(thawed_dictionary);
+            CHECK(barq_dictionary_resolve_in(frozen_dictionary, barq, &thawed_dictionary));
+            CHECK(thawed_dictionary == nullptr);
+            barq_release(frozen_dictionary);
+        }
+    }
+
+    barq_close(barq);
+    REQUIRE(barq_is_closed(barq));
+    barq_release(barq);
+}
+
+TEST_CASE("C API - queries", "[c_api]") {
+    TestFile test_file;
+    barq_t* barq = open_barq(test_file);
+
+    auto write = [&](auto&& f) {
+        checked(barq_begin_write(barq));
+        f();
+        checked(barq_commit(barq));
+        checked(barq_refresh(barq, nullptr));
+    };
+
+    bool found = false;
+
+    barq_class_info_t class_foo, class_bar;
+    CHECK(checked(barq_find_class(barq, "Foo", &found, &class_foo)));
+    REQUIRE(found);
+    CHECK(checked(barq_find_class(barq, "Bar", &found, &class_bar)));
+    REQUIRE(found);
+
+    auto foo_properties = [&](const char* prop) {
+        barq_property_info_t property;
+        bool found;
+        barq_find_property(barq, class_foo.key, prop, &found, &property);
+        CHECK(found);
+        return property.key;
+    };
+
+    auto bar_properties = [&](const char* prop) {
+        barq_property_info_t property;
+        bool found;
+        barq_find_property(barq, class_bar.key, prop, &found, &property);
+        CHECK(found);
+        return property.key;
+    };
+
+    auto foo_int_key = foo_properties("int");
+    auto foo_str_key = foo_properties("string");
+
+    CPtr<barq_object_t> obj1;
+    CPtr<barq_object_t> obj2;
+    auto int_val1 = barq_int_val(123);
+    auto int_val2 = barq_int_val(456);
+    write([&]() {
+        obj1 = cptr_checked(barq_object_create(barq, class_foo.key));
+        CHECK(obj1);
+        CHECK(checked(barq_set_value(obj1.get(), foo_int_key, int_val1, false)));
+        CHECK(checked(barq_set_value(obj1.get(), foo_str_key, barq_str_val("Hello, World!"), false)));
+        obj2 = cptr_checked(barq_object_create_with_primary_key(barq, class_bar.key, barq_int_val(1)));
+        CHECK(obj2);
+        CPtr<barq_object_t> obj3 = cptr_checked(barq_object_create(barq, class_foo.key));
+        CHECK(obj3);
+        CHECK(checked(barq_set_value(obj3.get(), foo_int_key, int_val2, false)));
+        CPtr<barq_object_t> obj4 = cptr_checked(barq_object_create(barq, class_foo.key));
+        CHECK(obj3);
+        CHECK(checked(barq_set_value(obj4.get(), foo_int_key, int_val1, false)));
+    });
+
+    SECTION("find with primary key") {
+        bool found = false;
+
+        auto p = cptr_checked(barq_object_find_with_primary_key(barq, class_bar.key, barq_int_val(1), &found));
+        CHECK(found);
+        auto p_key = barq_object_get_key(p.get());
+        auto obj2_key = barq_object_get_key(obj2.get());
+        CHECK(p_key == obj2_key);
+        CHECK(barq_equals(p.get(), obj2.get()));
+
+        CHECK(!barq_object_find_with_primary_key(barq, class_bar.key, barq_int_val(2), &found));
+        CHECK(!found);
+        CHECK(!barq_object_find_with_primary_key(barq, class_bar.key, barq_int_val(2), nullptr));
+
+        // Check that finding by type-mismatched values just find nothing.
+        CHECK(!barq_object_find_with_primary_key(barq, class_bar.key, barq_null(), &found));
+        CHECK(!found);
+        CHECK(!barq_object_find_with_primary_key(barq, class_bar.key, barq_str_val("a"), &found));
+        CHECK(!found);
+        CHECK(!barq_object_find_with_primary_key(barq, class_bar.key, barq_str_val("a"), nullptr));
+
+        // Invalid class key
+        CHECK(!barq_object_find_with_primary_key(barq, 123123123, barq_int_val(1), nullptr));
+        CHECK_ERR(BARQ_ERR_NO_SUCH_TABLE);
+    }
+
+    SECTION("find all") {
+        auto r = cptr_checked(barq_object_find_all(barq, class_bar.key));
+        size_t count;
+        barq_results_count(r.get(), &count);
+        CHECK(count == 1);
+    }
+
+    SECTION("query") {
+        barq_value_t arg_data[1] = {barq_str_val("Hello, World!")};
+        size_t num_args = 2;
+        barq_query_arg_t args[2] = {barq_query_arg_t{1, false, &arg_data[0]},
+                                     barq_query_arg_t{1, false, &int_val2}};
+        barq_query_arg_t* arg_list = &args[0];
+        auto q =
+            cptr_checked(barq_query_parse(barq, class_foo.key, "string == $0 SORT(int ASCENDING)", 1, arg_list));
+
+        SECTION("barq_query_description()") {
+            const char* descr = barq_query_get_description(q.get());
+            std::string expected = "string == \"Hello, World!\" SORT(int ASC)";
+            CHECK(descr == expected);
+        }
+
+        SECTION("barq_query_count()") {
+            size_t count;
+            CHECK(checked(barq_query_count(q.get(), &count)));
+            CHECK(count == 1);
+
+            SECTION("cloned") {
+                auto q2 = clone_cptr(q.get());
+                size_t count2;
+                CHECK(checked(barq_query_count(q2.get(), &count2)));
+                CHECK(count == count2);
+            }
+            SECTION("barq_query_append_query") {
+                auto q2 =
+                    cptr_checked(barq_query_append_query(q.get(), "TRUEPREDICATE LIMIT(1)", num_args, arg_list));
+                size_t count;
+                CHECK(checked(barq_query_count(q2.get(), &count)));
+                CHECK(count == 1);
+                q2 = cptr_checked(barq_query_append_query(q.get(), "FALSEPREDICATE", num_args, arg_list));
+                CHECK(checked(barq_query_count(q2.get(), &count)));
+                CHECK(count == 0);
+                q2 = cptr_checked(barq_query_append_query(q.get(), "TRUEPREDICATE LIMIT(0)", num_args, arg_list));
+                CHECK(checked(barq_query_count(q2.get(), &count)));
+                CHECK(count == 0);
+                q2 = cptr_checked(barq_query_append_query(q.get(), "TRUEPREDICATE LIMIT(10)", num_args, arg_list));
+                CHECK(checked(barq_query_count(q2.get(), &count)));
+                CHECK(count == 1);
+                q2 = cptr_checked(barq_query_append_query(q.get(), "int == $1", num_args, arg_list));
+                CHECK(checked(barq_query_count(q2.get(), &count)));
+                CHECK(count == 0);
+            }
+        }
+
+        SECTION("barq_query_parse() errors") {
+            // Invalid class key
+            CHECK(!barq_query_parse(barq, 123123123, "string == $0", num_args, arg_list));
+            CHECK_ERR_CAT(BARQ_ERR_NO_SUCH_TABLE, (BARQ_ERR_CAT_INVALID_ARG | BARQ_ERR_CAT_LOGIC));
+
+            // Invalid syntax
+            CHECK(!barq_query_parse(barq, class_foo.key, "lel", 0, nullptr));
+            CHECK_ERR_CAT(BARQ_ERR_INVALID_QUERY_STRING, (BARQ_ERR_CAT_INVALID_ARG | BARQ_ERR_CAT_LOGIC));
+
+            // Invalid property
+            CHECK(!barq_query_parse(barq, class_foo.key, "strong = 5", 0, nullptr));
+            CHECK_ERR_CAT(BARQ_ERR_INVALID_QUERY, (BARQ_ERR_CAT_INVALID_ARG | BARQ_ERR_CAT_LOGIC));
+
+            // Invalid number of arguments
+            CHECK(!barq_query_parse(barq, class_foo.key, "string == $0", 0, nullptr));
+            CHECK_ERR_CAT(BARQ_ERR_INVALID_QUERY_ARG, (BARQ_ERR_CAT_INVALID_ARG | BARQ_ERR_CAT_LOGIC));
+        }
+
+        SECTION("string in list") {
+            char foo[] = "foo";
+            barq_value_t str = barq_str_val(foo);
+            barq_value_t list_arg[2] = {str, barq_str_val("bar")};
+
+            write([&]() {
+                CHECK(barq_set_value(obj1.get(), foo_properties("string"), barq_str_val("foo"), false));
+            });
+
+            static const size_t num_args = 1;
+            barq_query_arg_t args[num_args] = {barq_query_arg_t{1, false, &str}};
+            barq_query_arg_t* arg_list_simple = &args[0];
+
+            barq_query_arg_t args_in_list[num_args] = {barq_query_arg_t{2, true, &list_arg[0]}};
+            barq_query_arg_t* arg_list = &args_in_list[0];
+
+            auto q_string_single_param =
+                cptr_checked(barq_query_parse(barq, class_foo.key, "string == $0", num_args, arg_list_simple));
+            auto q_string_in_list =
+                cptr_checked(barq_query_parse(barq, class_foo.key, "string IN $0", num_args, arg_list));
+
+            // changing the value for one of the parameters passed should not change the result of the query.
+            // essentially we must assure that core is copying all the arguments passed inside the list (like for
+            // normal query arguments), and after barq_query_parse completes any modification of the memory that
+            // was used to store the parameter does not impact in any way core.
+            char* s = foo;
+            s[0] = 'a';
+            size_t count, count_list;
+
+            CHECK(checked(barq_query_count(q_string_single_param.get(), &count)));
+            CHECK(1 == count);
+            CHECK(checked(barq_query_count(q_string_in_list.get(), &count_list)));
+            CHECK(1 == count_list);
+        }
+
+        SECTION("link in list") {
+            auto link = barq_link_val(class_bar.key, barq_object_get_key(obj2.get()));
+            barq_value_t link_value = link;
+            write([&]() {
+                CHECK(barq_set_value(obj1.get(), foo_properties("link"), link_value, false));
+            });
+
+            static const size_t num_args = 1;
+            barq_query_arg_t args[num_args] = {barq_query_arg_t{1, false, &link_value}};
+            barq_query_arg_t* arg = &args[0];
+
+            barq_value_t list_arg[num_args] = {link_value};
+            barq_query_arg_t args_in_list[num_args] = {barq_query_arg_t{num_args, true, &list_arg[0]}};
+            barq_query_arg_t* arg_list = &args_in_list[0];
+
+            auto q_link_single_param =
+                cptr_checked(barq_query_parse(barq, class_foo.key, "link == $0", num_args, arg));
+            auto q_link_in_list =
+                cptr_checked(barq_query_parse(barq, class_foo.key, "link IN $0", num_args, arg_list));
+
+            size_t count, count_list;
+
+            // change the link
+            link = barq_null();
+
+            CHECK(checked(barq_query_count(q_link_single_param.get(), &count)));
+            CHECK(1 == count);
+            CHECK(checked(barq_query_count(q_link_in_list.get(), &count_list)));
+            CHECK(1 == count_list);
+        }
+
+        SECTION("decimal NaN") {
+            barq_value_t decimal = barq_decimal_nan();
+
+            write([&]() {
+                CHECK(barq_set_value(obj1.get(), foo_properties("decimal"), decimal, false));
+            });
+            barq_query_arg_t args[] = {barq_query_arg_t{1, false, &decimal}};
+            auto q_decimal = cptr_checked(barq_query_parse(barq, class_foo.key, "decimal == $0", 1, args));
+            barq_value_t out_value;
+            bool out_found;
+            CHECK(barq_query_find_first(q_decimal.get(), &out_value, &out_found));
+            CHECK(out_found);
+            auto link = obj1->get_obj().get_link();
+            barq_value_t expected;
+            expected.type = BARQ_TYPE_LINK;
+            expected.link.target_table = link.get_table_key().value;
+            expected.link.target = link.get_obj_key().value;
+            CHECK(barq_val_eq(out_value, expected));
+        }
+
+        SECTION("interpolate all types") {
+            barq_value_t int_arg = barq_int_val(123);
+            barq_value_t bool_arg = barq_bool_val(true);
+            barq_value_t string_arg = barq_str_val("foobar");
+            static const uint8_t binary_data[3] = {1, 2, 3};
+            barq_value_t binary_arg = barq_binary_val(binary_data, 3);
+            barq_value_t timestamp_arg = barq_timestamp_val(1000000, 1);
+            barq_value_t float_arg = barq_float_val(123.f);
+            barq_value_t double_arg = barq_double_val(456.0);
+            barq_value_t decimal_arg = barq_decimal_val(789.0);
+            barq_value_t object_id_arg = barq_object_id_val("abc123abc123");
+            barq_value_t uuid_arg = barq_uuid_val("01234567-9abc-4def-9012-3456789abcde");
+            barq_value_t link_arg = barq_link_val(class_bar.key, barq_object_get_key(obj2.get()));
+            barq_value_t list_arg[3] = {barq_int_val(456), barq_str_val("110"), barq_double_val(3.14)};
+
+            static const size_t num_args = 13;
+            barq_query_arg_t args[num_args] = {
+                barq_query_arg_t{1, false, &int_arg},       barq_query_arg_t{1, false, &bool_arg},
+                barq_query_arg_t{1, false, &string_arg},    barq_query_arg_t{1, false, &binary_arg},
+                barq_query_arg_t{1, false, &timestamp_arg}, barq_query_arg_t{1, false, &float_arg},
+                barq_query_arg_t{1, false, &double_arg},    barq_query_arg_t{1, false, &decimal_arg},
+                barq_query_arg_t{1, false, &object_id_arg}, barq_query_arg_t{1, false, &uuid_arg},
+                barq_query_arg_t{1, false, &link_arg},      barq_query_arg_t{3, true, &list_arg[0]},
+                barq_query_arg_t{0, true, nullptr}};
+            barq_query_arg_t* arg_list = &args[0];
+
+            auto q_int = cptr_checked(barq_query_parse(barq, class_foo.key, "int == $0", num_args, arg_list));
+            auto q_bool = cptr_checked(barq_query_parse(barq, class_foo.key, "bool == $1", num_args, arg_list));
+            auto q_string = cptr_checked(barq_query_parse(barq, class_foo.key, "string == $2", num_args, arg_list));
+            auto q_binary = cptr_checked(barq_query_parse(barq, class_foo.key, "binary == $3", num_args, arg_list));
+            auto q_timestamp =
+                cptr_checked(barq_query_parse(barq, class_foo.key, "timestamp == $4", num_args, arg_list));
+            auto q_float = cptr_checked(barq_query_parse(barq, class_foo.key, "float == $5", num_args, arg_list));
+            auto q_double = cptr_checked(barq_query_parse(barq, class_foo.key, "double == $6", num_args, arg_list));
+            auto q_decimal =
+                cptr_checked(barq_query_parse(barq, class_foo.key, "decimal == $7", num_args, arg_list));
+            auto q_object_id =
+                cptr_checked(barq_query_parse(barq, class_foo.key, "object_id == $8", num_args, arg_list));
+            auto q_uuid = cptr_checked(barq_query_parse(barq, class_foo.key, "uuid == $9", num_args, arg_list));
+            auto q_link = cptr_checked(barq_query_parse(barq, class_foo.key, "link == $10", num_args, arg_list));
+            auto q_list = cptr_checked(barq_query_parse(barq, class_foo.key, "int == ANY $11", num_args, arg_list));
+            auto q_empty_list =
+                cptr_checked(barq_query_parse(barq, class_foo.key, "int == ALL $12", num_args, arg_list));
+
+            CHECK(cptr_checked(barq_query_find_all(q_int.get())));
+            CHECK(cptr_checked(barq_query_find_all(q_bool.get())));
+            CHECK(cptr_checked(barq_query_find_all(q_string.get())));
+            CHECK(cptr_checked(barq_query_find_all(q_binary.get())));
+            CHECK(cptr_checked(barq_query_find_all(q_timestamp.get())));
+            CHECK(cptr_checked(barq_query_find_all(q_float.get())));
+            CHECK(cptr_checked(barq_query_find_all(q_double.get())));
+            CHECK(cptr_checked(barq_query_find_all(q_decimal.get())));
+            CHECK(cptr_checked(barq_query_find_all(q_object_id.get())));
+            CHECK(cptr_checked(barq_query_find_all(q_uuid.get())));
+            CHECK(cptr_checked(barq_query_find_all(q_link.get())));
+            CHECK(cptr_checked(barq_query_find_all(q_list.get())));
+            CHECK(cptr_checked(barq_query_find_all(q_empty_list.get())));
+
+            SECTION("type mismatch") {
+                CHECK(!barq_query_parse(barq, class_foo.key, "int == $2", num_args, arg_list));
+                CHECK_ERR(BARQ_ERR_INVALID_QUERY_ARG);
+                CHECK(!barq_query_parse(barq, class_foo.key, "bool == $2", num_args, arg_list));
+                CHECK_ERR(BARQ_ERR_INVALID_QUERY_ARG);
+                CHECK(!barq_query_parse(barq, class_foo.key, "string == $7", num_args, arg_list));
+                CHECK_ERR(BARQ_ERR_INVALID_QUERY_ARG);
+                CHECK(!barq_query_parse(barq, class_foo.key, "timestamp == $2", num_args, arg_list));
+                CHECK_ERR(BARQ_ERR_INVALID_QUERY_ARG);
+                CHECK(!barq_query_parse(barq, class_foo.key, "double == $2", num_args, arg_list));
+                CHECK_ERR(BARQ_ERR_INVALID_QUERY_ARG);
+                CHECK(!barq_query_parse(barq, class_foo.key, "float == $2", num_args, arg_list));
+                CHECK_ERR(BARQ_ERR_INVALID_QUERY_ARG);
+                CHECK(!barq_query_parse(barq, class_foo.key, "binary == $0", num_args, arg_list));
+                CHECK_ERR(BARQ_ERR_INVALID_QUERY_ARG);
+                CHECK(!barq_query_parse(barq, class_foo.key, "decimal == $2", num_args, arg_list));
+                CHECK_ERR(BARQ_ERR_INVALID_QUERY_ARG);
+                CHECK(!barq_query_parse(barq, class_foo.key, "object_id == $2", num_args, arg_list));
+                CHECK_ERR(BARQ_ERR_INVALID_QUERY_ARG);
+                CHECK(!barq_query_parse(barq, class_foo.key, "uuid == $2", num_args, arg_list));
+                CHECK_ERR(BARQ_ERR_INVALID_QUERY_ARG);
+                CHECK(!barq_query_parse(barq, class_foo.key, "link == $2", num_args, arg_list));
+                CHECK_ERR(BARQ_ERR_INVALID_QUERY_ARG);
+            }
+        }
+
+        SECTION("barq_query_find_first()") {
+            barq_value_t found_value = barq_null();
+            bool found;
+            CHECK(checked(barq_query_find_first(q.get(), &found_value, &found)));
+            CHECK(found);
+            CHECK(found_value.type == BARQ_TYPE_LINK);
+            CHECK(found_value.link.target_table == class_foo.key);
+            CHECK(found_value.link.target == barq_object_get_key(obj1.get()));
+        }
+
+        SECTION("verify order barq_query_find_first()") {
+            barq_property_info_t info_string;
+            barq_property_info_t info_int;
+            bool found_string = false, found_int = false;
+            REQUIRE(barq_find_property(barq, class_foo.key, "string", &found_string, &info_string));
+            REQUIRE(barq_find_property(barq, class_foo.key, "int", &found_int, &info_int));
+            CHECK(info_string.key != BARQ_INVALID_PROPERTY_KEY);
+            CHECK(info_int.key != BARQ_INVALID_PROPERTY_KEY);
+            CPtr<barq_object_t> obj1, obj2;
+            checked(barq_begin_write(barq));
+            obj1 = cptr_checked(barq_object_create(barq, class_foo.key));
+            obj2 = cptr_checked(barq_object_create(barq, class_foo.key));
+            CHECK(obj1);
+            CHECK(obj2);
+            CHECK(checked(barq_set_value(obj1.get(), info_string.key, barq_str_val("Test"), false)));
+            CHECK(checked(barq_set_value(obj2.get(), info_string.key, barq_str_val("Test"), false)));
+            CHECK(checked(barq_set_value(obj1.get(), info_int.key, barq_int_val(10), false)));
+            CHECK(checked(barq_set_value(obj2.get(), info_int.key, barq_int_val(11), false)));
+            checked(barq_commit(barq));
+            checked(barq_refresh(barq, nullptr));
+
+            size_t count = 0;
+            barq_value_t arg_data[1] = {barq_str_val("Test")};
+            barq_query_arg_t args[1] = {barq_query_arg_t{1, false, &arg_data[0]}};
+            barq_query_arg_t* arg_list = &args[0];
+            auto q = cptr_checked(barq_query_parse(barq, class_foo.key, "string == $0", 1, arg_list));
+            CHECK(checked(barq_query_count(q.get(), &count)));
+            CHECK(count == 2);
+
+            auto q2 =
+                cptr_checked(barq_query_append_query(q.get(), "string == $0 SORT(int ASCENDING)", 1, arg_list));
+            barq_value_t found_value = barq_null();
+            bool found_sorted;
+            CHECK(checked(barq_query_find_first(q2.get(), &found_value, &found_sorted)));
+            CHECK(found_sorted);
+            CHECK(found_value.type == BARQ_TYPE_LINK);
+            CHECK(found_value.link.target_table == class_foo.key);
+            CHECK(found_value.link.target == barq_object_get_key(obj1.get()));
+
+            auto q3 =
+                cptr_checked(barq_query_append_query(q.get(), "string == $0 SORT(int DESCENDING)", 1, arg_list));
+            found_value = barq_null();
+            found_sorted = false;
+            CHECK(checked(barq_query_find_first(q3.get(), &found_value, &found_sorted)));
+            CHECK(found_sorted);
+            CHECK(found_value.type == BARQ_TYPE_LINK);
+            CHECK(found_value.link.target_table == class_foo.key);
+            CHECK(found_value.link.target == barq_object_get_key(obj2.get()));
+        }
+
+        SECTION("results") {
+            auto r = cptr_checked(barq_query_find_all(q.get()));
+            CHECK(!barq_is_frozen(r.get()));
+
+            SECTION("barq_results_is_valid") {
+                bool valid;
+                CHECK(checked(barq_results_is_valid(r.get(), &valid)));
+                CHECK(valid);
+            }
+
+            SECTION("barq_results_is_valid delete objects") {
+                write([&] {
+                    barq_object_delete(obj1.get());
+                    barq_object_delete(obj2.get());
+                    barq_results_delete_all(r.get());
+                });
+                bool valid;
+                CHECK(checked(barq_results_is_valid(r.get(), &valid)));
+                CHECK(valid);
+            }
+
+            SECTION("barq_results_is_valid delete collection") {
+                auto strings = cptr_checked(barq_get_list(obj2.get(), bar_properties("strings")));
+                CHECK(strings);
+                CHECK(!barq_is_frozen(strings.get()));
+
+                barq_value_t a = barq_str_val("a");
+                barq_value_t b = barq_str_val("b");
+                barq_value_t c = barq_null();
+
+                write([&] {
+                    CHECK(checked(barq_list_insert(strings.get(), 0, a)));
+                    CHECK(checked(barq_list_insert(strings.get(), 1, b)));
+                    CHECK(checked(barq_list_insert(strings.get(), 2, c)));
+                });
+                bool valid;
+                auto results = cptr_checked(barq_list_to_results(strings.get()));
+                CHECK(checked(barq_results_is_valid(results.get(), &valid)));
+                CHECK(valid);
+
+                write([&] {
+                    CHECK(checked(barq_object_delete(obj2.get())));
+                });
+
+                CHECK(checked(barq_results_is_valid(results.get(), &valid)));
+                CHECK_FALSE(valid);
+                size_t count;
+
+                CHECK_FALSE(barq_results_count(results.get(), &count));
+                CHECK_ERR(BARQ_ERR_STALE_ACCESSOR);
+
+                CHECK_FALSE(barq_results_resolve_in(results.get(), barq));
+                CHECK_ERR(BARQ_ERR_STALE_ACCESSOR);
+            }
+
+            SECTION("barq_results_count()") {
+                size_t count;
+                CHECK(checked(barq_results_count(r.get(), &count)));
+                CHECK(count == 1);
+
+                SECTION("cloned") {
+                    auto r2 = clone_cptr(r.get());
+                    size_t count2;
+                    CHECK(checked(barq_results_count(r2.get(), &count2)));
+                    CHECK(count == count2);
+                }
+            }
+
+            SECTION("empty result") {
+                auto q2 = cptr_checked(barq_query_parse(barq, class_foo.key, "string == 'boogeyman'", 0, nullptr));
+                auto r2 = cptr_checked(barq_query_find_all(q2.get()));
+                size_t count;
+                CHECK(checked(barq_results_count(r2.get(), &count)));
+                CHECK(count == 0);
+                barq_value_t value = barq_null();
+                CHECK(!barq_results_get(r2.get(), 0, &value));
+                CHECK_ERR(BARQ_ERR_INDEX_OUT_OF_BOUNDS);
+                size_t index = -1;
+                bool found = false;
+                CHECK(barq_results_find(r2.get(), &value, &index, &found));
+                CHECK(index == barq::not_found);
+                CHECK(found == false);
+            }
+
+            SECTION("barq_results_get()") {
+                barq_value_t value = barq_null();
+                CHECK(checked(barq_results_get(r.get(), 0, &value)));
+                CHECK(value.type == BARQ_TYPE_LINK);
+                CHECK(value.link.target_table == class_foo.key);
+                CHECK(value.link.target == barq_object_get_key(obj1.get()));
+                size_t index = -1;
+                bool found = false;
+                CHECK(barq_results_find(r.get(), &value, &index, &found));
+                CHECK(index == 0);
+                CHECK(found == true);
+
+                value = barq_null();
+                CHECK(!barq_results_get(r.get(), 1, &value));
+                CHECK_ERR(BARQ_ERR_INDEX_OUT_OF_BOUNDS);
+                index = -1;
+                found = false;
+                CHECK(barq_results_find(r.get(), &value, &index, &found));
+                CHECK(index == barq::not_found);
+                CHECK(found == false);
+            }
+
+            SECTION("barq_results_get_query()") {
+                auto q2 = cptr_checked(barq_query_parse(barq, class_foo.key, "int == 123", 0, nullptr));
+                auto r2 = cptr_checked(barq_results_filter(r.get(), q2.get()));
+                size_t count;
+                CHECK(checked(barq_results_count(r2.get(), &count)));
+                CHECK(count == 1);
+                auto results_query = cptr_checked(barq_results_get_query(r2.get()));
+                auto result = cptr_checked(barq_query_find_all(results_query.get()));
+                size_t count1 = 0;
+                CHECK(checked(barq_results_count(result.get(), &count1)));
+                CHECK(count == count1);
+            }
+
+            SECTION("barq_results_get_object()") {
+                auto p = cptr_checked(barq_results_get_object(r.get(), 0));
+                CHECK(p.get());
+                CHECK(barq_equals(p.get(), obj1.get()));
+                size_t index = -1;
+                bool found = false;
+                CHECK(barq_results_find_object(r.get(), p.get(), &index, &found));
+                CHECK(found == true);
+                CHECK(index == 0);
+
+                CHECK(!barq_results_get_object(r.get(), 1));
+                CHECK_ERR(BARQ_ERR_INDEX_OUT_OF_BOUNDS);
+                CHECK(!barq_results_find_object(r.get(), obj2.get(), &index, &found));
+                CHECK(found == false);
+                CHECK(index == barq::not_found);
+            }
+
+            SECTION("barq_results_filter()") {
+                auto q2 = cptr_checked(barq_query_parse(barq, class_foo.key, "int == 789", 0, nullptr));
+                auto r2 = cptr_checked(barq_results_filter(r.get(), q2.get()));
+                size_t count;
+                CHECK(checked(barq_results_count(r2.get(), &count)));
+                CHECK(count == 0);
+            }
+
+            SECTION("barq_results_sort()") {
+                auto r_all = cptr_checked(barq_object_find_all(barq, class_foo.key));
+                auto p = cptr_checked(barq_results_get_object(r_all.get(), 0));
+                CHECK(p.get());
+                CHECK(barq_equals(p.get(), obj1.get()));
+                auto r2 = cptr_checked(barq_results_sort(r_all.get(), "int DESCENDING, float ASCENDING"));
+                p = cptr_checked(barq_results_get_object(r2.get(), 1));
+                CHECK(p.get());
+                CHECK(barq_equals(p.get(), obj1.get()));
+            }
+
+            SECTION("barq_results_distinct()") {
+                auto r_all = cptr_checked(barq_object_find_all(barq, class_foo.key));
+                size_t count;
+                barq_results_count(r_all.get(), &count);
+                CHECK(count == 3);
+                auto r2 = cptr_checked(barq_results_distinct(r_all.get(), "int"));
+                barq_results_count(r2.get(), &count);
+                CHECK(count == 2);
+            }
+
+            SECTION("barq_results_limit()") {
+                auto r_all = cptr_checked(barq_object_find_all(barq, class_foo.key));
+                size_t count;
+                barq_results_count(r_all.get(), &count);
+                CHECK(count == 3);
+                auto r2 = cptr_checked(barq_results_limit(r_all.get(), 1));
+                barq_results_count(r2.get(), &count);
+                CHECK(count == 1);
+            }
+
+            SECTION("barq_results_snapshot()") {
+                auto r_all = cptr_checked(barq_object_find_all(barq, class_foo.key));
+                auto r_snapshot = cptr_checked(barq_results_snapshot(r_all.get()));
+                size_t count;
+                barq_results_count(r_all.get(), &count);
+                CHECK(count == 3);
+                barq_results_count(r_snapshot.get(), &count);
+                CHECK(count == 3);
+                write([&]() {
+                    auto p = cptr_checked(barq_results_get_object(r_all.get(), 0));
+                    barq_object_delete(p.get());
+                });
+                barq_results_count(r_all.get(), &count);
+                CHECK(count == 2);
+                barq_results_count(r_snapshot.get(), &count);
+                CHECK(count == 3);
+            }
+
+            SECTION("barq_results_min()") {
+                barq_value_t value = barq_null();
+                CHECK(checked(barq_results_min(r.get(), foo_int_key, &value, &found)));
+                CHECK(found);
+                CHECK(value.type == BARQ_TYPE_INT);
+                CHECK(value.integer == 123);
+
+                CHECK(!barq_results_min(r.get(), BARQ_INVALID_PROPERTY_KEY, nullptr, nullptr));
+                CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+            }
+
+            SECTION("barq_results_max()") {
+                barq_value_t value = barq_null();
+                CHECK(checked(barq_results_max(r.get(), foo_int_key, &value, &found)));
+                CHECK(found);
+                CHECK(value.type == BARQ_TYPE_INT);
+                CHECK(value.integer == 123);
+
+                CHECK(!barq_results_max(r.get(), BARQ_INVALID_PROPERTY_KEY, nullptr, nullptr));
+                CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+            }
+
+            SECTION("barq_results_sum()") {
+                barq_value_t value = barq_null();
+                CHECK(checked(barq_results_sum(r.get(), foo_int_key, &value, &found)));
+                CHECK(found);
+                CHECK(value.type == BARQ_TYPE_INT);
+                CHECK(value.integer == 123);
+
+                size_t count;
+                barq_results_count(r.get(), &count);
+                CHECK(count == 1);
+
+                CHECK(!barq_results_sum(r.get(), BARQ_INVALID_PROPERTY_KEY, nullptr, nullptr));
+                CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+            }
+
+            SECTION("barq_results_average()") {
+                barq_value_t value = barq_null();
+                CHECK(checked(barq_results_average(r.get(), foo_int_key, &value, &found)));
+                CHECK(found);
+                CHECK(value.type == BARQ_TYPE_DOUBLE);
+                CHECK(value.dnum == 123.0);
+
+                CHECK(!barq_results_average(r.get(), BARQ_INVALID_PROPERTY_KEY, nullptr, nullptr));
+                CHECK_ERR(BARQ_ERR_INVALID_PROPERTY);
+            }
+
+            SECTION("barq_results_delete_all()") {
+                CHECK(!barq_results_delete_all(r.get()));
+                CHECK_ERR(BARQ_ERR_WRONG_TRANSACTION_STATE);
+
+                write([&]() {
+                    size_t num_objects;
+                    CHECK(checked(barq_get_num_objects(barq, class_foo.key, &num_objects)));
+                    CHECK(num_objects == 3);
+                    CHECK(checked(barq_results_delete_all(r.get())));
+                    CHECK(checked(barq_get_num_objects(barq, class_foo.key, &num_objects)));
+                    CHECK(num_objects == 2);
+                });
+            }
+
+            SECTION("lists") {
+                auto list = cptr_checked(barq_get_list(obj1.get(), foo_properties("link_list")));
+                cptr_checked(barq_query_parse_for_list(list.get(), "TRUEPREDICATE", 0, nullptr));
+            }
+
+            SECTION("lists append query") {
+                auto list = cptr_checked(barq_get_list(obj1.get(), foo_properties("link_list")));
+
+                auto bar_link = barq_object_as_link(obj2.get());
+                barq_value_t bar_link_val;
+                bar_link_val.type = BARQ_TYPE_LINK;
+                bar_link_val.link = bar_link;
+
+                write([&]() {
+                    CHECK(checked(barq_list_insert(list.get(), 0, bar_link_val)));
+                    CHECK(checked(barq_list_insert(list.get(), 1, bar_link_val)));
+                    CHECK(checked(barq_list_insert(list.get(), 2, bar_link_val)));
+                });
+
+                size_t n = 0;
+                barq_list_size(list.get(), &n);
+                CHECK(n == 3);
+                auto query = cptr_checked(barq_query_parse_for_list(list.get(), "TRUEPREDICATE ", 0, nullptr));
+                n = 0;
+                barq_query_count(query.get(), &n);
+                CHECK(n == 3);
+
+                write([&]() {
+                    barq_list_clear(list.get());
+                });
+            }
+
+            SECTION("combine results query") {
+                barq_value_t int_arg = barq_int_val(123);
+                const size_t num_args = 1;
+                barq_query_arg_t args[num_args] = {barq_query_arg_t{1, false, &int_arg}};
+                barq_query_arg_t* arg_list = &args[0];
+                auto q_int = cptr_checked(barq_query_parse(barq, class_foo.key, "int == $0", num_args, arg_list));
+                auto combined_result_q =
+                    cptr_checked(barq_query_parse_for_results(r.get(), q_int->get_description(), 0, nullptr));
+                auto result = cptr_checked(barq_query_find_all(combined_result_q.get()));
+                size_t count;
+                CHECK(barq_results_count(result.get(), &count));
+                CHECK(count == 1);
+            }
+
+            SECTION("empty results") {
+                auto empty_q = cptr_checked(barq_query_parse_for_results(r.get(), "FALSEPREDICATE", 0, nullptr));
+                auto empty_r = cptr_checked(barq_query_find_all(empty_q.get()));
+
+                SECTION("barq_results_count()") {
+                    size_t count;
+                    CHECK(barq_results_count(empty_r.get(), &count));
+                    CHECK(count == 0);
+                }
+
+                SECTION("barq_results_min()") {
+                    barq_value_t value;
+                    bool found = true;
+                    CHECK(barq_results_min(empty_r.get(), foo_int_key, &value, &found));
+                    CHECK(barq_val_eq(value, barq_null()));
+                    CHECK(!found);
+                }
+
+                SECTION("barq_results_max()") {
+                    barq_value_t value;
+                    bool found = true;
+                    CHECK(barq_results_max(empty_r.get(), foo_int_key, &value, &found));
+                    CHECK(barq_val_eq(value, barq_null()));
+                    CHECK(!found);
+                }
+
+                SECTION("barq_results_sum()") {
+                    barq_value_t value;
+                    bool found = true;
+                    CHECK(barq_results_sum(empty_r.get(), foo_int_key, &value, &found));
+                    CHECK(barq_val_eq(value, barq_int_val(0)));
+                    CHECK(!found);
+                }
+
+                SECTION("barq_results_average()") {
+                    barq_value_t value;
+                    bool found = true;
+                    CHECK(barq_results_average(empty_r.get(), foo_int_key, &value, &found));
+                    CHECK(barq_val_eq(value, barq_null()));
+                    CHECK(!found);
+                }
+            }
+        }
+    }
+
+    barq_close(barq);
+    REQUIRE(barq_is_closed(barq));
+    barq_release(barq);
+}
+
+TEST_CASE("C API: nested collections", "[c_api]") {
+    TestFile test_file;
+    barq_t* barq;
+    ObjectSchema object_schema = {"Foo",
+                                  {
+                                      {"_id", PropertyType::Int, Property::IsPrimary{true}},
+                                      {"any", PropertyType::Mixed | PropertyType::Nullable},
+                                  }};
+
+    auto config = make_config(test_file.path.c_str(), false);
+    config->schema = Schema{object_schema};
+    config->schema_version = 0;
+    barq = barq_open(config.get());
+
+    barq_class_info_t class_foo;
+    bool found = false;
+    CHECK(checked(barq_find_class(barq, "Foo", &found, &class_foo)));
+    REQUIRE(found);
+
+    barq_property_info_t info;
+    found = false;
+    REQUIRE(barq_find_property(barq, class_foo.key, "any", &found, &info));
+    REQUIRE(found);
+    CHECK(info.key != BARQ_INVALID_PROPERTY_KEY);
+    barq_property_key_t foo_any_col_key = info.key;
+
+    CPtr<barq_object_t> obj1;
+    checked(barq_begin_write(barq));
+    barq_value_t pk = barq_int_val(42);
+    obj1 = cptr_checked(barq_object_create_with_primary_key(barq, class_foo.key, pk));
+
+    auto write = [&](auto&& f) {
+        checked(barq_begin_write(barq));
+        f();
+        checked(barq_commit(barq));
+        checked(barq_refresh(barq, nullptr));
+    };
+
+    SECTION("deletion of nested list through clearing of parent") {
+        struct UserData {
+            size_t deletions;
+            size_t insertions;
+            size_t modifications;
+            bool was_deleted;
+            barq_list_t* list;
+            barq_dictionary_t* dict;
+        } user_data;
+        auto parent_list = cptr_checked(barq_set_list(obj1.get(), foo_any_col_key));
+        REQUIRE(parent_list);
+        barq_value_t value;
+        barq_get_value(obj1.get(), foo_any_col_key, &value);
+        REQUIRE(value.type == BARQ_TYPE_LIST);
+        auto list = cptr_checked(barq_get_list(obj1.get(), foo_any_col_key));
+        // list[0] = nestedlist
+        auto nested_list = cptr_checked(barq_list_insert_list(list.get(), 0));
+        auto nested_dict = cptr_checked(barq_list_insert_dictionary(list.get(), 1));
+        user_data.list = nested_list.get();
+        user_data.dict = nested_dict.get();
+
+        checked(barq_commit(barq));
+
+        auto on_list_change = [](void* data, const barq_collection_changes_t* changes) {
+            auto* user_data = static_cast<UserData*>(data);
+            barq_collection_changes_get_num_changes(changes, &user_data->deletions, &user_data->insertions,
+                                                     &user_data->modifications, nullptr, nullptr,
+                                                     &user_data->was_deleted);
+            if (user_data->was_deleted) {
+                CHECK(!barq_list_is_valid(user_data->list));
+            }
+        };
+        auto require_change = [&]() {
+            auto token = cptr_checked(barq_list_add_notification_callback(nested_list.get(), &user_data, nullptr,
+                                                                           nullptr, on_list_change));
+            checked(barq_refresh(barq, nullptr));
+            return token;
+        };
+
+        auto token = require_change();
+
+        write([&] {
+            barq_list_clear(list.get());
+            // barq_list_set(list.get(), 0, barq_str_val("Foo"));
+        });
+        CHECK(user_data.was_deleted);
+        CHECK(!barq_list_is_valid(user_data.list));
+        CHECK(!barq_dictionary_is_valid(user_data.dict));
+    }
+
+    SECTION("results of mixed") {
+        SECTION("dictionary") {
+            auto parent_dict = cptr_checked(barq_set_dictionary(obj1.get(), foo_any_col_key));
+            REQUIRE(parent_dict);
+            barq_value_t value;
+            barq_get_value(obj1.get(), foo_any_col_key, &value);
+            REQUIRE(value.type == BARQ_TYPE_DICTIONARY);
+            auto dict = cptr_checked(barq_get_dictionary(obj1.get(), foo_any_col_key));
+            auto nlist = cptr_checked(barq_dictionary_insert_list(dict.get(), barq_str_val("A")));
+            auto ndict = cptr_checked(barq_dictionary_insert_dictionary(dict.get(), barq_str_val("B")));
+
+            // verify that we can fetch a collection from a result of mixed
+            auto results = cptr_checked(barq_dictionary_to_results(dict.get()));
+            const auto sz = results->size();
+            REQUIRE(sz == dict->size());
+            REQUIRE(results->is_valid());
+            barq_value_t val;
+            barq_results_get(results.get(), 0, &val);
+            REQUIRE(val.type == BARQ_TYPE_LIST);
+            barq_results_get(results.get(), 1, &val);
+            REQUIRE(val.type == BARQ_TYPE_DICTIONARY);
+            auto result_list = cptr_checked(barq_results_get_list(results.get(), 0));
+            REQUIRE(result_list);
+            REQUIRE(result_list->size() == nlist->size());
+            auto result_dictionary = cptr_checked(barq_results_get_dictionary(results.get(), 1));
+            REQUIRE(result_dictionary);
+            REQUIRE(result_dictionary->size() == ndict->size());
+        }
+        SECTION("list") {
+            auto parent_list = cptr_checked(barq_set_list(obj1.get(), foo_any_col_key));
+            REQUIRE(parent_list);
+            barq_value_t value;
+            barq_get_value(obj1.get(), foo_any_col_key, &value);
+            REQUIRE(value.type == BARQ_TYPE_LIST);
+            auto list = cptr_checked(barq_get_list(obj1.get(), foo_any_col_key));
+            auto nlist = cptr_checked(barq_list_insert_list(list.get(), 0));
+            auto ndict = cptr_checked(barq_list_insert_dictionary(list.get(), 1));
+
+            // verify that we can fetch a collection from a result of mixed
+            auto results = cptr_checked(barq_list_to_results(list.get()));
+            const auto sz = results->size();
+            REQUIRE(sz == list->size());
+            REQUIRE(results->is_valid());
+            barq_value_t val;
+            barq_results_get(results.get(), 0, &val);
+            REQUIRE(val.type == BARQ_TYPE_LIST);
+            barq_results_get(results.get(), 1, &val);
+            REQUIRE(val.type == BARQ_TYPE_DICTIONARY);
+            auto result_list = cptr_checked(barq_results_get_list(results.get(), 0));
+            REQUIRE(result_list);
+            REQUIRE(result_list->size() == nlist->size());
+            auto result_dictionary = cptr_checked(barq_results_get_dictionary(results.get(), 1));
+            REQUIRE(result_dictionary);
+            REQUIRE(result_dictionary->size() == ndict->size());
+        }
+    }
+
+    SECTION("dictionary") {
+        struct UserData {
+            size_t deletions;
+            size_t insertions;
+            size_t modifications;
+            bool was_deleted;
+            barq_dictionary_t* dict;
+        } user_data;
+
+        auto parent_dict = cptr_checked(barq_set_dictionary(obj1.get(), foo_any_col_key));
+        REQUIRE(parent_dict);
+        barq_value_t value;
+        barq_get_value(obj1.get(), foo_any_col_key, &value);
+        REQUIRE(value.type == BARQ_TYPE_DICTIONARY);
+        auto dict = cptr_checked(barq_get_dictionary(obj1.get(), foo_any_col_key));
+        checked(barq_dictionary_insert(dict.get(), barq_str_val("Hello"), barq_str_val("world"), nullptr, nullptr));
+        // dict -> list
+        auto list = cptr_checked(barq_dictionary_insert_list(dict.get(), barq_str_val("Goodbye")));
+        barq_list_insert(list.get(), 0, barq_str_val("Hello"));
+        barq_list_insert(list.get(), 0, barq_str_val("42"));
+        barq_list_insert(list.get(), 0, barq_int_val(42));
+        // dict -> dict
+        auto dict2 = cptr_checked(barq_dictionary_insert_dictionary(dict.get(), barq_str_val("Hi")));
+        user_data.dict = dict2.get();
+        checked(barq_dictionary_insert(dict2.get(), barq_str_val("Nested-Hello"), barq_str_val("Nested-World"),
+                                        nullptr, nullptr));
+        checked(barq_commit(barq));
+
+        auto on_dictionary_change = [](void* data, const barq_dictionary_changes_t* changes) {
+            auto* user_data = static_cast<UserData*>(data);
+            barq_dictionary_get_changes(changes, &user_data->deletions, &user_data->insertions,
+                                         &user_data->modifications, &user_data->was_deleted);
+            if (user_data->was_deleted) {
+                CHECK(!barq_dictionary_is_valid(user_data->dict));
+            }
+        };
+        auto require_change = [&]() {
+            auto token = cptr_checked(barq_dictionary_add_notification_callback(dict2.get(), &user_data, nullptr,
+                                                                                 nullptr, on_dictionary_change));
+            checked(barq_refresh(barq, nullptr));
+            return token;
+        };
+
+        auto token = require_change();
+
+        write([&] {
+            checked(barq_dictionary_insert(dict2.get(), barq_str_val("Nested-Godbye"),
+                                            barq_str_val("Nested-CruelWorld"), nullptr, nullptr));
+        });
+        CHECK(user_data.insertions == 1);
+
+        write([&] {
+            barq_dictionary_insert(dict.get(), barq_str_val("Hi"), barq_str_val("Foo"), nullptr, nullptr);
+        });
+        CHECK(user_data.deletions == 2);
+        CHECK(user_data.was_deleted);
+    }
+
+    SECTION("list") {
+        struct UserData {
+            size_t deletions;
+            size_t insertions;
+            size_t modifications;
+            bool was_deleted;
+            barq_list_t* list;
+        } user_data;
+
+        auto parent_list = cptr_checked(barq_set_list(obj1.get(), foo_any_col_key));
+        REQUIRE(parent_list);
+        barq_value_t value;
+        barq_get_value(obj1.get(), foo_any_col_key, &value);
+        REQUIRE(value.type == BARQ_TYPE_LIST);
+        auto list = cptr_checked(barq_get_list(obj1.get(), foo_any_col_key));
+        barq_list_insert(list.get(), 0, barq_str_val("Hello"));
+        barq_list_insert(list.get(), 1, barq_str_val("World"));
+        // list -> dict
+        auto dict = cptr_checked(barq_list_insert_dictionary(list.get(), 1));
+        checked(barq_dictionary_insert(dict.get(), barq_str_val("Hello"), barq_str_val("world"), nullptr, nullptr));
+        // list -> list
+        auto list2 = cptr_checked(barq_list_insert_list(list.get(), 2));
+        user_data.list = list2.get();
+
+        checked(barq_commit(barq));
+
+        auto on_list_change = [](void* data, const barq_collection_changes_t* changes) {
+            auto* user_data = static_cast<UserData*>(data);
+            barq_collection_changes_get_num_changes(changes, &user_data->deletions, &user_data->insertions,
+                                                     &user_data->modifications, nullptr, nullptr,
+                                                     &user_data->was_deleted);
+            if (user_data->was_deleted) {
+                CHECK(!barq_list_is_valid(user_data->list));
+            }
+        };
+        auto require_change = [&]() {
+            auto token = cptr_checked(
+                barq_list_add_notification_callback(list2.get(), &user_data, nullptr, nullptr, on_list_change));
+            checked(barq_refresh(barq, nullptr));
+            return token;
+        };
+
+        auto token = require_change();
+
+        write([&] {
+            barq_list_insert(list2.get(), 0, barq_str_val("Nested-Hello"));
+            barq_list_insert(list2.get(), 1, barq_str_val("Nested-World"));
+        });
+        CHECK(user_data.insertions == 2);
+
+        write([&] {
+            barq_list_set(list.get(), 2, barq_str_val("Foo"));
+        });
+        CHECK(user_data.deletions == 2);
+        CHECK(user_data.was_deleted);
+    }
+
+    SECTION("set list for collection in mixed, verify that previous reference is invalid") {
+        auto parent_list = cptr_checked(barq_set_list(obj1.get(), foo_any_col_key));
+        REQUIRE(parent_list);
+        barq_value_t value;
+        barq_get_value(obj1.get(), foo_any_col_key, &value);
+        REQUIRE(value.type == BARQ_TYPE_LIST);
+        auto list = cptr_checked(barq_get_list(obj1.get(), foo_any_col_key));
+        auto n_list = cptr_checked(barq_list_insert_list(list.get(), 0));
+        size_t size;
+        checked(barq_list_size(list.get(), &size));
+        REQUIRE(size == 1);
+        barq_list_insert(n_list.get(), 0, barq_str_val("Test1"));
+        auto n_dict = cptr_checked(barq_list_set_dictionary(list.get(), 0));
+        // accessor has become invalid
+        REQUIRE(!barq_list_insert(n_list.get(), 1, barq_str_val("Test2")));
+        CHECK_ERR(BARQ_ERR_INVALIDATED_OBJECT);
+        // try to get a dictionary should work
+        n_dict = cptr_checked(barq_list_get_dictionary(list.get(), 0));
+        bool inserted = false;
+        size_t ndx;
+        barq_value_t key = barq_str_val("key");
+        barq_value_t val = barq_str_val("value");
+        REQUIRE(barq_dictionary_insert(n_dict.get(), key, val, &ndx, &inserted));
+        REQUIRE(ndx == 0);
+        REQUIRE(inserted);
+
+        CHECK(barq_list_set(list.get(), 0, barq_int_val(5)));
+        // accessor invalid
+        REQUIRE(!barq_dictionary_insert(n_dict.get(), key, val, &ndx, &inserted));
+        CHECK_ERR(BARQ_ERR_INVALIDATED_OBJECT);
+        barq_value_t out;
+        CHECK(barq_list_get(list.get(), 0, &out));
+
+        n_list = cptr_checked(barq_list_set_list(list.get(), 0));
+        // get a list should work
+        n_list = cptr_checked(barq_list_get_list(list.get(), 0));
+        REQUIRE(barq_list_insert(n_list.get(), 0, barq_str_val("Test1")));
+        // reset the collection type to the same type (nop)
+        n_list = cptr_checked(barq_list_set_list(list.get(), 0));
+        // accessor is still valid
+        REQUIRE(barq_list_insert(n_list.get(), 0, barq_str_val("Test2")));
+        checked(barq_list_size(n_list.get(), &size));
+        REQUIRE(size == 2);
+    }
+
+    SECTION("json") {
+        REQUIRE(barq_set_json(
+            obj1.get(), foo_any_col_key,
+            R"( [ { "Seven":7, "Six":6 }, "Hello", { "Points": [1.25, 4.5, 6.75], "Hello": "World" } ])"));
+        barq_value_t value;
+        barq_get_value(obj1.get(), foo_any_col_key, &value);
+        REQUIRE(value.type == BARQ_TYPE_LIST);
+        auto list = cptr_checked(barq_get_list(obj1.get(), foo_any_col_key));
+        size_t size;
+        checked(barq_list_size(list.get(), &size));
+        CHECK(size == 3);
+    }
+
+    SECTION("freeze list") {
+        auto parent_dict = cptr_checked(barq_set_dictionary(obj1.get(), foo_any_col_key));
+        REQUIRE(parent_dict);
+        auto dict = cptr_checked(barq_get_dictionary(obj1.get(), foo_any_col_key));
+        auto list = cptr_checked(barq_dictionary_insert_list(dict.get(), barq_str_val("List")));
+        barq_list_insert(list.get(), 0, barq_str_val("Hello"));
+        barq_list_insert(list.get(), 0, barq_str_val("42"));
+        checked(barq_commit(barq));
+        size_t size;
+        checked(barq_list_size(list.get(), &size));
+        REQUIRE(size == 2);
+        auto frozen_barq = cptr_checked(barq_freeze(barq));
+
+        barq_list_t* frozen_list;
+        barq_list_resolve_in(list.get(), frozen_barq.get(), &frozen_list);
+        checked(barq_list_size(frozen_list, &size));
+        REQUIRE(size == 2);
+        barq_release(frozen_list);
+    }
+    barq_release(barq);
+}
+
+TEST_CASE("C API: convert", "[c_api]") {
+    TestFile test_file;
+    TestFile dest_test_file;
+    barq_t* barq;
+    ObjectSchema object_schema = {"Foo",
+                                  {
+                                      {"_id", PropertyType::Int, Property::IsPrimary{true}},
+                                      {"string_value", PropertyType::String},
+                                  }};
+
+    { // seed a Barq with an object
+        auto config = make_config(test_file.path.c_str(), false);
+        config->schema = Schema{object_schema};
+        config->schema_version = 0;
+        barq = barq_open(config.get());
+        REQUIRE(checked(barq));
+        CHECK(!barq_equals(barq, nullptr));
+        barq_class_info_t class_foo;
+        bool found = false;
+        CHECK(checked(barq_find_class(barq, "Foo", &found, &class_foo)));
+        REQUIRE(found);
+
+        barq_property_key_t foo_str_col_key;
+        barq_property_info_t info;
+        found = false;
+        REQUIRE(barq_find_property(barq, class_foo.key, "string_value", &found, &info));
+        REQUIRE(found);
+        CHECK(info.key != BARQ_INVALID_PROPERTY_KEY);
+        foo_str_col_key = info.key;
+
+        CPtr<barq_object_t> obj1;
+        checked(barq_begin_write(barq));
+        barq_value_t pk = barq_int_val(42);
+        obj1 = cptr_checked(barq_object_create_with_primary_key(barq, class_foo.key, pk));
+        CHECK(obj1);
+        CHECK(checked(barq_set_value(obj1.get(), foo_str_col_key, barq_str_val("Hello, World!"), false)));
+        checked(barq_commit(barq));
+        checked(barq_refresh(barq, nullptr));
+
+        size_t foo_count;
+        CHECK(checked(barq_get_num_objects(barq, class_foo.key, &foo_count)));
+        REQUIRE(foo_count == 1);
+    }
+
+    CHECK(barq_get_num_classes(barq) == 1);
+
+    SECTION("convert with path") {
+        bool merge_with_existing = false;
+        barq_binary encryption_key{nullptr, 0};
+
+        REQUIRE(barq_convert_with_path(barq, dest_test_file.path.c_str(), encryption_key, merge_with_existing));
+
+        SECTION("convert again without merge should fail") {
+            REQUIRE_FALSE(
+                barq_convert_with_path(barq, dest_test_file.path.c_str(), encryption_key, merge_with_existing));
+        }
+        SECTION("convert again with merge should succeed") {
+            merge_with_existing = true;
+            REQUIRE(barq_convert_with_path(barq, dest_test_file.path.c_str(), encryption_key, merge_with_existing));
+        }
+    }
+
+    SECTION("convert with config") {
+        auto dest_config = make_config(dest_test_file.path.c_str(), false);
+        dest_config->schema = Schema{object_schema};
+        dest_config->schema_version = 0;
+        bool merge_with_existing = false;
+        REQUIRE(barq_convert_with_config(barq, dest_config.get(), merge_with_existing));
+        SECTION("convert again without merge should fail") {
+            REQUIRE_FALSE(barq_convert_with_config(barq, dest_config.get(), merge_with_existing));
+        }
+        SECTION("convert again with merge should succeed") {
+            merge_with_existing = true;
+            REQUIRE(barq_convert_with_config(barq, dest_config.get(), merge_with_existing));
+        }
+    }
+    barq_close(barq);
+    REQUIRE(barq_is_closed(barq));
+    barq_release(barq);
+}
+
+struct Userdata {
+    std::atomic<bool> called{false};
+    bool has_error;
+    barq_error_t error;
+    barq_thread_safe_reference_t* barq_ref = nullptr;
+    std::string error_message;
+};
+
+#if BARQ_ENABLE_SYNC
+
+static void task_completion_func(void* p, barq_thread_safe_reference_t* barq,
+                                 const barq_async_error_t* async_error)
+{
+    auto userdata_p = static_cast<Userdata*>(p);
+
+    userdata_p->barq_ref = barq;
+    userdata_p->has_error = barq_get_async_error(async_error, &userdata_p->error);
+    userdata_p->called = true;
+}
+
+static void task_init_subscription(barq_thread_safe_reference_t* barq, void*)
+{
+    REQUIRE(barq);
+}
+
+static void sync_error_handler(void* p, barq_sync_session_t*, const barq_sync_error_t error)
+{
+    auto userdata_p = static_cast<Userdata*>(p);
+    userdata_p->has_error = true;
+    userdata_p->error_message = error.status.message;
+    userdata_p->error.error = error.status.error;
+    userdata_p->error.categories = error.status.categories;
+    userdata_p->error.message = userdata_p->error_message.c_str();
+}
+
+TEST_CASE("C API - async_open", "[sync][pbs][c_api]") {
+    TestSyncManager init_sync_manager;
+    SyncTestFile test_config(init_sync_manager, "default");
+    ObjectSchema object_schema = {"object",
+                                  {
+                                      {"_id", PropertyType::Int, Property::IsPrimary{true}},
+                                      {"value", PropertyType::Int},
+                                  }};
+    test_config.schema = Schema{object_schema};
+
+    SECTION("can open synced Barqs that don't already exist") {
+        barq_config_t* config = barq_config_new();
+        config->schema = Schema{object_schema};
+        barq_user user(init_sync_manager.fake_user());
+        barq_sync_config_t* sync_config = barq_sync_config_new(&user, "default");
+        barq_sync_config_set_initial_subscription_handler(sync_config, task_init_subscription, false, nullptr,
+                                                           nullptr);
+        barq_config_set_path(config, test_config.path.c_str());
+        barq_config_set_sync_config(config, sync_config);
+        barq_config_set_schema_version(config, 1);
+
+        barq_async_open_task_t* task = barq_open_synchronized(config);
+        REQUIRE(task);
+        Userdata userdata;
+        barq_async_open_task_start(task, task_completion_func, &userdata, nullptr);
+        util::EventLoop::main().run_until([&] {
+            return userdata.called.load();
+        });
+        REQUIRE(userdata.called);
+        REQUIRE(userdata.barq_ref);
+        barq_release(task);
+
+        barq_t* barq = barq_from_thread_safe_reference(userdata.barq_ref, nullptr);
+        barq_release(userdata.barq_ref);
+
+        bool found;
+        barq_class_info_t class_info;
+        barq_find_class(barq, "object", &found, &class_info);
+        REQUIRE(found);
+        barq_release(barq);
+        barq_release(config);
+        barq_release(sync_config);
+    }
+
+    SECTION("cancels download and reports an error on auth error") {
+        auto expired_token = encode_fake_jwt("", 123, 456);
+        struct User : TestUser {
+            using TestUser::TestUser;
+            void request_access_token(CompletionHandler&& completion) override
+            {
+                completion(app::AppError(ErrorCodes::HTTPError, "403 error", "", 403));
+            }
+            bool access_token_refresh_required() const override
+            {
+                return true;
+            }
+        };
+        auto user = std::make_shared<User>("barq", init_sync_manager.sync_manager());
+        user->m_access_token = expired_token;
+        user->m_refresh_token = expired_token;
+
+        barq_config_t* config = barq_config_new();
+        config->schema = Schema{object_schema};
+        barq_user c_user(user);
+        barq_sync_config_t* sync_config = barq_sync_config_new(&c_user, "barq");
+        barq_sync_config_set_initial_subscription_handler(sync_config, task_init_subscription, false, nullptr,
+                                                           nullptr);
+
+        barq_config_set_path(config, test_config.path.c_str());
+        barq_config_set_schema_version(config, 1);
+        Userdata userdata;
+        barq_sync_config_set_error_handler(sync_config, sync_error_handler, &userdata, nullptr);
+        barq_config_set_sync_config(config, sync_config);
+
+        barq_async_open_task_t* task = barq_open_synchronized(config);
+        REQUIRE(task);
+        barq_async_open_task_start(task, task_completion_func, &userdata, nullptr);
+        util::EventLoop::main().run_until([&] {
+            return userdata.called.load();
+        });
+        REQUIRE(userdata.called);
+        REQUIRE(!userdata.barq_ref);
+        REQUIRE(userdata.error.error == BARQ_ERR_AUTH_ERROR);
+        REQUIRE(userdata.error_message == "Unable to refresh the user access token: 403 error. Client Error: 403");
+        barq_release(task);
+        barq_release(config);
+        barq_release(sync_config);
+    }
+}
+
+struct BCTOState {
+    bool bcto_deleted = false;
+    bool thread_create_called = false;
+    bool thread_destroy_called = false;
+    std::string thread_on_error_message;
+    std::string id = "BTCO-STATE";
+};
+
+
+TEST_CASE("C API - binding callback thread observer", "[sync][c_api]") {
+    auto bcto_user_data = BCTOState();
+
+    auto bcto_free_userdata = [](barq_userdata_t userdata) {
+        REQUIRE(userdata);
+        auto user_data = static_cast<BCTOState*>(userdata);
+        REQUIRE(user_data->bcto_deleted == false);
+        REQUIRE((user_data && user_data->id == "BTCO-STATE"));
+        user_data->id.clear();
+        user_data->bcto_deleted = true;
+    };
+
+    auto bcto_on_thread_create = [](barq_userdata_t userdata) {
+        REQUIRE(userdata);
+        auto user_data = static_cast<BCTOState*>(userdata);
+        REQUIRE(user_data->bcto_deleted == false);
+        REQUIRE((user_data && user_data->id == "BTCO-STATE"));
+        REQUIRE(!user_data->thread_create_called);
+        user_data->thread_create_called = true;
+    };
+
+    auto bcto_on_thread_destroy = [](barq_userdata_t userdata) {
+        REQUIRE(userdata);
+        auto user_data = static_cast<BCTOState*>(userdata);
+        REQUIRE(user_data->bcto_deleted == false);
+        REQUIRE((user_data && user_data->id == "BTCO-STATE"));
+        REQUIRE(!user_data->thread_destroy_called);
+        user_data->thread_destroy_called = true;
+    };
+
+    auto bcto_on_thread_error = [](barq_userdata_t userdata, const char* err_message) {
+        REQUIRE(userdata);
+        REQUIRE(err_message);
+        auto user_data = static_cast<BCTOState*>(userdata);
+        REQUIRE(user_data->bcto_deleted == false);
+        REQUIRE((user_data && user_data->id == "BTCO-STATE"));
+        REQUIRE(user_data->thread_on_error_message.empty());
+        user_data->thread_on_error_message = err_message;
+        return true;
+    };
+
+    {
+        auto config_ptr = cptr(barq_sync_client_config_new());
+        auto config = config_ptr.get();
+        barq_sync_client_config_set_default_binding_thread_observer(
+            config, bcto_on_thread_create, bcto_on_thread_destroy, bcto_on_thread_error,
+            static_cast<barq_userdata_t>(&bcto_user_data), bcto_free_userdata);
+        REQUIRE(config->default_socket_provider_thread_observer);
+        auto observer_ptr =
+            static_cast<CBindingThreadObserver*>(config->default_socket_provider_thread_observer.get());
+        REQUIRE(observer_ptr->test_get_create_callback_func() == bcto_on_thread_create);
+        REQUIRE(observer_ptr->test_get_destroy_callback_func() == bcto_on_thread_destroy);
+        REQUIRE(observer_ptr->test_get_error_callback_func() == bcto_on_thread_error);
+        REQUIRE(observer_ptr->has_handle_error());
+        REQUIRE(observer_ptr->test_get_userdata_ptr() == &bcto_user_data);
+
+        JoiningThread([&] {
+            auto bcto_ptr = std::static_pointer_cast<barq::BindingCallbackThreadObserver>(
+                config->default_socket_provider_thread_observer);
+            REQUIRE(bcto_ptr);
+            auto will_destroy_thread = util::make_scope_exit([&bcto_ptr]() noexcept {
+                bcto_ptr->will_destroy_thread();
+            });
+            bcto_ptr->did_create_thread();
+            REQUIRE(bcto_ptr->handle_error(MultipleSyncAgents()));
+        });
+
+        REQUIRE(bcto_user_data.thread_create_called);
+        REQUIRE(bcto_user_data.thread_on_error_message.find(
+                    "Multiple sync agents attempted to join the same session") != std::string::npos);
+        REQUIRE(bcto_user_data.thread_destroy_called);
+    }
+
+    REQUIRE(bcto_user_data.bcto_deleted == true);
+
+    {
+        auto config_ptr = cptr(barq_sync_client_config_new());
+        auto config = config_ptr.get();
+        barq_sync_client_config_set_default_binding_thread_observer(config, nullptr, nullptr, nullptr, nullptr,
+                                                                     nullptr);
+        auto no_handle_error_ptr =
+            static_cast<CBindingThreadObserver*>(config->default_socket_provider_thread_observer.get());
+        no_handle_error_ptr->did_create_thread();                          // should not crash
+        no_handle_error_ptr->will_destroy_thread();                        // should not crash
+        REQUIRE(!no_handle_error_ptr->has_handle_error());                 // no handler, returns false
+        REQUIRE(!no_handle_error_ptr->handle_error(MultipleSyncAgents())); // no handler, returns false
+        // No free_user_data function was provided and internal default should be used
+        // Should not crash at scope exit
+    }
+}
+#endif

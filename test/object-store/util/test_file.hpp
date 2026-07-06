@@ -1,0 +1,279 @@
+////////////////////////////////////////////////////////////////////////////
+//
+// Copyright 2016 Realm Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+////////////////////////////////////////////////////////////////////////////
+
+#ifndef BARQ_TEST_UTIL_TEST_FILE_HPP
+#define BARQ_TEST_UTIL_TEST_FILE_HPP
+
+#include <barq/object-store/shared_barq.hpp>
+#include <barq/util/logger.hpp>
+#include <barq/util/tagged_bool.hpp>
+
+#if BARQ_ENABLE_SYNC
+#include "test_utils.hpp"
+#include <barq/object-store/sync/sync_manager.hpp>
+#include <barq/sync/client.hpp>
+#include <barq/sync/config.hpp>
+#include <barq/sync/noinst/server/server.hpp>
+#endif // BARQ_ENABLE_SYNC
+
+#include <thread>
+
+#ifndef TEST_TIMEOUT_EXTRA
+#define TEST_TIMEOUT_EXTRA 0
+#endif
+
+namespace barq {
+struct AppSession;
+class Schema;
+enum class SyncSessionStopPolicy;
+struct DBOptions;
+struct SyncConfig;
+} // namespace barq
+
+class JoiningThread {
+public:
+    template <typename... Args>
+    JoiningThread(Args&&... args)
+        : m_thread(std::forward<Args>(args)...)
+    {
+    }
+    ~JoiningThread()
+    {
+        if (m_thread.joinable())
+            m_thread.join();
+    }
+    void join()
+    {
+        m_thread.join();
+    }
+
+private:
+    std::thread m_thread;
+};
+
+
+struct TestFile : barq::Barq::Config {
+    TestFile();
+    ~TestFile();
+
+    TestFile(const TestFile&) = delete;
+    TestFile& operator=(const TestFile&) = delete;
+    TestFile(TestFile&&) = default;
+    TestFile& operator=(TestFile&&) = default;
+
+    // The file should outlive the object, ie. should not be deleted in destructor
+    void persist()
+    {
+        m_persist = true;
+    }
+
+    barq::DBOptions options() const;
+
+private:
+    bool m_persist = false;
+    std::string m_temp_dir;
+};
+
+struct InMemoryTestFile : barq::Barq::Config {
+    InMemoryTestFile();
+    barq::DBOptions options() const;
+};
+
+void advance_and_notify(barq::Barq& barq);
+void on_change_but_no_notify(barq::Barq& barq);
+
+#if BARQ_ENABLE_SYNC
+
+using StartImmediately = barq::util::TaggedBool<class StartImmediatelyTag>;
+using EnableSSL = barq::util::TaggedBool<class EnableSSLTag>;
+
+class SyncServer : private barq::sync::Clock {
+public:
+    struct Config {
+        StartImmediately start_immediately = true;
+        EnableSSL ssl = false;
+        std::string local_dir;
+    };
+
+    SyncServer(const Config& config);
+    ~SyncServer();
+
+    void start();
+    void stop();
+
+    std::string url_for_barq(barq::StringData barq_name) const;
+    std::string base_url() const
+    {
+        return m_url;
+    }
+    std::string local_root_dir() const
+    {
+        return m_local_root_dir;
+    }
+    int port() const;
+
+    template <class R, class P>
+    void advance_clock(std::chrono::duration<R, P> duration = std::chrono::seconds(1)) noexcept
+    {
+        m_now += std::chrono::duration_cast<time_point::duration>(duration).count();
+    }
+
+private:
+    std::string m_local_root_dir;
+    std::shared_ptr<barq::util::Logger> m_logger;
+    barq::sync::Server m_server;
+    std::thread m_thread;
+    std::string m_url;
+    std::atomic<time_point::rep> m_now{0};
+
+    time_point now() const noexcept override
+    {
+        return time_point{time_point::duration{m_now}};
+    }
+};
+
+struct TestUser : barq::SyncUser {
+    const std::string m_user_id;
+    std::string m_access_token;
+    std::string m_refresh_token;
+    std::shared_ptr<barq::SyncManager> m_sync_manager;
+    barq::SyncUser::State m_state = barq::SyncUser::State::LoggedIn;
+
+    TestUser(std::string user_id, std::shared_ptr<barq::SyncManager> sync_manager)
+        : m_user_id(std::move(user_id))
+        , m_sync_manager(std::move(sync_manager))
+    {
+    }
+
+    void log_out()
+    {
+        auto old_state = m_state;
+        m_state = barq::SyncUser::State::LoggedOut;
+        m_sync_manager->update_sessions_for(*this, old_state, m_state, {});
+    }
+
+    void log_in()
+    {
+        auto old_state = m_state;
+        m_state = barq::SyncUser::State::LoggedIn;
+        m_sync_manager->update_sessions_for(*this, old_state, m_state, m_access_token);
+    }
+
+    std::string user_id() const noexcept override
+    {
+        return m_user_id;
+    }
+    std::string app_id() const noexcept override
+    {
+        return "app id";
+    }
+
+    std::string access_token() const override
+    {
+        return m_access_token;
+    }
+    std::string refresh_token() const override
+    {
+        return m_access_token;
+    }
+    barq::SyncUser::State state() const override
+    {
+        return m_state;
+    }
+    bool access_token_refresh_required() const override
+    {
+        return false;
+    }
+    barq::SyncManager* sync_manager() override
+    {
+        return m_sync_manager.get();
+    }
+
+    void request_log_out() override {}
+    void request_refresh_location(CompletionHandler&&) override {}
+    void request_access_token(CompletionHandler&&) override {}
+
+    void track_barq(std::string_view) override {}
+    std::string create_file_action(barq::SyncFileAction, std::string_view, std::optional<std::string>) override
+    {
+        return "";
+    }
+};
+
+struct SyncTestFile : TestFile {
+    template <typename ErrorHandler>
+    SyncTestFile(const barq::SyncConfig& sync_config, barq::SyncSessionStopPolicy stop_policy,
+                 ErrorHandler&& error_handler)
+    {
+        this->sync_config = std::make_shared<barq::SyncConfig>(sync_config);
+        this->sync_config->stop_policy = stop_policy;
+        this->sync_config->error_handler = std::forward<ErrorHandler>(error_handler);
+        schema_mode = barq::SchemaMode::AdditiveExplicit;
+    }
+
+    SyncTestFile(TestSyncManager&, std::string name = "", std::string user_name = "test");
+    SyncTestFile(std::shared_ptr<barq::SyncUser> user, std::string partition,
+                 barq::util::Optional<barq::Schema> schema = barq::util::none);
+    SyncTestFile(std::shared_ptr<barq::SyncUser> user, std::string partition,
+                 barq::util::Optional<barq::Schema> schema,
+                 std::function<barq::SyncSessionErrorHandler>&& error_handler);
+    SyncTestFile(TestSyncManager&, std::string partition, barq::Schema schema);
+    SyncTestFile(std::shared_ptr<barq::SyncUser> user, barq::Schema schema, barq::SyncConfig::FLXSyncEnabled);
+};
+
+class TestSyncManager {
+public:
+    struct Config {
+        Config();
+        std::string base_path;
+        bool should_teardown_test_directory = true;
+        bool start_sync_client = true;
+    };
+
+    TestSyncManager(const Config& = Config(), const SyncServer::Config& = {});
+    ~TestSyncManager();
+
+    std::string base_file_path() const
+    {
+        return m_base_file_path;
+    }
+    SyncServer& sync_server()
+    {
+        return m_sync_server;
+    }
+    const std::shared_ptr<barq::SyncManager>& sync_manager()
+    {
+        return m_sync_manager;
+    }
+
+    std::shared_ptr<TestUser> fake_user(const std::string& name = "test");
+
+private:
+    std::shared_ptr<barq::SyncManager> m_sync_manager;
+    SyncServer m_sync_server;
+    const std::string m_base_file_path;
+    const bool m_should_teardown_test_directory = true;
+};
+
+
+bool wait_for_upload(barq::Barq& barq, std::chrono::seconds timeout = std::chrono::seconds(60));
+bool wait_for_download(barq::Barq& barq, std::chrono::seconds timeout = std::chrono::seconds(60));
+
+#endif // BARQ_ENABLE_SYNC
+
+#endif

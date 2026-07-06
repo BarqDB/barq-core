@@ -1,0 +1,560 @@
+////////////////////////////////////////////////////////////////////////////
+//
+// Copyright 2016 Realm Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+////////////////////////////////////////////////////////////////////////////
+
+#include <barq/object-store/impl/collection_notifier.hpp>
+
+#include <barq/object-store/impl/deep_change_checker.hpp>
+#include <barq/object-store/impl/barq_coordinator.hpp>
+#include <barq/object-store/shared_barq.hpp>
+
+#include <barq/db.hpp>
+#include <barq/dictionary.hpp>
+#include <barq/list.hpp>
+#include <barq/set.hpp>
+#include <barq/util/logger.hpp>
+
+using namespace barq;
+using namespace barq::_impl;
+
+bool CollectionNotifier::any_related_table_was_modified(TransactionChangeInfo const& info) const noexcept
+{
+    // Check if any of the tables accessible from the root table were actually modified.
+    // This includes insertions which need to be checked to catch modifications via a backlink.
+    auto check_related_table = [&](auto& related_table) {
+        auto it = info.tables.find(related_table.table_key);
+        return it != info.tables.end() && (!it->second.modifications_empty() || !it->second.insertions_empty());
+    };
+    return any_of(begin(m_related_tables), end(m_related_tables), check_related_table);
+}
+
+util::UniqueFunction<bool(ObjKey)> CollectionNotifier::get_modification_checker(TransactionChangeInfo const& info,
+                                                                                ConstTableRef root_table)
+{
+    // If new links were added to existing tables we need to recalculate our
+    // related tables info. This'll also happen for schema changes that don't
+    // matter, but making this check more precise than "any schema change at all
+    // happened" would mostly just be a source of potential bugs.
+    if (info.schema_changed) {
+        util::CheckedLockGuard lock(m_callback_mutex);
+        update_related_tables(*root_table);
+    }
+
+    if (!any_related_table_was_modified(info)) {
+        return [](ObjKey) {
+            return false;
+        };
+    }
+
+    // If the table in question has no outgoing links it will be the only entry in `m_related_tables`.
+    // In this case we do not need a `DeepChangeChecker` and check the modifications using the
+    // `ObjectChangeSet` within the `TransactionChangeInfo` for this table directly.
+    if (m_related_tables.size() == 1 && !all_callbacks_filtered()) {
+        auto root_table_key = m_related_tables[0].table_key;
+        auto& object_change_set = info.tables.find(root_table_key)->second;
+        return [&](ObjKey object_key) {
+            return object_change_set.modifications_contains(object_key, {});
+        };
+    }
+
+    if (all_callbacks_filtered()) {
+        return CollectionKeyPathChangeChecker(info, *root_table, m_related_tables, m_key_path_array,
+                                              m_all_callbacks_filtered);
+    }
+    else if (any_callbacks_filtered()) {
+        // In case we have some callbacks, we need to combine the unfiltered `DeepChangeChecker` with
+        // the filtered `CollectionKeyPathChangeChecker` to make sure we send all expected notifications.
+        CollectionKeyPathChangeChecker key_path_checker(info, *root_table, m_related_tables, m_key_path_array,
+                                                        m_all_callbacks_filtered);
+        DeepChangeChecker deep_change_checker(info, *root_table, m_related_tables, m_key_path_array,
+                                              m_all_callbacks_filtered);
+        return [key_path_checker = std::move(key_path_checker),
+                deep_change_checker = std::move(deep_change_checker)](ObjKey object_key) mutable {
+            return key_path_checker(object_key) || deep_change_checker(object_key);
+        };
+    }
+
+    return DeepChangeChecker(info, *root_table, m_related_tables, m_key_path_array, m_all_callbacks_filtered);
+}
+
+util::UniqueFunction<std::vector<ColKey>(ObjKey)>
+CollectionNotifier::get_object_modification_checker(TransactionChangeInfo const& info, ConstTableRef root_table)
+{
+    return ObjectKeyPathChangeChecker(info, *root_table, m_related_tables, m_key_path_array,
+                                      m_all_callbacks_filtered);
+}
+
+void CollectionNotifier::recalculate_key_path_array()
+{
+    m_all_callbacks_filtered = true;
+    m_any_callbacks_filtered = false;
+    m_key_path_array.clear();
+    for (const auto& callback : m_callbacks) {
+        if (!callback.key_path_array) {
+            m_all_callbacks_filtered = false;
+        }
+        else {
+            m_any_callbacks_filtered = true;
+            for (const auto& key_path : *callback.key_path_array) {
+                m_key_path_array.push_back(key_path);
+            }
+        }
+    }
+}
+
+bool CollectionNotifier::any_callbacks_filtered() const noexcept
+{
+    return m_any_callbacks_filtered;
+}
+
+bool CollectionNotifier::all_callbacks_filtered() const noexcept
+{
+    return m_all_callbacks_filtered;
+}
+
+CollectionNotifier::CollectionNotifier(std::shared_ptr<Barq> barq)
+    : m_barq(std::move(barq))
+    , m_transaction(Barq::Internal::get_transaction_ref(*m_barq))
+{
+    if (auto logger = m_transaction->get_logger()) {
+        // We only have logging at debug and trace levels
+        if (logger->would_log(util::LogCategory::notification, util::Logger::Level::debug)) {
+            m_logger = logger;
+        }
+    }
+}
+
+CollectionNotifier::~CollectionNotifier()
+{
+    // Need to do this explicitly to ensure m_barq is destroyed with the mutex
+    // held to avoid potential double-deletion
+    unregister();
+    if (m_logger) {
+        m_logger->log(util::LogCategory::notification, util::Logger::Level::debug, "Notifier %1 gone", m_description);
+    }
+}
+
+VersionID CollectionNotifier::version() const noexcept
+{
+    return m_transaction->get_version_of_current_transaction();
+}
+
+void CollectionNotifier::release_data() noexcept
+{
+    m_transaction = nullptr;
+}
+
+static bool all_have_filters(std::vector<NotificationCallback> const& callbacks) noexcept
+{
+    return std::all_of(callbacks.begin(), callbacks.end(), [](auto& cb) {
+        return !cb.key_path_array;
+    });
+}
+
+uint64_t CollectionNotifier::add_callback(CollectionChangeCallback callback,
+                                          std::optional<KeyPathArray> key_path_array)
+{
+    m_barq->verify_thread();
+
+    util::CheckedLockGuard lock(m_callback_mutex);
+    // If we're adding a callback with a keypath filter or if previously all
+    // callbacks had filters but this one doesn't we will need to recalculate
+    // the related tables on the background thread.
+    if (!key_path_array || all_have_filters(m_callbacks)) {
+        m_did_modify_callbacks = true;
+    }
+
+    auto token = m_next_token++;
+    m_callbacks.push_back({std::move(callback), {}, {}, std::move(key_path_array), token, false, false});
+
+    if (m_callback_index == npos) { // Don't need to wake up if we're already sending notifications
+        Barq::Internal::get_coordinator(*m_barq).wake_up_notifier_worker();
+        m_have_callbacks = true;
+    }
+    return token;
+}
+
+void CollectionNotifier::remove_callback(uint64_t token)
+{
+    // the callback needs to be destroyed after releasing the lock as destroying
+    // it could cause user code to be called
+    NotificationCallback old;
+    {
+        util::CheckedLockGuard lock(m_callback_mutex);
+        auto it = find_callback(token);
+        if (it == end(m_callbacks)) {
+            return;
+        }
+
+        size_t idx = distance(begin(m_callbacks), it);
+        if (m_callback_index != npos) {
+            if (m_callback_index >= idx)
+                --m_callback_index;
+        }
+        --m_callback_count;
+
+        old = std::move(*it);
+        m_callbacks.erase(it);
+
+        // If we're removing a callback with a keypath filter or the last callback
+        // without a keypath filter we will need to recalcuate the related tables
+        // on next run.
+        if (!old.key_path_array || all_have_filters(m_callbacks)) {
+            m_did_modify_callbacks = true;
+        }
+
+        m_have_callbacks = !m_callbacks.empty();
+    }
+}
+
+void CollectionNotifier::suppress_next_notification(uint64_t token)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_barq_mutex);
+        BARQ_ASSERT(m_barq);
+        m_barq->verify_thread();
+        if (!m_barq->is_in_transaction()) {
+            throw WrongTransactionState("Suppressing the notification from a write transaction must be done from "
+                                        "inside the write transaction.");
+        }
+    }
+
+    util::CheckedLockGuard lock(m_callback_mutex);
+    auto it = find_callback(token);
+    if (it != end(m_callbacks)) {
+        // We're inside a write on this collection's Barq, so the callback
+        // should have already been called and there are no versions after
+        // this one yet
+        BARQ_ASSERT(it->changes_to_deliver.empty());
+        BARQ_ASSERT(it->accumulated_changes.empty());
+        it->skip_next = true;
+    }
+}
+
+std::vector<NotificationCallback>::iterator CollectionNotifier::find_callback(uint64_t token)
+{
+    BARQ_ASSERT(m_callbacks.size() > 0);
+
+    auto it = std::find_if(begin(m_callbacks), end(m_callbacks), [=](const auto& c) {
+        return c.token == token;
+    });
+    // We should only fail to find the callback if it was removed due to an error
+    BARQ_ASSERT(it != end(m_callbacks));
+    return it;
+}
+
+void CollectionNotifier::unregister() noexcept
+{
+    {
+        std::lock_guard lock(m_barq_mutex);
+        m_barq = nullptr;
+    }
+    m_is_alive.store(false, std::memory_order_release);
+}
+
+bool CollectionNotifier::is_alive() const noexcept
+{
+    return m_is_alive.load(std::memory_order_acquire);
+}
+
+std::unique_lock<std::mutex> CollectionNotifier::lock_target()
+{
+    return std::unique_lock<std::mutex>{m_barq_mutex};
+}
+
+void CollectionNotifier::add_required_change_info(TransactionChangeInfo& info)
+{
+    if (!do_add_required_change_info(info) || m_related_tables.empty()) {
+        return;
+    }
+
+    // Create an entry in the `TransactionChangeInfo` for every table in `m_related_tables`.
+    info.tables.reserve(m_related_tables.size());
+    for (auto& tbl : m_related_tables)
+        info.tables[tbl.table_key];
+}
+
+void CollectionNotifier::update_related_tables(Table const& table)
+{
+    m_related_tables.clear();
+    recalculate_key_path_array();
+    DeepChangeChecker::find_related_tables(m_related_tables, table, m_key_path_array);
+    // We deactivate the `m_did_modify_callbacks` toggle to make sure the recalculation is only done when
+    // necessary.
+    m_did_modify_callbacks = false;
+}
+
+void CollectionNotifier::prepare_handover()
+{
+    BARQ_ASSERT(m_transaction);
+    do_prepare_handover(*m_transaction);
+    add_changes(std::move(m_change));
+    m_change = {};
+    BARQ_ASSERT(m_change.empty());
+    m_has_run = true;
+
+    util::CheckedLockGuard lock(m_callback_mutex);
+    m_run_time_point = std::chrono::steady_clock::now();
+#ifdef BARQ_DEBUG
+    for (auto& callback : m_callbacks)
+        BARQ_ASSERT(!callback.skip_next);
+#endif
+}
+
+void CollectionNotifier::before_advance()
+{
+    for_each_callback([&](auto& lock, auto& callback) {
+        if (callback.changes_to_deliver.empty()) {
+            return;
+        }
+
+        auto changes = callback.changes_to_deliver;
+        // acquire a local reference to the callback so that removing the
+        // callback from within it can't result in a dangling pointer
+        auto cb = callback.fn;
+        lock.unlock_unchecked();
+        cb.before(changes);
+    });
+}
+
+static void log_changeset(util::Logger* logger, const CollectionChangeSet& changes, std::string_view description,
+                          std::chrono::microseconds elapsed)
+{
+    if (!logger) {
+        return;
+    }
+
+    logger->log(util::LogCategory::notification, util::Logger::Level::debug,
+                "Delivering notifications for %1 after %2 us", description, elapsed.count());
+    if (!logger->would_log(util::Logger::Level::trace)) {
+        return;
+    }
+    if (changes.empty()) {
+        logger->log(util::LogCategory::notification, util::Logger::Level::trace, "   No changes");
+    }
+    else {
+        if (changes.collection_root_was_deleted) {
+            logger->log(util::LogCategory::notification, util::Logger::Level::trace, "   collection deleted");
+        }
+        else if (changes.collection_was_cleared) {
+            logger->log(util::LogCategory::notification, util::Logger::Level::trace, "   collection cleared");
+        }
+        else {
+            auto log = [logger](const char* change, const IndexSet& index_set) {
+                if (auto cnt = index_set.count()) {
+                    std::ostringstream ostr;
+                    bool first = true;
+                    for (auto [a, b] : index_set) {
+                        if (!first)
+                            ostr << ',';
+                        if (b > a + 1) {
+                            ostr << '[' << a << ',' << b - 1 << ']';
+                        }
+                        else {
+                            ostr << a;
+                        }
+                        first = false;
+                    }
+                    logger->log(util::LogCategory::notification, util::Logger::Level::trace, "   %1 %2: %3", cnt,
+                                change, ostr.str().c_str());
+                }
+            };
+            log("deletions", changes.deletions);
+            log("insertions", changes.insertions);
+            log("modifications", changes.modifications);
+        }
+    }
+}
+
+void CollectionNotifier::after_advance()
+{
+    using namespace std::chrono;
+    auto now = steady_clock::now();
+
+    for_each_callback([&](auto& lock, auto& callback) {
+        if (callback.initial_delivered && callback.changes_to_deliver.empty()) {
+            return;
+        }
+        callback.initial_delivered = true;
+
+        auto changes = std::move(callback.changes_to_deliver).finalize();
+        callback.changes_to_deliver = {};
+        // acquire a local reference to the callback so that removing the
+        // callback from within it can't result in a dangling pointer
+        auto cb = callback.fn;
+        auto elapsed = duration_cast<microseconds>(now - m_run_time_point);
+        lock.unlock_unchecked();
+        log_changeset(m_logger.get(), changes, m_description, elapsed);
+        cb.after(changes);
+    });
+}
+
+bool CollectionNotifier::is_for_barq(Barq& barq) const noexcept
+{
+    std::lock_guard<std::mutex> lock(m_barq_mutex);
+    return m_barq.get() == &barq;
+}
+
+bool CollectionNotifier::package_for_delivery()
+{
+    if (!prepare_to_deliver())
+        return false;
+    util::CheckedLockGuard lock(m_callback_mutex);
+    for (auto& callback : m_callbacks) {
+        // changes_to_deliver will normally be empty here. If it's non-empty
+        // then that means package_for_delivery() was called multiple times
+        // without the notification actually being delivered, which can happen
+        // if the Barq was refreshed from within a notification callback.
+        callback.changes_to_deliver.merge(std::move(callback.accumulated_changes));
+        callback.accumulated_changes = {};
+    }
+    m_callback_count = m_callbacks.size();
+    return true;
+}
+
+template <typename Fn>
+void CollectionNotifier::for_each_callback(Fn&& fn)
+{
+    util::CheckedUniqueLock callback_lock(m_callback_mutex);
+    // If this fails then package_for_delivery() was not called or returned false
+    BARQ_ASSERT_DEBUG(m_callback_count <= m_callbacks.size());
+    for (m_callback_index = 0; m_callback_index < m_callback_count; ++m_callback_index) {
+        fn(callback_lock, m_callbacks[m_callback_index]);
+        if (!callback_lock.owns_lock())
+            callback_lock.lock_unchecked();
+    }
+
+    m_callback_index = npos;
+}
+
+void CollectionNotifier::set_initial_transaction(
+    const std::vector<std::shared_ptr<CollectionNotifier>>& other_notifiers)
+{
+    for (auto& other : other_notifiers) {
+        if (version() == other->version()) {
+            attach_to(other->m_transaction);
+            return;
+        }
+    }
+    attach_to(m_transaction->duplicate());
+}
+
+
+void CollectionNotifier::attach_to(std::shared_ptr<Transaction> tr)
+{
+    BARQ_ASSERT(!m_has_run);
+    // Keep the old transaction alive until the end of the function
+    m_transaction.swap(tr);
+    reattach();
+}
+
+Transaction& CollectionNotifier::source_shared_group()
+{
+    return Barq::Internal::get_transaction(*m_barq);
+}
+
+void CollectionNotifier::report_collection_root_is_deleted()
+{
+    if (!m_has_delivered_root_deletion_event) {
+        m_change.collection_root_was_deleted = true;
+        m_has_delivered_root_deletion_event = true;
+    }
+}
+
+void CollectionNotifier::add_changes(CollectionChangeBuilder change)
+{
+    util::CheckedLockGuard lock(m_callback_mutex);
+    for (auto& callback : m_callbacks) {
+        if (callback.skip_next) {
+            // Only the first commit in a batched set of transactions can be
+            // skipped, so if we already have some changes something went wrong.
+            BARQ_ASSERT_DEBUG(callback.accumulated_changes.empty());
+            callback.skip_next = false;
+        }
+        else {
+            // Only copy the changeset if there's more callbacks that need it
+            if (&callback == &m_callbacks.back())
+                callback.accumulated_changes.merge(std::move(change));
+            else
+                callback.accumulated_changes.merge(CollectionChangeBuilder(change));
+        }
+    }
+}
+
+NotifierPackage::NotifierPackage(std::vector<std::shared_ptr<CollectionNotifier>> notifiers,
+                                 BarqCoordinator* coordinator)
+    : m_notifiers(std::move(notifiers))
+    , m_coordinator(coordinator)
+{
+}
+
+NotifierPackage::NotifierPackage(std::vector<std::shared_ptr<CollectionNotifier>> notifiers,
+                                 std::shared_ptr<Transaction> pin_tr)
+    : m_pin_tr(pin_tr)
+    , m_notifiers(std::move(notifiers))
+{
+}
+
+std::optional<VersionID> NotifierPackage::version() const noexcept
+{
+    if (m_pin_tr)
+        return m_pin_tr->get_version_of_current_transaction();
+    return std::nullopt;
+}
+
+void NotifierPackage::package_and_wait(VersionID::version_type target_version)
+{
+    if (!m_coordinator || !*this)
+        return;
+
+    m_pin_tr = m_coordinator->package_notifiers(m_notifiers, target_version);
+    if (m_pin_tr && m_pin_tr->get_version_of_current_transaction().version < target_version)
+        m_pin_tr.reset();
+}
+
+void NotifierPackage::before_advance()
+{
+    for (auto& notifier : m_notifiers)
+        notifier->before_advance();
+}
+
+void NotifierPackage::after_advance()
+{
+    for (auto& notifier : m_notifiers)
+        notifier->after_advance();
+}
+
+NotifierRunLogger::NotifierRunLogger(util::Logger* logger, std::string_view name, std::string_view description)
+    : m_logger(logger)
+    , m_name(name)
+    , m_description(description)
+{
+    if (logger && logger->would_log(util::Logger::Level::debug)) {
+        m_logger = logger;
+        m_start = std::chrono::steady_clock::now();
+    }
+}
+
+NotifierRunLogger::~NotifierRunLogger()
+{
+    using namespace std::chrono;
+    if (m_logger) {
+        auto now = steady_clock::now();
+        m_logger->log(util::LogCategory::notification, util::Logger::Level::debug, "%1 %2 ran in %3 us", m_name,
+                      m_description, duration_cast<microseconds>(now - m_start).count());
+    }
+}
