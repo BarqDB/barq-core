@@ -99,8 +99,15 @@ cmake-build-debug/test/object-store/barq-object-store-tests.app/Contents/MacOS/b
 
 ## License And Attribution
 
-Barq is derived from Realm Core.
+Barq is a modified fork of [Realm Core](https://github.com/realm/realm-core).
+The source files have been changed from their original form as part of the Barq
+project; see the Git history for details. The original Realm Inc. copyright
+headers are retained.
 
-The code is licensed under the Apache License 2.0. See `LICENSE`.
+The code is licensed under the Apache License 2.0. See `LICENSE` and `NOTICE`.
+
+Barq is an independent project and is not affiliated with, sponsored by, or
+endorsed by Realm, MongoDB, Inc., or MongoDB Atlas. "Realm", "MongoDB", and
+"MongoDB Atlas" are trademarks of MongoDB, Inc.
 
 Third-party notices are kept in `THIRD-PARTY-NOTICES`.
