@@ -23,6 +23,7 @@
 #include <barq/object-store/c_api/conversion.hpp>
 #include <barq/object-store/sync/sync_manager.hpp>
 #include <barq/object-store/sync/sync_session.hpp>
+#include <barq/object-store/sync/token_sync_user.hpp>
 #include <barq/object-store/sync/async_open_task.hpp>
 #include <barq/util/basic_system_errors.hpp>
 
@@ -227,6 +228,81 @@ BARQ_API void barq_sync_client_config_set_default_binding_thread_observer(
 BARQ_API void barq_config_set_sync_config(barq_config_t* config, barq_sync_config_t* sync_config)
 {
     config->sync_config = std::make_shared<SyncConfig>(*sync_config);
+}
+
+namespace {
+// A user created by barq_sync_user_new_from_token() is a TokenSyncUser. The
+// route/token setters below are specific to it.
+std::shared_ptr<TokenSyncUser> as_token_user(const barq_user_t* user)
+{
+    auto token = std::dynamic_pointer_cast<TokenSyncUser>(static_cast<const std::shared_ptr<SyncUser>&>(*user));
+    if (!token) {
+        throw std::invalid_argument("user was not created by barq_sync_user_new_from_token()");
+    }
+    return token;
+}
+} // unnamed namespace
+
+BARQ_API barq_user_t* barq_sync_user_new_from_token(const char* tenant_id, const char* user_id,
+                                                    const char* access_token) noexcept
+{
+    BARQ_ASSERT(tenant_id);
+    BARQ_ASSERT(user_id);
+    BARQ_ASSERT(access_token);
+    return wrap_err([&]() {
+        std::shared_ptr<SyncUser> user = TokenSyncUser::create(tenant_id, user_id, access_token);
+        return new barq_user_t(std::move(user));
+    });
+}
+
+BARQ_API void barq_sync_user_set_route(barq_user_t* user, const char* route, bool verified) noexcept
+{
+    BARQ_ASSERT(user);
+    BARQ_ASSERT(route);
+    wrap_err([&]() {
+        as_token_user(user)->set_route(route, verified);
+        return true;
+    });
+}
+
+BARQ_API void barq_sync_user_set_access_token(barq_user_t* user, const char* access_token) noexcept
+{
+    BARQ_ASSERT(user);
+    BARQ_ASSERT(access_token);
+    wrap_err([&]() {
+        as_token_user(user)->set_access_token(access_token);
+        return true;
+    });
+}
+
+BARQ_API void barq_sync_user_mark_access_token_refresh_required(barq_user_t* user) noexcept
+{
+    BARQ_ASSERT(user);
+    wrap_err([&]() {
+        as_token_user(user)->mark_access_token_refresh_required();
+        return true;
+    });
+}
+
+// The validated config builders (route required; partition must be non-empty and
+// relative to the tenant). These share TokenSyncUser::make_*_config with the C++
+// SDK, unlike barq_sync_config_new()/barq_flx_sync_config_new() which construct a
+// SyncConfig directly without those checks.
+BARQ_API barq_sync_config_t* barq_sync_user_make_sync_config(barq_user_t* user, const char* partition) noexcept
+{
+    BARQ_ASSERT(user);
+    BARQ_ASSERT(partition);
+    return wrap_err([&]() {
+        return new barq_sync_config_t(*as_token_user(user)->make_sync_config(partition));
+    });
+}
+
+BARQ_API barq_sync_config_t* barq_sync_user_make_flexible_sync_config(barq_user_t* user) noexcept
+{
+    BARQ_ASSERT(user);
+    return wrap_err([&]() {
+        return new barq_sync_config_t(*as_token_user(user)->make_flexible_sync_config());
+    });
 }
 
 BARQ_API barq_sync_config_t* barq_sync_config_new(const barq_user_t* user, const char* partition_value) noexcept

@@ -3165,6 +3165,36 @@ BARQ_API void barq_sync_client_config_set_default_binding_thread_observer(
     barq_on_object_store_thread_callback_t on_thread_destroy, barq_on_object_store_error_callback_t on_error,
     barq_userdata_t user_data, barq_free_userdata_func_t free_userdata);
 
+/**
+ * Create a sync user identified by a tenant and a pre-supplied access token (a
+ * signed JWT), for use with self-hosted Barq sync (no Atlas App Services login).
+ * All three arguments must be non-empty. Set a route with
+ * barq_sync_user_set_route() before creating a sync config from this user.
+ *
+ * This is the shared Barq implementation of the SyncUser interface; every client
+ * SDK uses it rather than re-implementing the interface. Returns a new user, or
+ * null on error (e.g. an empty argument), with the error set on the thread.
+ */
+BARQ_API barq_user_t* barq_sync_user_new_from_token(const char* tenant_id, const char* user_id,
+                                                    const char* access_token) BARQ_API_NOEXCEPT;
+/** Set the websocket route to the sync server. Only valid for a token user. */
+BARQ_API void barq_sync_user_set_route(barq_user_t*, const char* route, bool verified) BARQ_API_NOEXCEPT;
+/** Replace the user's access token (e.g. after refreshing it). Token user only. */
+BARQ_API void barq_sync_user_set_access_token(barq_user_t*, const char* access_token) BARQ_API_NOEXCEPT;
+/** Flag the access token as needing a refresh. Token user only. */
+BARQ_API void barq_sync_user_mark_access_token_refresh_required(barq_user_t*) BARQ_API_NOEXCEPT;
+
+/**
+ * Validated sync-config builders shared with the C++ SDK. Both require a route to
+ * have been set; the partition-based one requires a non-empty partition that does
+ * not start with '/'. Return null on error (with the error set on the thread).
+ * Prefer these over barq_sync_config_new()/barq_flx_sync_config_new(), which skip
+ * the checks. Token user only.
+ */
+BARQ_API barq_sync_config_t* barq_sync_user_make_sync_config(barq_user_t*,
+                                                             const char* partition) BARQ_API_NOEXCEPT;
+BARQ_API barq_sync_config_t* barq_sync_user_make_flexible_sync_config(barq_user_t*) BARQ_API_NOEXCEPT;
+
 BARQ_API barq_sync_config_t* barq_sync_config_new(const barq_user_t*, const char* partition_value) BARQ_API_NOEXCEPT;
 BARQ_API barq_sync_config_t* barq_flx_sync_config_new(const barq_user_t*) BARQ_API_NOEXCEPT;
 BARQ_API void barq_sync_config_set_session_stop_policy(barq_sync_config_t*,
