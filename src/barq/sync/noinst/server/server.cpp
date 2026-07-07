@@ -47,6 +47,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <locale>
 #include <map>
 #include <memory>
@@ -103,6 +104,37 @@ static_assert(std::numeric_limits<timestamp_type>::digits >= 63, "Bad timestamp 
 namespace {
 
 enum class SchedStatus { done = 0, pending, in_progress };
+
+std::string get_tenant_id_from_virt_path(const std::string& virt_path)
+{
+    if (virt_path.empty())
+        return {};
+    std::size_t begin = (virt_path.front() == '/') ? 1 : 0;
+    if (begin >= virt_path.size())
+        return {};
+    std::size_t end = virt_path.find('/', begin);
+    return virt_path.substr(begin, end - begin); // Throws
+}
+
+std::uintmax_t directory_size(const std::string& path)
+{
+    if (!util::File::exists(path))
+        return 0;
+    if (!util::File::is_dir(path))
+        return util::File::get_size_static(path);
+
+    std::uintmax_t total = 0;
+    util::DirScanner scanner{path}; // Throws
+    std::string name;
+    while (scanner.next(name)) { // Throws
+        std::string child = util::File::resolve(name, path); // Throws
+        std::uintmax_t child_size = directory_size(child);   // Throws
+        if (child_size > std::numeric_limits<std::uintmax_t>::max() - total)
+            return std::numeric_limits<std::uintmax_t>::max();
+        total += child_size;
+    }
+    return total;
+}
 
 // Only used by the Sync Server to support older pbs sync clients (prior to protocol v8)
 constexpr std::string_view get_old_pbs_websocket_protocol_prefix() noexcept
@@ -746,6 +778,11 @@ inline ServerFileAccessCache& Worker::get_file_access_cache() noexcept
 
 class ServerImpl : public ServerImplBase, public ServerHistory::Context {
 public:
+    struct TenantUsage {
+        std::size_t connections = 0;
+        std::size_t files = 0;
+    };
+
     std::uint_fast64_t errors_seen = 0;
 
     std::atomic<milliseconds_type> m_par_time;
@@ -884,6 +921,52 @@ public:
         return m_barq_names;
     }
 
+    bool reserve_tenant_connection(const std::string& tenant_id)
+    {
+        std::size_t limit = m_config.tenant_limits.max_connections;
+        if (limit == 0)
+            return true;
+        TenantUsage& usage = m_tenant_usage[tenant_id]; // Throws
+        if (usage.connections >= limit)
+            return false;
+        ++usage.connections;
+        return true;
+    }
+
+    void release_tenant_connection(const std::string& tenant_id) noexcept
+    {
+        auto i = m_tenant_usage.find(tenant_id);
+        if (i == m_tenant_usage.end() || i->second.connections == 0)
+            return;
+        --i->second.connections;
+    }
+
+    bool tenant_can_access_path(const std::string& tenant_id, const std::string& virt_path)
+    {
+        const auto& limits = m_config.tenant_limits;
+        auto usage = m_tenant_usage.find(tenant_id);
+        std::size_t files = usage == m_tenant_usage.end() ? 0 : usage->second.files;
+
+        bool known_file = m_barq_names.count(virt_path) != 0;
+        if (!known_file && limits.max_files != 0 && files >= limits.max_files)
+            return false;
+
+        return tenant_can_store_bytes(tenant_id, 0); // Throws
+    }
+
+    bool tenant_can_store_bytes(const std::string& tenant_id, std::size_t incoming_bytes)
+    {
+        std::uintmax_t limit = m_config.tenant_limits.max_storage_bytes;
+        if (limit == 0)
+            return true;
+        std::string tenant_dir = util::File::resolve(tenant_id, m_root_dir); // Throws
+        std::uintmax_t used = directory_size(tenant_dir);                    // Throws
+        if (used >= limit)
+            return false;
+        std::uintmax_t remaining = limit - used;
+        return std::uintmax_t(incoming_bytes) <= remaining;
+    }
+
     // virt_path must be valid when get_or_create_file() is called.
     util::bind_ptr<ServerFile> get_or_create_file(const std::string& virt_path)
     {
@@ -895,12 +978,26 @@ public:
             _impl::parse_virtual_path(m_root_dir, virt_path); // Throws
         BARQ_ASSERT(virt_path_components.is_valid);
 
-        _impl::make_dirs(m_root_dir, virt_path); // Throws
-        m_barq_names.insert(virt_path);         // Throws
-        {
+        bool known_file = m_barq_names.count(virt_path) != 0;
+        std::string tenant_id = get_tenant_id_from_virt_path(virt_path); // Throws
+        _impl::make_dirs(m_root_dir, virt_path);                         // Throws
+        try {
+            if (!known_file) {
+                m_barq_names.insert(virt_path); // Throws
+                ++m_tenant_usage[tenant_id].files;
+            }
             bool disable_sync_to_disk = m_config.disable_sync_to_disk;
             file.reset(new ServerFile(*this, m_file_access_cache, virt_path, virt_path_components.real_barq_path,
                                       disable_sync_to_disk)); // Throws
+        }
+        catch (...) {
+            if (!known_file) {
+                m_barq_names.erase(virt_path);
+                auto i = m_tenant_usage.find(tenant_id);
+                if (i != m_tenant_usage.end() && i->second.files > 0)
+                    --i->second.files;
+            }
+            throw;
         }
 
         file->initialize();
@@ -994,6 +1091,8 @@ private:
     // corresponding virtual path is in `m_barq_names`, assuming no external
     // file-system level intervention.
     std::set<std::string> m_barq_names;
+
+    std::map<std::string, TenantUsage> m_tenant_usage;
 
     std::unique_ptr<network::ssl::Context> m_ssl_context;
     ServerFileAccessCache m_file_access_cache;
@@ -1138,6 +1237,18 @@ public:
     void set_signed_access_token(std::string token)
     {
         m_signed_access_token = std::move(token);
+    }
+
+    bool bind_tenant(std::string tenant_id)
+    {
+        if (tenant_id.empty())
+            return true;
+        if (m_tenant_id)
+            return *m_tenant_id == tenant_id;
+        if (!m_server.reserve_tenant_connection(tenant_id))
+            return false;
+        m_tenant_id = std::move(tenant_id); // Throws
+        return true;
     }
 
     const std::string& get_remote_endpoint() const noexcept
@@ -1338,6 +1449,8 @@ private:
     // The signed access token from the sync request's 'barq_at' query parameter,
     // used to authenticate the client when it sends BIND.
     std::string m_signed_access_token;
+
+    std::optional<std::string> m_tenant_id;
 
     // A queue of sessions that have enlisted for an opportunity to send a
     // message. Sessions will be served in the order that they enlist. A session
@@ -2304,17 +2417,9 @@ public:
         }
 
         ServerImpl& server = m_connection.get_server();
-        _impl::VirtualPathComponents virt_path_components =
-            _impl::parse_virtual_path(server.get_root_dir(), path); // Throws
-
-        if (!virt_path_components.is_valid) {
-            logger.error("Bad virtual path (message_type='bind', path='%1', "
-                         "signed_user_token='%2')",
-                         path,
-                         short_token_fmt(signed_user_token)); // Throws
-            error = ProtocolError::illegal_barq_path;
-            return false;
-        }
+        std::string file_path = path;   // The full server-side virtual path.
+        std::string access_path = path; // The path checked against token.path.
+        std::string tenant_id;
 
         // Authenticate the client before granting access to the file: verify the
         // signed access token, reject it if expired, and confirm it grants access
@@ -2336,27 +2441,64 @@ public:
                 error = ProtocolError::permission_denied;
                 return false;
             }
+            if (server.get_access_control().uses_tenant_public_keys()) {
+                tenant_id = access_token->app_id; // Throws
+                if (!_impl::make_tenant_virtual_path(tenant_id, path, file_path, &access_path)) {
+                    logger.error("BIND rejected (tenant='%1', client_path='%2', identity='%3'): bad tenant path",
+                                 tenant_id, path, access_token->identity); // Throws
+                    error = ProtocolError::illegal_barq_path;
+                    return false;
+                }
+            }
             if (access_token->expired(server.token_expiration_clock_now())) {
                 logger.error("BIND rejected (path='%1', identity='%2'): access token expired", path,
                              access_token->identity); // Throws
                 error = ProtocolError::permission_denied;
                 return false;
             }
-            if (!server.get_access_control().can(*access_token, Privilege::Read, path)) {
-                logger.error("BIND rejected (path='%1', identity='%2'): permission denied", path,
-                             access_token->identity); // Throws
+            if (!server.get_access_control().can(*access_token, Privilege::Read, access_path)) {
+                logger.error("BIND rejected (path='%1', tenant='%2', identity='%3'): permission denied", access_path,
+                             tenant_id, access_token->identity); // Throws
                 error = ProtocolError::permission_denied;
                 return false;
             }
-            logger.detail("BIND authenticated (path='%1', identity='%2')", path,
-                          access_token->identity); // Throws
+            logger.detail("BIND authenticated (path='%1', file_path='%2', tenant='%3', identity='%4')", access_path,
+                          file_path, tenant_id, access_token->identity); // Throws
         }
 
-        m_server_file = server.get_or_create_file(path); // Throws
+        _impl::VirtualPathComponents virt_path_components =
+            _impl::parse_virtual_path(server.get_root_dir(), file_path); // Throws
+
+        if (!virt_path_components.is_valid) {
+            logger.error("Bad virtual path (message_type='bind', path='%1', "
+                         "signed_user_token='%2')",
+                         file_path,
+                         short_token_fmt(signed_user_token)); // Throws
+            error = ProtocolError::illegal_barq_path;
+            return false;
+        }
+
+        if (!tenant_id.empty()) {
+            if (!server.tenant_can_access_path(tenant_id, file_path)) {
+                logger.error("BIND rejected (path='%1', tenant='%2'): tenant resource limit reached", file_path,
+                             tenant_id); // Throws
+                error = ProtocolError::limits_exceeded;
+                return false;
+            }
+            if (!m_connection.bind_tenant(tenant_id)) {
+                logger.error("BIND rejected (path='%1', tenant='%2'): tenant connection limit reached", file_path,
+                             tenant_id); // Throws
+                error = ProtocolError::limits_exceeded;
+                return false;
+            }
+        }
+
+        m_server_file = server.get_or_create_file(file_path); // Throws
 
         m_server_file->add_unidentified_session(this); // Throws
 
-        logger.info("Client info: (path='%1', from=%2, protocol=%3) %4", path, m_connection.get_remote_endpoint(),
+        logger.info("Client info: (path='%1', tenant='%2', from=%3, protocol=%4) %5", file_path, tenant_id,
+                    m_connection.get_remote_endpoint(),
                     m_connection.get_client_protocol_version(),
                     m_connection.get_client_user_agent()); // Throws
 
@@ -2749,6 +2891,22 @@ public:
         BARQ_ASSERT(m_server_file);
         ServerFile& file = *m_server_file;
         std::size_t offset = num_previously_integrated_changesets;
+        std::size_t incoming_bytes = 0;
+        for (std::size_t i = offset; i < upload_changesets.size(); ++i) {
+            std::size_t changeset_size = upload_changesets[i].changeset.size();
+            if (changeset_size > std::numeric_limits<std::size_t>::max() - incoming_bytes) {
+                incoming_bytes = std::numeric_limits<std::size_t>::max();
+                break;
+            }
+            incoming_bytes += changeset_size;
+        }
+        std::string tenant_id = get_tenant_id_from_virt_path(file.get_virt_path()); // Throws
+        if (!tenant_id.empty() && !file.get_server().tenant_can_store_bytes(tenant_id, incoming_bytes)) {
+            logger.error("UPLOAD rejected (path='%1', tenant='%2'): tenant storage limit reached",
+                         file.get_virt_path(), tenant_id); // Throws
+            error = ProtocolError::limits_exceeded;
+            return false;
+        }
         file.add_changesets_from_downstream(m_client_file_ident, upload_progress, locked_server_version_2,
                                             upload_changesets.data() + offset, num_changesets_to_integrate); // Throws
 
@@ -3792,7 +3950,9 @@ Worker::Worker(ServerImpl& server)
     // Throws
     , logger(*logger_ptr)
     , m_server{server}
-    , m_file_access_cache{server.get_config().max_open_files, logger, *this, server.get_config().encryption_key}
+    , m_file_access_cache{server.get_config().max_open_files, logger, *this, server.get_config().encryption_key,
+                          server.get_config().tenant_encryption_master_secret,
+                          server.get_config().tenant_limits.max_open_files}
 {
     util::seed_prng_nondeterministically(m_random); // Throws
 }
@@ -3844,16 +4004,38 @@ void Worker::stop() noexcept
 
 // ============================ ServerImpl implementation ============================
 
+Server::Config validate_server_config(Server::Config config)
+{
+    if (config.encryption_key && config.tenant_encryption_master_secret) {
+        throw std::invalid_argument("encryption_key and tenant_encryption_master_secret are mutually exclusive");
+    }
+    if (config.tenant_encryption_master_secret && config.tenant_encryption_master_secret->empty()) {
+        throw std::invalid_argument("tenant_encryption_master_secret must not be empty");
+    }
+    if (config.tenant_encryption_master_secret && !config.tenant_public_keys) {
+        throw std::invalid_argument("tenant_encryption_master_secret requires tenant_public_keys");
+    }
+    const auto& limits = config.tenant_limits;
+    bool has_tenant_limits = limits.max_connections != 0 || limits.max_files != 0 || limits.max_open_files != 0 ||
+                             limits.max_storage_bytes != 0;
+    if (has_tenant_limits && !config.tenant_public_keys) {
+        throw std::invalid_argument("tenant_limits requires tenant_public_keys");
+    }
+    return config;
+}
+
 ServerImpl::ServerImpl(const std::string& root_dir, util::Optional<sync::PKey> pkey, Server::Config config)
     : logger_ptr{std::make_shared<util::CategoryLogger>(util::LogCategory::server, std::move(config.logger))}
     , logger{*logger_ptr}
-    , m_config{std::move(config)}
-    , m_max_upload_backlog{determine_max_upload_backlog(config)}
+    , m_config{validate_server_config(std::move(config))}
+    , m_max_upload_backlog{determine_max_upload_backlog(m_config)}
     , m_root_dir{root_dir} // Throws
-    , m_access_control{std::move(pkey)}
-    , m_protocol_version_range{determine_protocol_version_range(config)}                 // Throws
-    , m_file_access_cache{m_config.max_open_files, logger, *this, config.encryption_key} // Throws
-    , m_worker{*this}                                                                    // Throws
+    , m_access_control{std::move(pkey), m_config.tenant_public_keys}
+    , m_protocol_version_range{determine_protocol_version_range(m_config)} // Throws
+    , m_file_access_cache{m_config.max_open_files, logger, *this, m_config.encryption_key,
+                          m_config.tenant_encryption_master_secret,
+                          m_config.tenant_limits.max_open_files} // Throws
+    , m_worker{*this}                                         // Throws
     , m_acceptor{get_service()}
     , m_server_protocol{}       // Throws
     , m_compress_memory_arena{} // Throws
@@ -3902,13 +4084,17 @@ void ServerImpl::start()
     logger.info("Maximum number of open files: %1", m_config.max_open_files); // Throws
     {
         const char* lead_text = "Encryption";
-        if (m_config.encryption_key) {
-            logger.info("%1: Yes", lead_text); // Throws
+        if (m_config.tenant_encryption_master_secret) {
+            logger.info("%1: Per tenant", lead_text); // Throws
+        }
+        else if (m_config.encryption_key) {
+            logger.info("%1: Global", lead_text); // Throws
         }
         else {
             logger.info("%1: No", lead_text); // Throws
         }
     }
+    logger.info("Tenant public keys: %1", (m_config.tenant_public_keys ? "Yes" : "No")); // Throws
     logger.info("Log level: %1", logger.get_level_threshold()); // Throws
     {
         const char* lead_text = "Disable sync to disk";
@@ -3935,6 +4121,9 @@ void ServerImpl::start()
     logger.debug("Authorization header name: %1", m_config.authorization_header_name);     // Throws
 
     m_barq_names = _impl::find_barq_files(m_root_dir); // Throws
+    for (const std::string& virt_path : m_barq_names) {
+        ++m_tenant_usage[get_tenant_id_from_virt_path(virt_path)].files; // Throws
+    }
 
     initiate_connection_reaper_timer(m_config.connection_reaper_interval); // Throws
 
@@ -4242,6 +4431,8 @@ SyncConnection::~SyncConnection() noexcept
 {
     m_sessions_enlisted_to_send.clear();
     m_sessions.clear();
+    if (m_tenant_id)
+        m_server.release_tenant_connection(*m_tenant_id);
 }
 
 
@@ -4820,7 +5011,7 @@ public:
 
 
 Server::Server(const std::string& root_dir, util::Optional<sync::PKey> pkey, Config config)
-    : m_impl{new Implementation{root_dir, std::move(pkey), std::move(config)}} // Throws
+    : m_impl{new Implementation{root_dir, std::move(pkey), validate_server_config(std::move(config))}} // Throws
 {
 }
 

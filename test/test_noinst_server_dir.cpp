@@ -41,6 +41,33 @@ TEST(ServerDir_InvalidVirtualPath)
     }
 }
 
+TEST(ServerDir_TenantVirtualPath)
+{
+    std::string virt_path;
+    std::string relative_path;
+
+    CHECK(make_tenant_virtual_path("tenant-a", "shared", virt_path, &relative_path));
+    CHECK_EQUAL(virt_path, "/tenant-a/shared");
+    CHECK_EQUAL(relative_path, "shared");
+
+    std::string tenant_a_real_path;
+    std::string tenant_b_real_path;
+    CHECK(map_virt_to_real_barq_path("/root", virt_path, tenant_a_real_path));
+    CHECK(make_tenant_virtual_path("tenant-b", "shared", virt_path, &relative_path));
+    CHECK(map_virt_to_real_barq_path("/root", virt_path, tenant_b_real_path));
+    CHECK(tenant_a_real_path != tenant_b_real_path);
+}
+
+TEST(ServerDir_TenantVirtualPathRejectsEscapes)
+{
+    std::string virt_path;
+
+    CHECK(!make_tenant_virtual_path("tenant-a", "/tenant-b/shared", virt_path));
+    CHECK(!make_tenant_virtual_path("tenant-a", "../shared", virt_path));
+    CHECK(!make_tenant_virtual_path("tenant-a", ".hidden", virt_path));
+    CHECK(!make_tenant_virtual_path("bad/tenant", "shared", virt_path));
+}
+
 #ifndef _WIN32
 TEST(ServerDir_FullSyncPath)
 {

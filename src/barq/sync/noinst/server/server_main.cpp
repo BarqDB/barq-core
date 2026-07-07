@@ -1,7 +1,10 @@
 #include <barq/sync/noinst/server/crypto_server.hpp>
+#include <barq/sync/noinst/server/access_control.hpp>
+#include <barq/sync/noinst/server/server_dir.hpp>
 #include <barq/sync/noinst/server/server.hpp>
 #include <barq/sync/network/network.hpp>
 #include <barq/util/file.hpp>
+#include <barq/util/load_file.hpp>
 #include <barq/util/logger.hpp>
 #include <barq/util/optional.hpp>
 #include <barq/version.hpp>
@@ -9,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
@@ -16,6 +20,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace barq;
 
@@ -33,10 +38,16 @@ struct Options {
     std::string port = "9090";
     std::string root_dir;
     std::string jwt_public_key;
+    std::string jwt_public_key_dir;
+    std::string tenant_encryption_master_key;
     std::string tls_cert;
     std::string tls_key;
     std::string server_id = "barq-server";
     util::Logger::Level log_level = util::Logger::Level::info;
+    std::size_t tenant_max_connections = 0;
+    std::size_t tenant_max_files = 0;
+    std::size_t tenant_max_open_files = 0;
+    std::uintmax_t tenant_max_storage_bytes = 0;
     bool allow_unsigned_tokens = false;
     bool disable_sync_to_disk = false;
 };
@@ -50,6 +61,14 @@ void print_usage(std::ostream& out)
         << "  --port PORT                 Listen port. Default: 9090. Use 0 for a free port.\n"
         << "  --root-dir DIR              Directory for server Barq files.\n"
         << "  --jwt-public-key PEM        RSA public key for access token checks.\n"
+        << "  --jwt-public-key-dir DIR    Per-tenant public keys. Use <tenant_id>.pem or <tenant_id>/*.pem.\n"
+        << "  --tenant-encryption-master-key FILE\n"
+        << "                              Master secret file for per-tenant DB keys.\n"
+        << "  --tenant-max-connections N  Max concurrent sync connections per tenant. 0 = unlimited.\n"
+        << "  --tenant-max-files N        Max Barq files per tenant. 0 = unlimited.\n"
+        << "  --tenant-max-open-files N   Max open Barq files per tenant per server thread. 0 = unlimited.\n"
+        << "  --tenant-max-storage-bytes N\n"
+        << "                              Max current on-disk bytes per tenant. 0 = unlimited.\n"
         << "  --allow-unsigned-tokens     Dev/test only. Do not verify token signatures.\n"
         << "  --tls-cert PEM              TLS certificate chain file.\n"
         << "  --tls-key PEM               TLS private key file.\n"
@@ -76,6 +95,20 @@ bool parse_log_level(const std::string& value, util::Logger::Level& level)
     return !in.fail() && in.eof();
 }
 
+template <class T>
+bool parse_unsigned_number(const std::string& value, T& out)
+{
+    if (value.empty() || value.front() == '-')
+        return false;
+    std::istringstream in(value);
+    T parsed = 0;
+    in >> parsed;
+    if (in.fail() || !in.eof())
+        return false;
+    out = parsed;
+    return true;
+}
+
 bool parse_args(int argc, char* argv[], Options& options)
 {
     for (int i = 1; i < argc; ++i) {
@@ -99,6 +132,50 @@ bool parse_args(int argc, char* argv[], Options& options)
         else if (arg == "--jwt-public-key") {
             if (!read_value(i, argc, argv, options.jwt_public_key, "--jwt-public-key"))
                 return false;
+        }
+        else if (arg == "--jwt-public-key-dir") {
+            if (!read_value(i, argc, argv, options.jwt_public_key_dir, "--jwt-public-key-dir"))
+                return false;
+        }
+        else if (arg == "--tenant-encryption-master-key") {
+            if (!read_value(i, argc, argv, options.tenant_encryption_master_key, "--tenant-encryption-master-key"))
+                return false;
+        }
+        else if (arg == "--tenant-max-connections") {
+            std::string value;
+            if (!read_value(i, argc, argv, value, "--tenant-max-connections"))
+                return false;
+            if (!parse_unsigned_number(value, options.tenant_max_connections)) {
+                std::cerr << "Invalid --tenant-max-connections: " << value << "\n";
+                return false;
+            }
+        }
+        else if (arg == "--tenant-max-files") {
+            std::string value;
+            if (!read_value(i, argc, argv, value, "--tenant-max-files"))
+                return false;
+            if (!parse_unsigned_number(value, options.tenant_max_files)) {
+                std::cerr << "Invalid --tenant-max-files: " << value << "\n";
+                return false;
+            }
+        }
+        else if (arg == "--tenant-max-open-files") {
+            std::string value;
+            if (!read_value(i, argc, argv, value, "--tenant-max-open-files"))
+                return false;
+            if (!parse_unsigned_number(value, options.tenant_max_open_files)) {
+                std::cerr << "Invalid --tenant-max-open-files: " << value << "\n";
+                return false;
+            }
+        }
+        else if (arg == "--tenant-max-storage-bytes") {
+            std::string value;
+            if (!read_value(i, argc, argv, value, "--tenant-max-storage-bytes"))
+                return false;
+            if (!parse_unsigned_number(value, options.tenant_max_storage_bytes)) {
+                std::cerr << "Invalid --tenant-max-storage-bytes: " << value << "\n";
+                return false;
+            }
         }
         else if (arg == "--tls-cert") {
             if (!read_value(i, argc, argv, options.tls_cert, "--tls-cert"))
@@ -137,12 +214,29 @@ bool parse_args(int argc, char* argv[], Options& options)
         std::cerr << "--root-dir is required\n";
         return false;
     }
-    if (options.jwt_public_key.empty() && !options.allow_unsigned_tokens) {
-        std::cerr << "--jwt-public-key is required unless --allow-unsigned-tokens is set\n";
+    int auth_modes = 0;
+    if (!options.jwt_public_key.empty())
+        ++auth_modes;
+    if (!options.jwt_public_key_dir.empty())
+        ++auth_modes;
+    if (options.allow_unsigned_tokens)
+        ++auth_modes;
+    if (auth_modes == 0) {
+        std::cerr << "--jwt-public-key or --jwt-public-key-dir is required unless --allow-unsigned-tokens is set\n";
         return false;
     }
-    if (!options.jwt_public_key.empty() && options.allow_unsigned_tokens) {
-        std::cerr << "Use either --jwt-public-key or --allow-unsigned-tokens, not both\n";
+    if (auth_modes > 1) {
+        std::cerr << "Use only one of --jwt-public-key, --jwt-public-key-dir, or --allow-unsigned-tokens\n";
+        return false;
+    }
+    if (!options.tenant_encryption_master_key.empty() && options.jwt_public_key_dir.empty()) {
+        std::cerr << "--tenant-encryption-master-key requires --jwt-public-key-dir\n";
+        return false;
+    }
+    bool has_tenant_limits = options.tenant_max_connections != 0 || options.tenant_max_files != 0 ||
+                             options.tenant_max_open_files != 0 || options.tenant_max_storage_bytes != 0;
+    if (has_tenant_limits && options.jwt_public_key_dir.empty()) {
+        std::cerr << "Tenant limits require --jwt-public-key-dir\n";
         return false;
     }
     if (options.tls_cert.empty() != options.tls_key.empty()) {
@@ -151,6 +245,50 @@ bool parse_args(int argc, char* argv[], Options& options)
     }
 
     return true;
+}
+
+std::shared_ptr<sync::AccessControl::PublicKeyStore> load_tenant_public_keys(const std::string& dir)
+{
+    auto store = std::make_shared<sync::AccessControl::PublicKeyStore>();
+
+    auto add_key = [&](const std::string& tenant_id, const std::string& path) {
+        if (!_impl::valid_virt_path_segment(tenant_id)) {
+            throw std::runtime_error("Invalid tenant public key name: " + tenant_id);
+        }
+        store->keys[tenant_id].push_back(sync::PKey::load_public(path)); // Throws
+    };
+
+    util::DirScanner scanner{dir}; // Throws
+    std::string name;
+    while (scanner.next(name)) { // Throws
+        std::string path = util::File::resolve(name, dir); // Throws
+        if (util::File::is_dir(path)) {
+            if (!_impl::valid_virt_path_segment(name)) {
+                throw std::runtime_error("Invalid tenant public key directory: " + name);
+            }
+            util::DirScanner tenant_scanner{path}; // Throws
+            std::string key_name;
+            while (tenant_scanner.next(key_name)) { // Throws
+                if (!StringData{key_name}.ends_with(".pem"))
+                    continue;
+                std::string key_path = util::File::resolve(key_name, path); // Throws
+                if (!util::File::is_dir(key_path))
+                    add_key(name, key_path); // Throws
+            }
+            continue;
+        }
+
+        if (!StringData{name}.ends_with(".pem"))
+            continue;
+
+        std::string tenant_id = name.substr(0, name.size() - 4); // Throws
+        add_key(tenant_id, path);                                // Throws
+    }
+
+    if (store->keys.empty()) {
+        throw std::runtime_error("No tenant public keys found in: " + dir);
+    }
+    return store;
 }
 
 std::string route_host(const std::string& configured_host, const sync::network::Endpoint& endpoint)
@@ -182,8 +320,12 @@ int main(int argc, char* argv[])
         util::make_dir_recursive(root_dir);
 
         util::Optional<sync::PKey> public_key = util::none;
-        if (!options.allow_unsigned_tokens)
+        if (!options.jwt_public_key.empty())
             public_key = sync::PKey::load_public(options.jwt_public_key);
+
+        std::shared_ptr<sync::AccessControl::PublicKeyStore> tenant_public_keys;
+        if (!options.jwt_public_key_dir.empty())
+            tenant_public_keys = load_tenant_public_keys(options.jwt_public_key_dir); // Throws
 
         auto logger = std::make_shared<util::StderrLogger>(options.log_level);
 
@@ -196,6 +338,15 @@ int main(int argc, char* argv[])
         config.ssl_certificate_path = options.tls_cert;
         config.ssl_certificate_key_path = options.tls_key;
         config.disable_sync_to_disk = options.disable_sync_to_disk;
+        config.tenant_public_keys = std::move(tenant_public_keys);
+        config.tenant_limits.max_connections = options.tenant_max_connections;
+        config.tenant_limits.max_files = options.tenant_max_files;
+        config.tenant_limits.max_open_files = options.tenant_max_open_files;
+        config.tenant_limits.max_storage_bytes = options.tenant_max_storage_bytes;
+        if (!options.tenant_encryption_master_key.empty()) {
+            auto secret = util::load_file(options.tenant_encryption_master_key); // Throws
+            config.tenant_encryption_master_secret = std::vector<char>(secret.begin(), secret.end()); // Throws
+        }
 
         sync::Server server(root_dir, std::move(public_key), std::move(config));
         server.start();

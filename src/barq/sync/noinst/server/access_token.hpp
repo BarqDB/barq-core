@@ -26,6 +26,8 @@ struct AccessToken {
         invalid_json,
         invalid_signature,
         invalid_jwt,
+        missing_app_id,
+        unknown_app_id,
     };
 
     UserIdent identity;
@@ -61,6 +63,8 @@ struct AccessToken {
     static bool parseJWT(StringData signed_access_token, AccessToken&, ParseError&, Verifier* = nullptr);
 
     static bool parse(StringData signed_access_token, AccessToken&, ParseError&, Verifier* = nullptr);
+
+    static bool parse_unverified(StringData signed_access_token, AccessToken&, ParseError&);
 };
 
 

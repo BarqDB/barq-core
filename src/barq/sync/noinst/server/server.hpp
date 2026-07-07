@@ -2,10 +2,13 @@
 #define BARQ_SYNC_SERVER_HPP
 
 #include <cstdint>
+#include <array>
+#include <optional>
 #include <memory>
 #include <string>
 #include <map>
 #include <set>
+#include <vector>
 #include <exception>
 
 #include <barq/util/logger.hpp>
@@ -13,6 +16,7 @@
 #include <barq/util/time.hpp>
 #include <barq/sync/network/network.hpp>
 #include <barq/sync/noinst/server/clock.hpp>
+#include <barq/sync/noinst/server/access_control.hpp>
 #include <barq/sync/noinst/server/crypto_server.hpp>
 #include <barq/sync/client.hpp>
 
@@ -193,6 +197,23 @@ public:
 
         /// An optional 64 byte key to encrypt all files with.
         std::optional<std::array<char, 64>> encryption_key;
+
+        /// Optional per-tenant public keys. When set, access tokens must carry
+        /// app_id and are verified with the key registered for that app_id.
+        std::shared_ptr<const AccessControl::PublicKeyStore> tenant_public_keys;
+
+        /// Optional master secret used to derive a separate 64 byte encryption
+        /// key per tenant. Mutually exclusive with encryption_key.
+        std::optional<std::vector<char>> tenant_encryption_master_secret;
+
+        /// Optional per-tenant resource limits. Zero means unlimited.
+        struct TenantLimits {
+            std::size_t max_connections = 0;
+            std::size_t max_files = 0;
+            std::size_t max_open_files = 0;
+            std::uintmax_t max_storage_bytes = 0;
+        };
+        TenantLimits tenant_limits;
 
         /// Sets a limit on the allowed accumulated size in bytes of buffered
         /// incoming changesets waiting to be processed. If left at zero, an

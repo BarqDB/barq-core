@@ -25,6 +25,8 @@ struct VirtualPathComponents {
     std::string user_identity;
 };
 
+bool valid_virt_path_segment(const std::string& segment);
+
 // parse_virtual_path() validates and parses a virtual path. The format of a
 // virtual path, also called a server path, is described in doc/protocol.md.
 //
@@ -35,6 +37,9 @@ struct VirtualPathComponents {
 // The argument root_path can be any valid path and is only used as a base
 // directory for barq_barq_path.
 VirtualPathComponents parse_virtual_path(const std::string& root_path, const std::string& virt_path);
+
+bool make_tenant_virtual_path(const std::string& tenant_id, const std::string& client_path,
+                              std::string& virt_path, std::string* relative_path = nullptr);
 
 
 // If virt_path is valid, the return value is the local Barq path corresponding to the
