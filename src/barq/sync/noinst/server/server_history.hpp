@@ -11,6 +11,7 @@
 #include <barq/util/buffer.hpp>
 #include <barq/util/logger.hpp>
 #include <barq/util/backtrace.hpp>
+#include <barq/util/value_reset_guard.hpp>
 #include <barq/chunked_binary.hpp>
 #include <barq/impl/cont_transact_hist.hpp>
 #include <barq/replication.hpp>
@@ -189,6 +190,9 @@ public:
     struct IntegratableChangesetList {
         UploadCursor upload_progress = {0, 0};
         version_type locked_server_version = 0;
+        bool is_flx_sync = false;
+        std::string flx_user_identity;
+        bool flx_user_is_admin = false;
         std::vector<IntegratableChangeset> changesets;
 
         bool has_changesets() const noexcept
@@ -384,6 +388,18 @@ public:
                              std::uint_fast64_t& cumulative_byte_size_total,
                              std::size_t accum_byte_size_soft_limit = 0x20000) const;
 
+    /// Returns true when the specified client file identifier does not
+    /// correspond to a live client file entry, i.e. it is out of range or the
+    /// entry has been expired (its `last_seen` timestamp is zero, e.g. after
+    /// history compaction). Returns false for a live, non-expired client file.
+    ///
+    /// Unlike fetch_download_info(), this is safe to call with an arbitrary
+    /// (possibly stale or never-allocated) identifier: it bounds-checks before
+    /// touching any per-entry accessor. It is used to garbage-collect
+    /// per-client server-side metadata belonging to clients that are gone for
+    /// good.
+    bool is_client_file_expired(file_ident_type client_file_ident) const;
+
     /// The application must call this function before using the history as an
     /// upstream client history.
     ///
@@ -403,6 +419,12 @@ public:
     /// \return True if, and only if the handler retured true.
     template <class H>
     bool transact(H handler, sync::VersionInfo&);
+
+    /// Perform an internal metadata transaction without adding a sync history
+    /// entry. The DB snapshot changes, but peers must not see this as a
+    /// downloadable server changeset.
+    template <class H>
+    bool transact_without_sync_history(H handler, sync::VersionInfo&);
 
     std::vector<sync::Changeset> get_parsed_changesets(version_type begin, version_type end) const;
 
@@ -788,6 +810,19 @@ bool ServerHistory::transact(H handler, sync::VersionInfo& version_info)
 {
     auto wt = m_db->start_write();                 // Throws
     if (handler(*wt)) {                            // Throws
+        version_info.barq_version = wt->commit(); // Throws
+        version_info.sync_version = get_salted_server_version();
+        return true;
+    }
+    return false;
+}
+
+template <class H>
+bool ServerHistory::transact_without_sync_history(H handler, sync::VersionInfo& version_info)
+{
+    auto wt = m_db->start_write(); // Throws
+    if (handler(*wt)) {            // Throws
+        auto ta = util::make_temp_assign(m_is_local_changeset, false, true);
         version_info.barq_version = wt->commit(); // Throws
         version_info.sync_version = get_salted_server_version();
         return true;

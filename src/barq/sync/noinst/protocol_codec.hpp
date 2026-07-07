@@ -673,12 +673,21 @@ public:
                                version_type upload_client_version, version_type upload_server_version,
                                std::uint_fast64_t downloadable_bytes, std::size_t num_changesets, const char* body,
                                std::size_t uncompressed_body_size, std::size_t compressed_body_size,
-                               bool body_is_compressed, util::Logger&);
+                               bool body_is_compressed, util::Logger&, bool is_flx_sync = false,
+                               int64_t query_version = 0,
+                               sync::DownloadBatchState batch_state = sync::DownloadBatchState::SteadyState,
+                               double progress_estimate = 0.0);
 
     void make_mark_message(OutputBuffer&, session_ident_type session_ident, request_ident_type request_ident);
 
     void make_error_message(int protocol_version, OutputBuffer&, sync::ProtocolError error_code, const char* message,
                             std::size_t message_size, bool try_again, session_ident_type session_ident);
+
+    void make_query_error_message(OutputBuffer&, int error_code, std::string_view message,
+                                  session_ident_type session_ident, int64_t query_version);
+
+    void make_json_error_message(OutputBuffer&, session_ident_type session_ident, int error_code,
+                                 std::string_view error_body);
 
     void make_pong(OutputBuffer&, milliseconds_type timestamp);
 
@@ -844,7 +853,7 @@ public:
                 auto need_client_file_ident = msg.read_next<bool>();
                 auto is_subserver = msg.read_next<bool>('\n');
 
-                if (path_size == 0) {
+                if (path_size == 0 && !connection.is_flx_sync_connection()) {
                     return report_error(ErrorCodes::SyncProtocolInvariantFailed, "Path size in BIND message is zero");
                 }
                 if (path_size > s_max_path_size) {
@@ -869,11 +878,44 @@ public:
                 auto scan_server_version = msg.read_next<version_type>();
                 auto scan_client_version = msg.read_next<version_type>();
                 auto latest_server_version = msg.read_next<version_type>();
-                auto latest_server_version_salt = msg.read_next<salt_type>('\n');
+                auto latest_server_version_salt =
+                    msg.read_next<salt_type>(connection.is_flx_sync_connection() ? ' ' : '\n');
 
-                connection.receive_ident_message(session_ident, client_file_ident, client_file_ident_salt,
-                                                 scan_server_version, scan_client_version, latest_server_version,
-                                                 latest_server_version_salt); // Throws
+                if (connection.is_flx_sync_connection()) {
+                    auto query_version = msg.read_next<int64_t>();
+                    auto query_size = msg.read_next<size_t>('\n');
+                    if (query_size > s_max_body_size) {
+                        return report_error(ErrorCodes::LimitExceeded, "QUERY body in IDENT message is too large");
+                    }
+                    auto query_body = msg.read_sized_data<std::string>(query_size);
+                    connection.receive_ident_message(session_ident, client_file_ident, client_file_ident_salt,
+                                                     scan_server_version, scan_client_version, latest_server_version,
+                                                     latest_server_version_salt, query_version,
+                                                     std::move(query_body)); // Throws
+                }
+                else {
+                    connection.receive_ident_message(session_ident, client_file_ident, client_file_ident_salt,
+                                                     scan_server_version, scan_client_version, latest_server_version,
+                                                     latest_server_version_salt); // Throws
+                }
+            }
+            else if (message_type == "query") {
+                if (!connection.is_flx_sync_connection()) {
+                    return report_error(ErrorCodes::SyncProtocolInvariantFailed,
+                                        "QUERY message received on a non-FLX connection");
+                }
+                auto session_ident = msg.read_next<session_ident_type>();
+                auto query_version = msg.read_next<int64_t>();
+                auto query_size = msg.read_next<size_t>('\n');
+                if (query_version < 0) {
+                    return report_error(ErrorCodes::SyncProtocolInvariantFailed, "Bad query version: %1",
+                                        query_version);
+                }
+                if (query_size > s_max_body_size) {
+                    return report_error(ErrorCodes::LimitExceeded, "QUERY body is too large");
+                }
+                auto query_body = msg.read_sized_data<std::string>(query_size);
+                connection.receive_query_message(session_ident, query_version, std::move(query_body)); // Throws
             }
             else if (message_type == "unbind") {
                 auto session_ident = msg.read_next<session_ident_type>('\n');

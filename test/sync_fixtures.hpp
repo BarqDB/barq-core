@@ -10,6 +10,7 @@
 #include <barq/sync/network/http.hpp>
 #include <barq/sync/network/network.hpp>
 #include <barq/sync/noinst/client_history_impl.hpp>
+#include <barq/sync/noinst/migration_store.hpp>
 #include <barq/sync/noinst/protocol_codec.hpp>
 #include <barq/sync/noinst/server/server.hpp>
 #include <barq/sync/noinst/server/server_dir.hpp>
@@ -152,6 +153,17 @@ const char g_user_1_path_test_token[] = "ewogICAgImlkZW50aXR5IjogInVzZXJfMSIsCiA
                                         "Rh6IKIQ5EksIZTGnQscBdSM/n1Qlpa7SPx94SrtIwZvPO+OcqJj367PdnS+Ii0TvGj6WFIz44gJT"
                                         "GX03+qMqSdAuW/91xX013efiG+nYKKPMT4Z6+pQkyJ9C9eyvXXiJigXlBXb8wxrWBzpGoaPcWYYj"
                                         "q9wI3gXQ9i7DT+cH7gbDFWnweiorMvmAPkocSw==";
+
+const char g_admin_path_test_token[] = "ewogICAgImlkZW50aXR5IjogImFkbWluIiwKICAgICJ0aW1lc3RhbXAiOiAxNDU1NTMwNjE0"
+                                       "LAogICAgImV4cGlyZXMiOiBudWxsLAogICAgImFwcF9pZCI6ICJpby5yZWFsbS5UZXN0IiwK"
+                                       "ICAgICJwYXRoIjogIi90ZXN0IiwKICAgICJhY2Nlc3MiOiBbImRvd25sb2FkIiwgInVwbG9h"
+                                       "ZCIsICJtYW5hZ2UiXQp9Cg=="
+                                       ":"
+                                       "LKdphKbzoYdDyodFu8gM+b0/R9OZNrczHYwm10CrkIIJP4/udcgicLxjlBzu+uFT7cknLKXC/M"
+                                       "6tny/OZdqwyhK5DvDrT8ChJyz1VXIkjSOkTIyihDVM9hwF2AsCeSyg50Wg4qEKrfrA0GLY6wt"
+                                       "ZCYWHUNNtM8SjlCstlzN4DdSG44E1kLNSiLlFipaxNWyTWXDC48kJDNi/6Q+3Vi3MSdPu7gaT"
+                                       "1uXavj3BQxV2pyEUK8e03VptZYp7NWTHps5VnT8k1OA+/694rcSWGvipUYrwP+KkFdOeBkEIV"
+                                       "H3hFaOZ8NNUHHl2fBK/z8msWHyoZ/ZJ66qHVkMdIhdaaRRF1A==";
 
 
 // Generated from test_token_readonly.json
@@ -438,6 +450,7 @@ public:
         const Clock* history_compaction_clock = nullptr;
 
         size_t max_download_size = 0x1000000; // 16 MB as in Server::Config
+        bool enable_download_bootstrap_cache = false;
 
 #if BARQ_DISABLE_SYNC_MULTIPLEXING
         bool one_connection_per_session = true;
@@ -459,9 +472,14 @@ public:
 
         int server_max_protocol_version = 0;
 
+        bool enable_flx_sync = false;
+        std::vector<Server::Config::FLXRule> flx_rules;
+        std::shared_ptr<const AccessControl::PublicKeyStore> tenant_public_keys;
+
         std::set<file_ident_type> server_disable_download_for;
 
         std::function<Server::SessionBootstrapCallback> server_session_bootstrap_callback;
+        std::function<Server::FLXBootstrapBatchCallback> server_flx_bootstrap_batch_callback;
 
         std::shared_ptr<BindingCallbackThreadObserver> socket_provider_observer;
     };
@@ -524,12 +542,17 @@ public:
             config_2.connection_reaper_timeout = config.server_connection_reaper_timeout;
             config_2.connection_reaper_interval = config.server_connection_reaper_interval;
             config_2.max_download_size = config.max_download_size;
+            config_2.enable_download_bootstrap_cache = config.enable_download_bootstrap_cache;
             config_2.tcp_no_delay = true;
             config_2.authorization_header_name = config.authorization_header_name;
             config_2.encryption_key = config.server_encryption_key;
             config_2.max_protocol_version = config.server_max_protocol_version;
+            config_2.enable_flx_sync = config.enable_flx_sync;
+            config_2.flx_rules = config.flx_rules;
+            config_2.tenant_public_keys = config.tenant_public_keys;
             config_2.disable_download_for = std::move(config.server_disable_download_for);
             config_2.session_bootstrap_callback = std::move(config.server_session_bootstrap_callback);
+            config_2.flx_bootstrap_batch_callback = std::move(config.server_flx_bootstrap_batch_callback);
             m_servers[i] = std::make_unique<Server>(std::move(dir), std::move(public_key), std::move(config_2));
             m_servers[i]->start(listen_address, listen_port);
             m_server_ports[i] = m_servers[i]->listen_endpoint().port();
@@ -726,6 +749,38 @@ public:
         }
 
         return Session{*m_clients[client_index], std::move(db), nullptr, nullptr, std::move(config)};
+    }
+
+    Session make_flx_session(int client_index, int server_index, DBRef db,
+                             std::shared_ptr<SubscriptionStore> flx_sub_store, std::string barq_identifier,
+                             Session::Config config = {})
+    {
+        config.service_identifier = "/barq-sync";
+        config.barq_identifier = std::move(barq_identifier);
+        if (config.signed_user_token.empty())
+            config.signed_user_token = g_signed_test_user_token;
+        config.server_port = m_server_ports[server_index];
+        config.server_address = "localhost";
+        if (m_connection_state_change_listeners[client_index]) {
+            config.connection_state_change_listener = m_connection_state_change_listeners[client_index];
+        }
+        else if (!config.connection_state_change_listener) {
+            auto fallback_listener = [this](ConnectionState state, std::optional<SessionErrorInfo> error) {
+                if (state != ConnectionState::disconnected)
+                    return;
+                BARQ_ASSERT(error);
+                unit_test::TestContext& test_context = m_test_context;
+                test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error->status, error->is_fatal);
+                bool client_error_occurred = true;
+                CHECK_NOT(client_error_occurred);
+                stop();
+            };
+            config.connection_state_change_listener = fallback_listener;
+        }
+
+        auto migration_store = MigrationStore::create(db);
+        return Session{*m_clients[client_index], std::move(db), std::move(flx_sub_store),
+                       std::move(migration_store), std::move(config)};
     }
 
     Session make_bound_session(int client_index, DBRef db, int server_index, std::string server_path,

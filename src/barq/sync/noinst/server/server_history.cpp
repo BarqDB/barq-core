@@ -869,6 +869,25 @@ bool ServerHistory::fetch_download_info(file_ident_type client_file_ident, Downl
 }
 
 
+bool ServerHistory::is_client_file_expired(file_ident_type client_file_ident) const
+{
+    if (client_file_ident <= 0)
+        return true;
+
+    TransactionRef tr = m_db->start_read(); // Throws
+    version_type barq_version = tr->get_version();
+    const_cast<ServerHistory*>(this)->set_group(tr.get());
+    ensure_updated(barq_version); // Throws
+
+    std::size_t client_file_index = std::size_t(client_file_ident);
+    if (client_file_index >= m_acc->cf_last_seen_timestamps.size())
+        return true; // Never allocated (or trimmed away)
+
+    std::int_fast64_t last_seen_timestamp = m_acc->cf_last_seen_timestamps.get(client_file_index);
+    return last_seen_timestamp == 0; // Zero means the entry has been expired
+}
+
+
 void ServerHistory::add_upstream_sync_status()
 {
     TransactionRef tr = m_db->start_write(); // Throws

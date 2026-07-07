@@ -1,10 +1,14 @@
 #include <barq/sync/noinst/server/server.hpp>
 
 #include <barq/binary_data.hpp>
+#include <barq/dictionary.hpp>
 #include <barq/impl/simulated_failure.hpp>
+#include <barq/list.hpp>
 #include <barq/object_id.hpp>
+#include <barq/set.hpp>
 #include <barq/string_data.hpp>
 #include <barq/sync/changeset.hpp>
+#include <barq/sync/changeset_encoder.hpp>
 #include <barq/sync/trigger.hpp>
 #include <barq/sync/impl/clamped_hex_dump.hpp>
 #include <barq/sync/impl/clock.hpp>
@@ -12,6 +16,7 @@
 #include <barq/sync/network/network_ssl.hpp>
 #include <barq/sync/network/websocket.hpp>
 #include <barq/sync/noinst/client_history_impl.hpp>
+#include <barq/sync/noinst/integer_codec.hpp>
 #include <barq/sync/noinst/protocol_codec.hpp>
 #include <barq/sync/noinst/server/access_control.hpp>
 #include <barq/sync/noinst/server/server_dir.hpp>
@@ -46,12 +51,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <locale>
 #include <map>
 #include <memory>
 #include <queue>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -134,6 +141,448 @@ std::uintmax_t directory_size(const std::string& path)
         total += child_size;
     }
     return total;
+}
+
+const Server::Config::FLXRule* find_flx_rule(const std::vector<Server::Config::FLXRule>& rules,
+                                             const std::string& table_name) noexcept
+{
+    auto it = std::find_if(rules.begin(), rules.end(), [&](const Server::Config::FLXRule& rule) {
+        return rule.table == table_name;
+    });
+    return it == rules.end() ? nullptr : &*it;
+}
+
+const Server::Config::FLXRule* find_flx_rule_for_table(const std::vector<Server::Config::FLXRule>& rules,
+                                                       const std::string& table_name)
+{
+    if (auto rule = find_flx_rule(rules, table_name)) {
+        return rule;
+    }
+    return find_flx_rule(rules, std::string(Group::table_name_to_class_name(table_name)));
+}
+
+Instruction::Payload::Type flx_payload_type(DataType type)
+{
+    using Type = Instruction::Payload::Type;
+    switch (type) {
+        case type_Int:
+            return Type::Int;
+        case type_Bool:
+            return Type::Bool;
+        case type_String:
+            return Type::String;
+        case type_Binary:
+            return Type::Binary;
+        case type_Timestamp:
+            return Type::Timestamp;
+        case type_Float:
+            return Type::Float;
+        case type_Double:
+            return Type::Double;
+        case type_Decimal:
+            return Type::Decimal;
+        case type_ObjectId:
+            return Type::ObjectId;
+        case type_UUID:
+            return Type::UUID;
+        case type_Link:
+        case type_TypedLink:
+            return Type::Link;
+        case type_Mixed:
+            return Type::Null;
+    }
+    return Type::Null;
+}
+
+Instruction::CollectionType flx_collection_type(ColKey col_key)
+{
+    using CollectionType = Instruction::CollectionType;
+    if (col_key.is_list()) {
+        return CollectionType::List;
+    }
+    if (col_key.is_set()) {
+        return CollectionType::Set;
+    }
+    if (col_key.is_dictionary()) {
+        return CollectionType::Dictionary;
+    }
+    return CollectionType::Single;
+}
+
+InternString flx_class_name(Changeset& changeset, StringData table_name)
+{
+    return changeset.intern_string(Group::table_name_to_class_name(table_name));
+}
+
+Instruction::PrimaryKey flx_primary_key(Changeset& changeset, ConstTableRef table, const Obj& obj)
+{
+    ColKey pk_col = table->get_primary_key_column();
+    if (!pk_col) {
+        return table->get_object_id(obj.get_key());
+    }
+
+    Mixed pk = obj.get_any(pk_col);
+    if (pk.is_null()) {
+        return mpark::monostate{};
+    }
+    switch (pk.get_type()) {
+        case type_Int:
+            return pk.get<int64_t>();
+        case type_String:
+            return changeset.intern_string(pk.get<StringData>());
+        case type_ObjectId:
+            return pk.get<ObjectId>();
+        case type_UUID:
+            return pk.get<UUID>();
+        default:
+            break;
+    }
+    throw std::runtime_error("Unsupported FLX primary key type");
+}
+
+Instruction::PrimaryKey flx_primary_key(Changeset& changeset, Mixed pk)
+{
+    if (pk.is_null()) {
+        return mpark::monostate{};
+    }
+    switch (pk.get_type()) {
+        case type_Int:
+            return pk.get<int64_t>();
+        case type_String:
+            return changeset.intern_string(pk.get<StringData>());
+        case type_ObjectId:
+            return pk.get<ObjectId>();
+        case type_UUID:
+            return pk.get<UUID>();
+        default:
+            break;
+    }
+    throw std::runtime_error("Unsupported FLX primary key type");
+}
+
+Instruction::Payload flx_payload(Changeset& changeset, Mixed value)
+{
+    if (value.is_null()) {
+        return Instruction::Payload{};
+    }
+
+    switch (value.get_type()) {
+        case type_Int:
+            return Instruction::Payload{value.get<int64_t>()};
+        case type_Bool:
+            return Instruction::Payload{value.get<bool>()};
+        case type_Float:
+            return Instruction::Payload{value.get<float>()};
+        case type_Double:
+            return Instruction::Payload{value.get<double>()};
+        case type_String:
+            return Instruction::Payload{changeset.append_string(value.get<StringData>())};
+        case type_Binary: {
+            BinaryData binary = value.get<BinaryData>();
+            return Instruction::Payload{changeset.append_string(StringData{binary.data(), binary.size()}), true};
+        }
+        case type_Timestamp:
+            return Instruction::Payload{value.get<Timestamp>()};
+        case type_Decimal:
+            return Instruction::Payload{value.get<Decimal128>()};
+        case type_ObjectId:
+            return Instruction::Payload{value.get<ObjectId>()};
+        case type_UUID:
+            return Instruction::Payload{value.get<UUID>()};
+        case type_Mixed:
+        case type_Link:
+        case type_TypedLink:
+            break;
+    }
+    throw std::runtime_error("Unsupported FLX payload type");
+}
+
+bool flx_concrete_data_type_can_bootstrap_payload(DataType type) noexcept
+{
+    switch (type) {
+        case type_Int:
+        case type_Bool:
+        case type_String:
+        case type_Binary:
+        case type_Timestamp:
+        case type_Float:
+        case type_Double:
+        case type_Decimal:
+        case type_ObjectId:
+        case type_UUID:
+            return true;
+        case type_Mixed:
+        case type_Link:
+        case type_TypedLink:
+            return false;
+    }
+    return false;
+}
+
+bool flx_data_type_can_bootstrap_payload(DataType type) noexcept
+{
+    return type == type_Mixed || flx_concrete_data_type_can_bootstrap_payload(type);
+}
+
+ConstTableRef flx_typed_link_target_table(ConstTableRef context_table, ObjLink link)
+{
+    if (!context_table || !link) {
+        return {};
+    }
+
+    Group* group = context_table->get_parent_group();
+    if (!group) {
+        return {};
+    }
+
+    ConstTableRef target_table = group->get_table(link.get_table_key()); // Throws
+    if (!target_table || target_table->is_embedded() || target_table->is_asymmetric()) {
+        return {};
+    }
+    return target_table;
+}
+
+bool flx_mixed_value_can_bootstrap_payload(ConstTableRef context_table, Mixed value)
+{
+    if (value.is_null()) {
+        return true;
+    }
+    if (value.is_type(type_TypedLink)) {
+        ObjLink link = value.get<ObjLink>();
+        ConstTableRef target_table = flx_typed_link_target_table(context_table, link); // Throws
+        if (!target_table) {
+            return false;
+        }
+        if (target_table->try_get_object(link.get_obj_key())) { // Throws
+            return true;
+        }
+        return link.get_obj_key().is_unresolved() && target_table->get_primary_key_column() &&
+               target_table->try_get_tombstone(link.get_obj_key()); // Throws
+    }
+    return flx_concrete_data_type_can_bootstrap_payload(value.get_type());
+}
+
+bool flx_column_has_supported_link_target(ConstTableRef table, ColKey col_key) noexcept
+{
+    if (DataType(col_key.get_type()) != type_Link) {
+        return false;
+    }
+
+    ConstTableRef target_table = table->get_link_target(col_key);
+    return target_table && !target_table->is_embedded() && !target_table->is_asymmetric();
+}
+
+bool flx_column_has_embedded_link_target(ConstTableRef table, ColKey col_key) noexcept
+{
+    if (DataType(col_key.get_type()) != type_Link) {
+        return false;
+    }
+
+    ConstTableRef target_table = table->get_link_target(col_key);
+    return target_table && target_table->is_embedded();
+}
+
+bool flx_column_can_bootstrap_link_value(ConstTableRef table, ColKey col_key) noexcept
+{
+    return !col_key.is_collection() && flx_column_has_supported_link_target(table, col_key);
+}
+
+bool flx_column_can_bootstrap_embedded_object_value(ConstTableRef table, ColKey col_key) noexcept
+{
+    return !col_key.is_collection() && flx_column_has_embedded_link_target(table, col_key);
+}
+
+bool flx_column_can_bootstrap_link_collection_value(ConstTableRef table, ColKey col_key) noexcept
+{
+    return col_key.is_collection() && flx_column_has_supported_link_target(table, col_key);
+}
+
+bool flx_column_can_bootstrap_embedded_list_value(ConstTableRef table, ColKey col_key) noexcept
+{
+    return col_key.is_list() && flx_column_has_embedded_link_target(table, col_key);
+}
+
+bool flx_column_can_bootstrap_embedded_dictionary_value(ConstTableRef table, ColKey col_key) noexcept
+{
+    return col_key.is_dictionary() && table->get_dictionary_key_type(col_key) == type_String &&
+           flx_column_has_embedded_link_target(table, col_key);
+}
+
+bool flx_column_can_bootstrap_scalar_value(ConstTableRef table, ColKey col_key) noexcept
+{
+    if (col_key.is_collection()) {
+        return false;
+    }
+    if (DataType(col_key.get_type()) == type_Link) {
+        return flx_column_can_bootstrap_link_value(table, col_key) ||
+               flx_column_can_bootstrap_embedded_object_value(table, col_key);
+    }
+    return flx_data_type_can_bootstrap_payload(DataType(col_key.get_type()));
+}
+
+bool flx_column_can_bootstrap_list_value(ConstTableRef table, ColKey col_key) noexcept
+{
+    return col_key.is_list() && (flx_data_type_can_bootstrap_payload(DataType(col_key.get_type())) ||
+                                 flx_column_can_bootstrap_link_collection_value(table, col_key) ||
+                                 flx_column_can_bootstrap_embedded_list_value(table, col_key));
+}
+
+bool flx_column_can_bootstrap_set_value(ConstTableRef table, ColKey col_key) noexcept
+{
+    return col_key.is_set() && (flx_data_type_can_bootstrap_payload(DataType(col_key.get_type())) ||
+                                flx_column_can_bootstrap_link_collection_value(table, col_key));
+}
+
+bool flx_column_can_bootstrap_dictionary_value(ConstTableRef table, ColKey col_key) noexcept
+{
+    return col_key.is_dictionary() && table->get_dictionary_key_type(col_key) == type_String &&
+           (flx_data_type_can_bootstrap_payload(DataType(col_key.get_type())) ||
+            flx_column_can_bootstrap_link_collection_value(table, col_key) ||
+            flx_column_can_bootstrap_embedded_dictionary_value(table, col_key));
+}
+
+bool flx_column_can_bootstrap_value(ConstTableRef table, ColKey col_key) noexcept
+{
+    return flx_column_can_bootstrap_scalar_value(table, col_key) || flx_column_can_bootstrap_list_value(table, col_key) ||
+           flx_column_can_bootstrap_set_value(table, col_key) || flx_column_can_bootstrap_dictionary_value(table, col_key);
+}
+
+bool flx_column_current_value_can_bootstrap(ConstTableRef table, const Obj& obj, ColKey col_key)
+{
+    if (DataType(col_key.get_type()) != type_Mixed) {
+        return true;
+    }
+
+    if (!col_key.is_collection()) {
+        return flx_mixed_value_can_bootstrap_payload(table, obj.get_any(col_key)); // Throws
+    }
+    if (col_key.is_list()) {
+        auto list = obj.get_listbase_ptr(col_key); // Throws
+        for (size_t i = 0; i < list->size(); ++i) {
+            if (!flx_mixed_value_can_bootstrap_payload(table, list->get_any(i))) { // Throws
+                return false;
+            }
+        }
+        return true;
+    }
+    if (col_key.is_set()) {
+        auto set = obj.get_setbase_ptr(col_key); // Throws
+        for (size_t i = 0; i < set->size(); ++i) {
+            if (!flx_mixed_value_can_bootstrap_payload(table, set->get_any(i))) { // Throws
+                return false;
+            }
+        }
+        return true;
+    }
+    if (col_key.is_dictionary()) {
+        auto dictionary = obj.get_dictionary(col_key); // Throws
+        for (size_t i = 0; i < dictionary.size(); ++i) {
+            if (!flx_mixed_value_can_bootstrap_payload(table, dictionary.get_any(i))) { // Throws
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool flx_query_is_match_all(std::string_view query_string) noexcept
+{
+    auto trim = [](std::string_view value) noexcept {
+        while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+            value.remove_prefix(1);
+        }
+        while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+            value.remove_suffix(1);
+        }
+        return value;
+    };
+
+    query_string = trim(query_string);
+    while (query_string.size() >= 2 && query_string.front() == '(' && query_string.back() == ')') {
+        query_string.remove_prefix(1);
+        query_string.remove_suffix(1);
+        query_string = trim(query_string);
+    }
+    return query_string.empty() || query_string == "TRUEPREDICATE";
+}
+
+void flx_add_table(Changeset& changeset, ConstTableRef table)
+{
+    Instruction::AddTable add_table;
+    add_table.table = flx_class_name(changeset, table->get_name());
+    if (table->is_embedded()) {
+        add_table.type = Instruction::AddTable::EmbeddedTable{};
+    }
+    else {
+        ColKey pk_col = table->get_primary_key_column();
+        if (pk_col) {
+            add_table.type = Instruction::AddTable::TopLevelTable{
+                changeset.intern_string(table->get_column_name(pk_col)),
+                flx_payload_type(table->get_column_type(pk_col)),
+                table->is_nullable(pk_col),
+                table->is_asymmetric(),
+            };
+        }
+        else {
+            add_table.type = Instruction::AddTable::TopLevelTable{
+                changeset.intern_string(""),
+                Instruction::Payload::Type::GlobalKey,
+                false,
+                table->is_asymmetric(),
+            };
+        }
+    }
+    changeset.push_back(add_table);
+}
+
+void flx_add_schema_impl(Changeset& changeset, ConstTableRef table, std::set<std::string>& visiting)
+{
+    std::string table_real_name = std::string(table->get_name()); // Throws
+    bool entered = visiting.insert(table_real_name).second;       // Throws
+    flx_add_table(changeset, table); // Throws
+    if (!entered) {
+        return;
+    }
+
+    InternString table_name = flx_class_name(changeset, table->get_name());
+
+    ColKey pk_col = table->get_primary_key_column();
+    for (ColKey col_key : table->get_column_keys()) {
+        if (col_key == pk_col || !flx_column_can_bootstrap_value(table, col_key)) {
+            continue;
+        }
+        ConstTableRef link_target_table;
+        if (flx_column_has_embedded_link_target(table, col_key)) {
+            link_target_table = table->get_link_target(col_key);
+            flx_add_schema_impl(changeset, link_target_table, visiting); // Throws
+        }
+        else if (flx_column_has_supported_link_target(table, col_key)) {
+            link_target_table = table->get_link_target(col_key);
+            if (link_target_table != table) {
+                flx_add_table(changeset, link_target_table); // Throws
+            }
+        }
+
+        Instruction::AddColumn add_col;
+        add_col.table = table_name;
+        add_col.field = changeset.intern_string(table->get_column_name(col_key));
+        add_col.type = flx_payload_type(table->get_column_type(col_key));
+        add_col.key_type = col_key.is_dictionary() ? flx_payload_type(table->get_dictionary_key_type(col_key))
+                                                   : Instruction::Payload::Type::Null;
+        add_col.nullable = table->is_nullable(col_key);
+        add_col.collection_type = flx_collection_type(col_key);
+        add_col.link_target_table =
+            link_target_table ? flx_class_name(changeset, link_target_table->get_name()) : changeset.intern_string("");
+        changeset.push_back(add_col);
+    }
+
+    visiting.erase(table_real_name);
+}
+
+void flx_add_schema(Changeset& changeset, ConstTableRef table)
+{
+    std::set<std::string> visiting;
+    flx_add_schema_impl(changeset, table, visiting); // Throws
 }
 
 // Only used by the Sync Server to support older pbs sync clients (prior to protocol v8)
@@ -263,6 +712,30 @@ struct DownloadCache {
     std::size_t accum_compacted_size;
 };
 
+struct FLXPrimaryKey {
+    enum class Type { Null, Int, String, GlobalKey, ObjectId, UUID };
+
+    Type type = Type::Null;
+    int64_t int_value = 0;
+    std::string string_value;
+    GlobalKey global_key;
+    ObjectId object_id;
+    UUID uuid;
+};
+
+struct FLXVisibleObject {
+    std::string table_name;
+    FLXPrimaryKey primary_key;
+};
+
+struct FLXTouchedObject {
+    std::string table_name;
+    FLXPrimaryKey primary_key;
+};
+
+using FLXVisibleObjects = std::map<std::string, FLXVisibleObject>;
+using FLXTouchedObjects = std::map<std::string, FLXTouchedObject>;
+
 
 // An unblocked work unit is comprised of one Work object for each of the files
 // that contribute work to the work unit, generally one reference file and a
@@ -293,6 +766,18 @@ public:
     // Result of integration of changesets from downstream clients
     IntegrationResult integration_result;
 
+    struct PendingJsonError {
+        file_ident_type client_file_ident = 0;
+        std::string body;
+    };
+    std::vector<PendingJsonError> pending_json_errors;
+
+    struct PendingFLXForcedRemoval {
+        file_ident_type client_file_ident = 0;
+        FLXVisibleObject object;
+    };
+    std::vector<PendingFLXForcedRemoval> pending_flx_forced_removals;
+
     void reset() noexcept
     {
         has_primary_work = false;
@@ -310,6 +795,8 @@ public:
 
         version_info = {};
         integration_result = {};
+        pending_json_errors.clear();
+        pending_flx_forced_removals.clear();
     }
 };
 
@@ -454,6 +941,996 @@ private:
 };
 
 
+constexpr const char* c_flx_visible_state_table = "flx_visible_state";
+constexpr const char* c_flx_visible_state_client_file_ident = "client_file_ident";
+constexpr const char* c_flx_visible_state_json = "visible_json";
+
+std::string flx_primary_key_part(const FLXPrimaryKey& primary_key)
+{
+    switch (primary_key.type) {
+        case FLXPrimaryKey::Type::Null:
+            return "null";
+        case FLXPrimaryKey::Type::Int:
+            return util::format("int:%1", primary_key.int_value);
+        case FLXPrimaryKey::Type::String:
+            return util::format("string:%1:%2", primary_key.string_value.size(), primary_key.string_value);
+        case FLXPrimaryKey::Type::GlobalKey:
+            return util::format("global:%1", primary_key.global_key.to_string());
+        case FLXPrimaryKey::Type::ObjectId:
+            return util::format("objectid:%1", primary_key.object_id.to_string());
+        case FLXPrimaryKey::Type::UUID:
+            return util::format("uuid:%1", primary_key.uuid.to_string());
+    }
+    BARQ_UNREACHABLE();
+}
+
+std::string flx_visible_object_key(const std::string& table_name, const FLXPrimaryKey& primary_key)
+{
+    return table_name + "\t" + flx_primary_key_part(primary_key); // Throws
+}
+
+nlohmann::json flx_primary_key_to_json(const FLXPrimaryKey& primary_key)
+{
+    nlohmann::json json = nlohmann::json::object(); // Throws
+    switch (primary_key.type) {
+        case FLXPrimaryKey::Type::Null:
+            json["type"] = "null";
+            break;
+        case FLXPrimaryKey::Type::Int:
+            json["type"] = "int";
+            json["value"] = primary_key.int_value;
+            break;
+        case FLXPrimaryKey::Type::String:
+            json["type"] = "string";
+            json["value"] = primary_key.string_value;
+            break;
+        case FLXPrimaryKey::Type::GlobalKey:
+            json["type"] = "global";
+            json["value"] = primary_key.global_key.to_string();
+            break;
+        case FLXPrimaryKey::Type::ObjectId:
+            json["type"] = "objectid";
+            json["value"] = primary_key.object_id.to_string();
+            break;
+        case FLXPrimaryKey::Type::UUID:
+            json["type"] = "uuid";
+            json["value"] = primary_key.uuid.to_string();
+            break;
+    }
+    return json;
+}
+
+bool flx_primary_key_from_json(const nlohmann::json& json, FLXPrimaryKey& primary_key)
+{
+    if (!json.is_object() || !json.contains("type") || !json["type"].is_string()) {
+        return false;
+    }
+
+    std::string type = json["type"].get<std::string>(); // Throws
+    if (type == "null") {
+        primary_key = {};
+        return true;
+    }
+
+    if (!json.contains("value")) {
+        return false;
+    }
+
+    if (type == "int") {
+        if (!json["value"].is_number_integer()) {
+            return false;
+        }
+        primary_key.type = FLXPrimaryKey::Type::Int;
+        primary_key.int_value = json["value"].get<int64_t>(); // Throws
+        return true;
+    }
+
+    if (!json["value"].is_string()) {
+        return false;
+    }
+
+    std::string value = json["value"].get<std::string>(); // Throws
+    if (type == "string") {
+        primary_key.type = FLXPrimaryKey::Type::String;
+        primary_key.string_value = std::move(value);
+        return true;
+    }
+    if (type == "global") {
+        primary_key.type = FLXPrimaryKey::Type::GlobalKey;
+        primary_key.global_key = GlobalKey::from_string(StringData{value});
+        return true;
+    }
+    if (type == "objectid") {
+        if (!ObjectId::is_valid_str(StringData{value})) {
+            return false;
+        }
+        primary_key.type = FLXPrimaryKey::Type::ObjectId;
+        primary_key.object_id = ObjectId{StringData{value}};
+        return true;
+    }
+    if (type == "uuid") {
+        if (!UUID::is_valid_string(StringData{value})) {
+            return false;
+        }
+        primary_key.type = FLXPrimaryKey::Type::UUID;
+        primary_key.uuid = UUID{StringData{value}};
+        return true;
+    }
+
+    return false;
+}
+
+std::string flx_visible_objects_to_json(const FLXVisibleObjects& visible_objects)
+{
+    nlohmann::json root = nlohmann::json::object();  // Throws
+    root["objects"] = nlohmann::json::array();       // Throws
+    auto& objects = root["objects"];
+    for (const auto& [_, visible_object] : visible_objects) {
+        nlohmann::json object = nlohmann::json::object(); // Throws
+        object["table"] = visible_object.table_name;
+        object["primaryKey"] = flx_primary_key_to_json(visible_object.primary_key); // Throws
+        objects.push_back(std::move(object));                                      // Throws
+    }
+    return root.dump(); // Throws
+}
+
+FLXVisibleObjects flx_visible_objects_from_json(std::string_view text)
+{
+    FLXVisibleObjects visible_objects;
+    if (text.empty()) {
+        return visible_objects;
+    }
+
+    try {
+        auto root = nlohmann::json::parse(text);
+        if (!root.is_object() || !root.contains("objects") || !root["objects"].is_array()) {
+            return visible_objects;
+        }
+
+        for (const auto& object : root["objects"]) {
+            if (!object.is_object() || !object.contains("table") || !object["table"].is_string() ||
+                !object.contains("primaryKey")) {
+                continue;
+            }
+
+            FLXVisibleObject visible_object;
+            visible_object.table_name = object["table"].get<std::string>(); // Throws
+            if (!flx_primary_key_from_json(object["primaryKey"], visible_object.primary_key)) {
+                continue;
+            }
+            std::string key = flx_visible_object_key(visible_object.table_name, visible_object.primary_key); // Throws
+            visible_objects.emplace(std::move(key), std::move(visible_object));                              // Throws
+        }
+    }
+    catch (const std::exception&) {
+        visible_objects.clear();
+    }
+    return visible_objects;
+}
+
+bool flx_visible_objects_have_same_keys(const FLXVisibleObjects& a, const FLXVisibleObjects& b) noexcept
+{
+    if (a.size() != b.size()) {
+        return false;
+    }
+
+    auto a_it = a.begin();
+    auto b_it = b.begin();
+    for (; a_it != a.end(); ++a_it, ++b_it) {
+        if (a_it->first != b_it->first) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TableRef flx_get_or_create_visible_state_table(Transaction& tr)
+{
+    TableRef table = tr.get_table(c_flx_visible_state_table); // Throws
+    if (!table) {
+        table = tr.add_table_with_primary_key(c_flx_visible_state_table, type_Int,
+                                              c_flx_visible_state_client_file_ident); // Throws
+        table->add_column(type_String, c_flx_visible_state_json);                     // Throws
+        return table;
+    }
+
+    ColKey pk_col = table->get_primary_key_column();
+    if (!pk_col || table->get_column_name(pk_col) != c_flx_visible_state_client_file_ident ||
+        table->get_column_type(pk_col) != type_Int) {
+        throw std::runtime_error("Bad FLX visible state metadata primary key");
+    }
+
+    ColKey json_col = table->get_column_key(c_flx_visible_state_json);
+    if (!json_col) {
+        table->add_column(type_String, c_flx_visible_state_json); // Throws
+    }
+    else if (table->get_column_type(json_col) != type_String) {
+        throw std::runtime_error("Bad FLX visible state metadata JSON column");
+    }
+    return table;
+}
+
+FLXPrimaryKey flx_primary_key_from_mixed(Mixed pk);
+
+FLXPrimaryKey flx_primary_key_from_object(ConstTableRef table, const Obj& obj)
+{
+    ColKey pk_col = table->get_primary_key_column();
+    if (!pk_col) {
+        FLXPrimaryKey primary_key;
+        primary_key.type = FLXPrimaryKey::Type::GlobalKey;
+        primary_key.global_key = table->get_object_id(obj.get_key());
+        return primary_key;
+    }
+
+    Mixed pk = obj.get_any(pk_col);
+    return flx_primary_key_from_mixed(pk); // Throws
+}
+
+FLXPrimaryKey flx_primary_key_from_mixed(Mixed pk)
+{
+    FLXPrimaryKey primary_key;
+    if (pk.is_null()) {
+        primary_key.type = FLXPrimaryKey::Type::Null;
+        return primary_key;
+    }
+
+    switch (pk.get_type()) {
+        case type_Int:
+            primary_key.type = FLXPrimaryKey::Type::Int;
+            primary_key.int_value = pk.get<int64_t>();
+            return primary_key;
+        case type_String:
+            primary_key.type = FLXPrimaryKey::Type::String;
+            primary_key.string_value = std::string(pk.get<StringData>()); // Throws
+            return primary_key;
+        case type_ObjectId:
+            primary_key.type = FLXPrimaryKey::Type::ObjectId;
+            primary_key.object_id = pk.get<ObjectId>();
+            return primary_key;
+        case type_UUID:
+            primary_key.type = FLXPrimaryKey::Type::UUID;
+            primary_key.uuid = pk.get<UUID>();
+            return primary_key;
+        default:
+            break;
+    }
+    throw std::runtime_error("Unsupported FLX primary key type");
+}
+
+FLXPrimaryKey flx_primary_key_from_instruction(const Changeset& changeset,
+                                               const Instruction::PrimaryKey& instruction_key)
+{
+    return mpark::visit(util::overload{
+                            [](mpark::monostate) {
+                                return FLXPrimaryKey{};
+                            },
+                            [](int64_t value) {
+                                FLXPrimaryKey primary_key;
+                                primary_key.type = FLXPrimaryKey::Type::Int;
+                                primary_key.int_value = value;
+                                return primary_key;
+                            },
+                            [](GlobalKey value) {
+                                FLXPrimaryKey primary_key;
+                                primary_key.type = FLXPrimaryKey::Type::GlobalKey;
+                                primary_key.global_key = value;
+                                return primary_key;
+                            },
+                            [&](InternString value) {
+                                FLXPrimaryKey primary_key;
+                                primary_key.type = FLXPrimaryKey::Type::String;
+                                primary_key.string_value = std::string(changeset.get_string(value)); // Throws
+                                return primary_key;
+                            },
+                            [](ObjectId value) {
+                                FLXPrimaryKey primary_key;
+                                primary_key.type = FLXPrimaryKey::Type::ObjectId;
+                                primary_key.object_id = value;
+                                return primary_key;
+                            },
+                            [](UUID value) {
+                                FLXPrimaryKey primary_key;
+                                primary_key.type = FLXPrimaryKey::Type::UUID;
+                                primary_key.uuid = value;
+                                return primary_key;
+                            },
+                        },
+                        instruction_key);
+}
+
+bool flx_primary_key_to_mixed(const FLXPrimaryKey& primary_key, Mixed& mixed)
+{
+    switch (primary_key.type) {
+        case FLXPrimaryKey::Type::Null:
+            mixed = Mixed{};
+            return true;
+        case FLXPrimaryKey::Type::Int:
+            mixed = Mixed{primary_key.int_value};
+            return true;
+        case FLXPrimaryKey::Type::String:
+            mixed = Mixed{StringData{primary_key.string_value}};
+            return true;
+        case FLXPrimaryKey::Type::ObjectId:
+            mixed = Mixed{primary_key.object_id};
+            return true;
+        case FLXPrimaryKey::Type::UUID:
+            mixed = Mixed{primary_key.uuid};
+            return true;
+        case FLXPrimaryKey::Type::GlobalKey:
+            return false;
+    }
+    BARQ_UNREACHABLE();
+}
+
+Obj flx_find_object(ConstTableRef table, const FLXPrimaryKey& primary_key)
+{
+    ColKey pk_col = table->get_primary_key_column();
+    ObjKey obj_key;
+    if (!pk_col) {
+        if (primary_key.type != FLXPrimaryKey::Type::GlobalKey) {
+            return {};
+        }
+        obj_key = table->get_objkey(primary_key.global_key);
+    }
+    else {
+        Mixed mixed;
+        if (!flx_primary_key_to_mixed(primary_key, mixed)) {
+            return {};
+        }
+        obj_key = table->find_primary_key(mixed);
+    }
+    if (!obj_key) {
+        return {};
+    }
+    return table->try_get_object(obj_key);
+}
+
+Instruction::Payload flx_link_payload(Changeset& changeset, ConstTableRef target_table, const Obj& target)
+{
+    Instruction::Payload::Link link;
+    link.target_table = flx_class_name(changeset, target_table->get_name());
+    link.target = flx_primary_key(changeset, target_table, target); // Throws
+    return Instruction::Payload{link};
+}
+
+Instruction::Payload flx_link_payload(Changeset& changeset, ConstTableRef target_table, ObjKey target_key)
+{
+    Obj target = target_table ? target_table->try_get_object(target_key) : Obj{}; // Throws
+    if (target) {
+        return flx_link_payload(changeset, target_table, target); // Throws
+    }
+
+    if (target_table && target_key.is_unresolved() && target_table->get_primary_key_column()) {
+        Obj tombstone = target_table->try_get_tombstone(target_key); // Throws
+        if (tombstone) {
+            Instruction::Payload::Link link;
+            link.target_table = flx_class_name(changeset, target_table->get_name());
+            link.target = flx_primary_key(changeset, tombstone.get_any(target_table->get_primary_key_column())); // Throws
+            return Instruction::Payload{link};
+        }
+    }
+
+    return Instruction::Payload{};
+}
+
+Instruction::Payload flx_link_payload(Changeset& changeset, ConstTableRef table, const Obj& obj, ColKey col_key)
+{
+    Mixed value = obj.get_any(col_key); // Throws
+    if (value.is_null()) {
+        return Instruction::Payload{};
+    }
+    ConstTableRef target_table = table->get_link_target(col_key);
+    return flx_link_payload(changeset, target_table, value.get<ObjKey>()); // Throws
+}
+
+Instruction::Payload flx_payload(Changeset& changeset, ConstTableRef context_table, Mixed value)
+{
+    if (!value.is_null() && value.is_type(type_TypedLink)) {
+        ObjLink link = value.get<ObjLink>();
+        ConstTableRef target_table = flx_typed_link_target_table(context_table, link); // Throws
+        return flx_link_payload(changeset, target_table, link.get_obj_key());          // Throws
+    }
+    return flx_payload(changeset, value); // Throws
+}
+
+std::string flx_table_name_from_instruction(const Changeset& changeset, InternString class_name)
+{
+    Group::TableNameBuffer buffer;
+    StringData table_name = Group::class_name_to_table_name(changeset.get_string(class_name), buffer);
+    return std::string(table_name); // Throws
+}
+
+void collect_flx_touched_instruction(const Changeset& changeset, const Instruction& instruction,
+                                     FLXTouchedObjects& touched_objects)
+{
+    if (instruction.is_vector()) {
+        for (std::size_t i = 0; i < instruction.size(); ++i) {
+            collect_flx_touched_instruction(changeset, instruction.at(i), touched_objects); // Throws
+        }
+        return;
+    }
+
+    const Instruction::ObjectInstruction* object_instruction = instruction.get_if<Instruction::ObjectInstruction>();
+    if (!object_instruction) {
+        return;
+    }
+
+    std::string table_name = flx_table_name_from_instruction(changeset, object_instruction->table); // Throws
+    FLXPrimaryKey primary_key = flx_primary_key_from_instruction(changeset, object_instruction->object); // Throws
+    std::string key = flx_visible_object_key(table_name, primary_key); // Throws
+    touched_objects[key] = FLXTouchedObject{std::move(table_name), std::move(primary_key)}; // Throws
+}
+
+void collect_flx_touched_objects(const Changeset& changeset, FLXTouchedObjects& touched_objects)
+{
+    for (auto it = changeset.begin(); it != changeset.end(); ++it) {
+        if (const Instruction* instruction = *it) {
+            collect_flx_touched_instruction(changeset, *instruction, touched_objects); // Throws
+        }
+    }
+}
+
+// True if the instruction destructively mutates the schema (erases a table or
+// column). These are TableInstructions that are not ObjectInstructions; the
+// compensating-write pass only reverts object changes, and a dropped table or
+// column cannot be restored once applied. A non-admin Flexible Sync client must
+// never be allowed to run them against the shared file. Additive schema changes
+// (AddTable/AddColumn) are left alone: they are non-destructive and are how a
+// client legitimately establishes its schema on first sync.
+bool flx_instruction_is_destructive_schema_change(const Instruction& instruction)
+{
+    if (instruction.is_vector()) {
+        for (std::size_t i = 0; i < instruction.size(); ++i) {
+            if (flx_instruction_is_destructive_schema_change(instruction.at(i))) // Throws
+                return true;
+        }
+        return false;
+    }
+    return instruction.get_if<Instruction::EraseTable>() || instruction.get_if<Instruction::EraseColumn>();
+}
+
+bool flx_changeset_has_destructive_schema_change(const Changeset& changeset)
+{
+    for (auto it = changeset.begin(); it != changeset.end(); ++it) {
+        if (const Instruction* instruction = *it) {
+            if (flx_instruction_is_destructive_schema_change(*instruction)) // Throws
+                return true;
+        }
+    }
+    return false;
+}
+
+std::string flx_base64_primary_key(const FLXPrimaryKey& primary_key)
+{
+    std::string payload;
+    auto append_int64 = [&](int64_t value) {
+        char buffer[_impl::encode_int_max_bytes<int64_t>()];
+        std::size_t size = _impl::encode_int(buffer, value);
+        payload.append(buffer, size); // Throws
+    };
+    auto append_uint64 = [&](uint64_t value) {
+        char buffer[_impl::encode_int_max_bytes<uint64_t>()];
+        std::size_t size = _impl::encode_int(buffer, value);
+        payload.append(buffer, size); // Throws
+    };
+    auto append_type = [&](Instruction::Payload::Type type) {
+        append_int64(int64_t(type));
+    };
+
+    switch (primary_key.type) {
+        case FLXPrimaryKey::Type::Null:
+            append_type(Instruction::Payload::Type::Null);
+            break;
+        case FLXPrimaryKey::Type::Int:
+            append_type(Instruction::Payload::Type::Int);
+            append_int64(primary_key.int_value);
+            break;
+        case FLXPrimaryKey::Type::String:
+            append_type(Instruction::Payload::Type::String);
+            append_uint64(uint64_t(primary_key.string_value.size()));
+            payload.append(primary_key.string_value); // Throws
+            break;
+        case FLXPrimaryKey::Type::ObjectId:
+            append_type(Instruction::Payload::Type::ObjectId);
+            payload.append(reinterpret_cast<const char*>(&primary_key.object_id), sizeof(primary_key.object_id));
+            break;
+        case FLXPrimaryKey::Type::UUID: {
+            append_type(Instruction::Payload::Type::UUID);
+            auto bytes = primary_key.uuid.to_bytes();
+            payload.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            break;
+        }
+        case FLXPrimaryKey::Type::GlobalKey:
+            append_type(Instruction::Payload::Type::Null);
+            break;
+    }
+
+    std::string encoded;
+    encoded.resize(util::base64_encoded_size(payload.size())); // Throws
+    util::base64_encode(payload, encoded);
+    return encoded;
+}
+
+struct FLXSnapshotValue {
+    std::string column_name;
+    OwnedMixed value = OwnedMixed{Mixed{}};
+    std::string binary_value;
+    bool is_binary = false;
+    bool is_list = false;
+    bool is_set = false;
+    bool is_dictionary = false;
+    bool is_link = false;
+    bool link_is_null = false;
+    std::string link_target_table;
+    FLXPrimaryKey link_target_primary_key;
+    bool is_embedded_object = false;
+    bool embedded_is_null = false;
+    std::string embedded_target_table;
+    std::vector<FLXSnapshotValue> embedded_values;
+    std::vector<FLXSnapshotValue> list_values;
+    std::vector<std::pair<std::string, FLXSnapshotValue>> dictionary_values;
+
+    Mixed as_mixed() const noexcept
+    {
+        if (is_binary) {
+            return Mixed{BinaryData{binary_value.data(), binary_value.size()}};
+        }
+        return value;
+    }
+};
+
+FLXSnapshotValue flx_snapshot_mixed(Mixed mixed)
+{
+    FLXSnapshotValue value;
+    if (!mixed.is_null() && mixed.is_type(type_Binary)) {
+        BinaryData binary = mixed.get<Binary>();
+        value.binary_value.assign(binary.data(), binary.size()); // Throws
+        value.is_binary = true;
+    }
+    else {
+        value.value = OwnedMixed{mixed}; // Throws
+    }
+    return value;
+}
+
+std::vector<FLXSnapshotValue> flx_snapshot_values(ConstTableRef table, const Obj& obj);
+
+FLXSnapshotValue flx_snapshot_link(ConstTableRef target_table, ObjKey target_key)
+{
+    FLXSnapshotValue value;
+    value.is_link = true;
+    Obj target = target_table ? target_table->try_get_object(target_key) : Obj{}; // Throws
+    if (!target) {
+        if (target_table && target_key.is_unresolved() && target_table->get_primary_key_column()) {
+            Obj tombstone = target_table->try_get_tombstone(target_key); // Throws
+            if (tombstone) {
+                value.link_target_table = std::string(target_table->get_name()); // Throws
+                value.link_target_primary_key =
+                    flx_primary_key_from_mixed(tombstone.get_any(target_table->get_primary_key_column())); // Throws
+                return value;
+            }
+        }
+        value.link_is_null = true;
+        return value;
+    }
+
+    value.link_target_table = std::string(target_table->get_name());                  // Throws
+    value.link_target_primary_key = flx_primary_key_from_object(target_table, target); // Throws
+    return value;
+}
+
+FLXSnapshotValue flx_snapshot_mixed(ConstTableRef context_table, Mixed mixed)
+{
+    if (!mixed.is_null() && mixed.is_type(type_TypedLink)) {
+        ObjLink link = mixed.get<ObjLink>();
+        ConstTableRef target_table = flx_typed_link_target_table(context_table, link); // Throws
+        return flx_snapshot_link(target_table, link.get_obj_key());                    // Throws
+    }
+    return flx_snapshot_mixed(mixed); // Throws
+}
+
+FLXSnapshotValue flx_snapshot_embedded_object(ConstTableRef target_table, const Obj& embedded)
+{
+    FLXSnapshotValue value;
+    value.is_embedded_object = true;
+    value.embedded_is_null = !embedded;
+    if (target_table) {
+        value.embedded_target_table = std::string(target_table->get_name()); // Throws
+    }
+    if (target_table && embedded) {
+        value.embedded_values = flx_snapshot_values(target_table, embedded); // Throws
+    }
+    return value;
+}
+
+Obj flx_restore_link_target(Transaction& tr, const FLXSnapshotValue& snapshot)
+{
+    if (snapshot.link_is_null) {
+        return {};
+    }
+
+    TableRef target_table = tr.get_table(snapshot.link_target_table); // Throws
+    if (!target_table) {
+        return {};
+    }
+    return flx_find_object(target_table, snapshot.link_target_primary_key); // Throws
+}
+
+bool flx_restore_values(Transaction& tr, Obj& obj, const std::vector<FLXSnapshotValue>& values);
+
+void flx_restore_list_value(Transaction& tr, Obj& obj, ColKey col_key, const FLXSnapshotValue& snapshot)
+{
+    if (DataType(col_key.get_type()) == type_Link) {
+        ConstTableRef target_table = obj.get_table()->get_link_target(col_key);
+        if (target_table && target_table->is_embedded()) {
+            auto list = obj.get_linklist(col_key); // Throws
+            list.clear();                          // Throws
+            for (const FLXSnapshotValue& item : snapshot.list_values) {
+                if (item.is_embedded_object && !item.embedded_is_null) {
+                    Obj embedded = list.create_and_insert_linked_object(list.size()); // Throws
+                    flx_restore_values(tr, embedded, item.embedded_values);           // Throws
+                }
+            }
+            return;
+        }
+
+        auto list = obj.get_linklist(col_key); // Throws
+        list.clear();                          // Throws
+        for (const FLXSnapshotValue& item : snapshot.list_values) {
+            Obj target = flx_restore_link_target(tr, item); // Throws
+            if (target) {
+                list.insert(list.size(), target.get_key()); // Throws
+            }
+        }
+        return;
+    }
+
+    auto list = obj.get_listbase_ptr(col_key); // Throws
+    list->clear();                             // Throws
+    for (const FLXSnapshotValue& item : snapshot.list_values) {
+        if (item.is_link) {
+            Obj target = flx_restore_link_target(tr, item); // Throws
+            if (target) {
+                list->insert_any(list->size(), target.get_link()); // Throws
+            }
+            else if (item.link_is_null) {
+                list->insert_null(list->size()); // Throws
+            }
+            continue;
+        }
+
+        Mixed mixed = item.as_mixed();
+        if (mixed.is_null()) {
+            list->insert_null(list->size()); // Throws
+        }
+        else {
+            list->insert_any(list->size(), mixed); // Throws
+        }
+    }
+}
+
+void flx_restore_set_value(Transaction& tr, Obj& obj, ColKey col_key, const FLXSnapshotValue& snapshot)
+{
+    if (DataType(col_key.get_type()) == type_Link) {
+        auto set = obj.get_linkset(col_key); // Throws
+        set.clear();                         // Throws
+        for (const FLXSnapshotValue& item : snapshot.list_values) {
+            Obj target = flx_restore_link_target(tr, item); // Throws
+            if (target) {
+                set.insert(target.get_key()); // Throws
+            }
+        }
+        return;
+    }
+
+    auto set = obj.get_setbase_ptr(col_key); // Throws
+    set->clear();                            // Throws
+    for (const FLXSnapshotValue& item : snapshot.list_values) {
+        if (item.is_link) {
+            Obj target = flx_restore_link_target(tr, item); // Throws
+            if (target) {
+                set->insert_any(target.get_link()); // Throws
+            }
+            else if (item.link_is_null) {
+                set->insert_null(); // Throws
+            }
+            continue;
+        }
+
+        Mixed mixed = item.as_mixed();
+        if (mixed.is_null()) {
+            set->insert_null(); // Throws
+        }
+        else {
+            set->insert_any(mixed); // Throws
+        }
+    }
+}
+
+void flx_restore_dictionary_value(Transaction& tr, Obj& obj, ColKey col_key, const FLXSnapshotValue& snapshot)
+{
+    auto dictionary = obj.get_dictionary(col_key); // Throws
+    dictionary.clear();                            // Throws
+    if (DataType(col_key.get_type()) == type_Link) {
+        ConstTableRef target_table = obj.get_table()->get_link_target(col_key);
+        if (target_table && target_table->is_embedded()) {
+            for (const auto& item : snapshot.dictionary_values) {
+                if (item.second.is_embedded_object && !item.second.embedded_is_null) {
+                    Obj embedded = dictionary.create_and_insert_linked_object(StringData{item.first}); // Throws
+                    flx_restore_values(tr, embedded, item.second.embedded_values);                     // Throws
+                }
+            }
+            return;
+        }
+    }
+
+    for (const auto& item : snapshot.dictionary_values) {
+        if (item.second.is_link) {
+            Obj target = flx_restore_link_target(tr, item.second); // Throws
+            if (target) {
+                dictionary.insert(StringData{item.first}, target.get_link()); // Throws
+            }
+            else if (item.second.link_is_null && DataType(col_key.get_type()) != type_Link) {
+                dictionary.insert(StringData{item.first}, Mixed{}); // Throws
+            }
+        }
+        else {
+            Mixed value = item.second.as_mixed();
+            dictionary.insert(StringData{item.first}, value); // Throws
+        }
+    }
+}
+
+void flx_restore_link_value(Transaction& tr, Obj& obj, ColKey col_key, const FLXSnapshotValue& snapshot)
+{
+    if (DataType(col_key.get_type()) != type_Link) {
+        if (snapshot.link_is_null) {
+            obj.set_null(col_key); // Throws
+            return;
+        }
+
+        Obj target = flx_restore_link_target(tr, snapshot); // Throws
+        if (!target) {
+            return;
+        }
+        obj.set_any(col_key, target.get_link()); // Throws
+        return;
+    }
+
+    if (snapshot.link_is_null) {
+        obj.set<ObjKey>(col_key, ObjKey{}); // Throws
+        return;
+    }
+
+    Obj target = flx_restore_link_target(tr, snapshot); // Throws
+    if (!target) {
+        return;
+    }
+    obj.set<ObjKey>(col_key, target.get_key()); // Throws
+}
+
+bool flx_restore_values(Transaction& tr, Obj& obj, const std::vector<FLXSnapshotValue>& values);
+
+void flx_restore_embedded_object_value(Transaction& tr, Obj& obj, ColKey col_key, const FLXSnapshotValue& snapshot)
+{
+    if (snapshot.embedded_is_null) {
+        obj.set_null(col_key); // Throws
+        return;
+    }
+
+    Obj embedded = obj.get_linked_object(col_key); // Throws
+    if (!embedded) {
+        embedded = obj.create_and_set_linked_object(col_key); // Throws
+    }
+    flx_restore_values(tr, embedded, snapshot.embedded_values); // Throws
+}
+
+struct FLXObjectSnapshot {
+    std::string table_name;
+    FLXPrimaryKey primary_key;
+    bool existed = false;
+    std::vector<FLXSnapshotValue> values;
+};
+
+struct FLXCompensationCandidate {
+    file_ident_type client_file_ident = 0;
+    version_type rejected_client_version = 0;
+    std::string user_identity;
+    bool user_is_admin = false;
+    bool before_matches_owner = false;
+    FLXObjectSnapshot before;
+};
+
+struct FLXRejectedUpdate {
+    file_ident_type client_file_ident = 0;
+    version_type rejected_client_version = 0;
+    std::string table_name;
+    FLXPrimaryKey primary_key;
+    std::string reason;
+};
+
+bool flx_object_owner_matches(ConstTableRef table, const Obj& obj, const std::string& owner_field,
+                              const std::string& identity)
+{
+    ColKey owner_col = table->get_column_key(owner_field);
+    if (!owner_col || obj.is_null(owner_col) || DataType(owner_col.get_type()) != type_String) {
+        return false;
+    }
+    return obj.get_any(owner_col).get<StringData>() == identity;
+}
+
+FLXObjectSnapshot flx_snapshot_object(ConstTableRef table, const std::string& table_name,
+                                      const FLXPrimaryKey& primary_key)
+{
+    FLXObjectSnapshot snapshot;
+    snapshot.table_name = table_name; // Throws
+    snapshot.primary_key = primary_key;
+
+    Obj obj = flx_find_object(table, primary_key); // Throws
+    if (!obj) {
+        return snapshot;
+    }
+
+    snapshot.existed = true;
+    snapshot.values = flx_snapshot_values(table, obj); // Throws
+    return snapshot;
+}
+
+std::vector<FLXSnapshotValue> flx_snapshot_values(ConstTableRef table, const Obj& obj)
+{
+    std::vector<FLXSnapshotValue> values;
+    ColKey pk_col = table->get_primary_key_column();
+    for (ColKey col_key : table->get_column_keys()) {
+        if (col_key == pk_col || !flx_column_can_bootstrap_value(table, col_key) ||
+            !flx_column_current_value_can_bootstrap(table, obj, col_key)) {
+            continue;
+        }
+
+        FLXSnapshotValue value;
+        value.column_name = std::string(table->get_column_name(col_key)); // Throws
+        if (flx_column_can_bootstrap_list_value(table, col_key)) {
+            value.is_list = true;
+            if (flx_column_can_bootstrap_embedded_list_value(table, col_key)) {
+                ConstTableRef target_table = table->get_link_target(col_key);
+                auto list = obj.get_linklist(col_key); // Throws
+                for (size_t i = 0; i < list.size(); ++i) {
+                    value.list_values.push_back(flx_snapshot_embedded_object(target_table, list.get_object(i))); // Throws
+                }
+            }
+            else if (flx_column_can_bootstrap_link_collection_value(table, col_key)) {
+                ConstTableRef target_table = table->get_link_target(col_key);
+                auto list = obj.get_linklist(col_key); // Throws
+                for (size_t i = 0; i < list.size(); ++i) {
+                    value.list_values.push_back(flx_snapshot_link(target_table, list.get(i))); // Throws
+                }
+            }
+            else {
+                auto list = obj.get_listbase_ptr(col_key); // Throws
+                for (size_t i = 0; i < list->size(); ++i) {
+                    value.list_values.push_back(flx_snapshot_mixed(table, list->get_any(i))); // Throws
+                }
+            }
+        }
+        else if (flx_column_can_bootstrap_set_value(table, col_key)) {
+            value.is_set = true;
+            if (flx_column_can_bootstrap_link_collection_value(table, col_key)) {
+                ConstTableRef target_table = table->get_link_target(col_key);
+                auto set = obj.get_linkset(col_key); // Throws
+                for (size_t i = 0; i < set.size(); ++i) {
+                    value.list_values.push_back(flx_snapshot_link(target_table, set.get(i))); // Throws
+                }
+            }
+            else {
+                auto set = obj.get_setbase_ptr(col_key); // Throws
+                for (size_t i = 0; i < set->size(); ++i) {
+                    value.list_values.push_back(flx_snapshot_mixed(table, set->get_any(i))); // Throws
+                }
+            }
+        }
+        else if (flx_column_can_bootstrap_dictionary_value(table, col_key)) {
+            value.is_dictionary = true;
+            auto dictionary = obj.get_dictionary(col_key); // Throws
+            ConstTableRef target_table = (flx_column_can_bootstrap_link_collection_value(table, col_key) ||
+                                          flx_column_can_bootstrap_embedded_dictionary_value(table, col_key))
+                ? table->get_link_target(col_key)
+                : ConstTableRef{};
+            for (size_t i = 0; i < dictionary.size(); ++i) {
+                std::string key = std::string(dictionary.get_key(i).get_string()); // Throws
+                FLXSnapshotValue item_value = flx_column_can_bootstrap_embedded_dictionary_value(table, col_key)
+                    ? flx_snapshot_embedded_object(target_table, dictionary.get_object(StringData{key}))
+                    : target_table ? flx_snapshot_link(target_table, dictionary.get_any(i).get<ObjKey>())
+                                   : flx_snapshot_mixed(table, dictionary.get_any(i)); // Throws
+                value.dictionary_values.emplace_back(std::move(key), std::move(item_value)); // Throws
+            }
+        }
+        else if (flx_column_can_bootstrap_link_value(table, col_key)) {
+            value.is_link = true;
+            value.link_is_null = obj.is_null(col_key);
+            if (!value.link_is_null) {
+                ConstTableRef target_table = table->get_link_target(col_key);
+                FLXSnapshotValue link = flx_snapshot_link(target_table, obj.get<ObjKey>(col_key)); // Throws
+                value.link_is_null = link.link_is_null;
+                value.link_target_table = std::move(link.link_target_table); // Throws
+                value.link_target_primary_key = link.link_target_primary_key;
+            }
+        }
+        else if (flx_column_can_bootstrap_embedded_object_value(table, col_key)) {
+            ConstTableRef target_table = table->get_link_target(col_key);
+            value = flx_snapshot_embedded_object(target_table, obj.get_linked_object(col_key)); // Throws
+            value.column_name = std::string(table->get_column_name(col_key));                   // Throws
+        }
+        else {
+            FLXSnapshotValue scalar = flx_snapshot_mixed(table, obj.get_any(col_key)); // Throws
+            scalar.column_name = std::move(value.column_name);                        // Throws
+            value = std::move(scalar);
+        }
+        values.push_back(std::move(value)); // Throws
+    }
+    return values;
+}
+
+bool flx_restore_values(Transaction& tr, Obj& obj, const std::vector<FLXSnapshotValue>& values)
+{
+    bool dirty = false;
+    for (const FLXSnapshotValue& value : values) {
+        ColKey col_key = obj.get_table()->get_column_key(value.column_name);
+        if (!col_key) {
+            continue;
+        }
+        if (value.is_list) {
+            flx_restore_list_value(tr, obj, col_key, value); // Throws
+        }
+        else if (value.is_set) {
+            flx_restore_set_value(tr, obj, col_key, value); // Throws
+        }
+        else if (value.is_dictionary) {
+            flx_restore_dictionary_value(tr, obj, col_key, value); // Throws
+        }
+        else if (value.is_embedded_object) {
+            flx_restore_embedded_object_value(tr, obj, col_key, value); // Throws
+        }
+        else if (value.is_link) {
+            flx_restore_link_value(tr, obj, col_key, value); // Throws
+        }
+        else {
+            obj.set_any(col_key, value.as_mixed()); // Throws
+        }
+        dirty = true;
+    }
+    return dirty;
+}
+
+bool flx_restore_snapshot(Transaction& tr, const FLXObjectSnapshot& snapshot)
+{
+    TableRef table = tr.get_table(snapshot.table_name); // Throws
+    if (!table) {
+        return false;
+    }
+
+    Obj obj = flx_find_object(table, snapshot.primary_key); // Throws
+    if (!snapshot.existed) {
+        if (obj) {
+            obj.remove(); // Throws
+            return true;
+        }
+        return false;
+    }
+
+    bool dirty = false;
+    if (!obj) {
+        Mixed primary_key;
+        if (!table->get_primary_key_column() || !flx_primary_key_to_mixed(snapshot.primary_key, primary_key)) {
+            return false;
+        }
+        bool did_create = false;
+        obj = table->create_object_with_primary_key(primary_key, &did_create); // Throws
+        dirty = did_create;
+    }
+
+    return flx_restore_values(tr, obj, snapshot.values) || dirty; // Throws
+}
+
+
 // ============================ ServerFile ============================
 
 class ServerFile : public util::RefCountBase {
@@ -547,10 +2024,20 @@ public:
 
     Session* get_identified_session(file_ident_type client_file_ident) noexcept;
 
+    FLXVisibleObjects get_flx_visible_objects(file_ident_type client_file_ident);
+    void set_flx_visible_objects(file_ident_type client_file_ident, FLXVisibleObjects visible_objects);
+
+    // Run gc_flx_visible_state() at most once over the lifetime of this
+    // ServerFile (i.e. once per activation / server run), triggered lazily the
+    // first time a Flexible Sync client binds. A GC failure is logged but never
+    // propagated, so it cannot disrupt a client session.
+    void gc_flx_visible_state_once() noexcept;
+
     bool can_add_changesets_from_downstream() const noexcept;
     void add_changesets_from_downstream(file_ident_type client_file_ident, UploadCursor upload_progress,
                                         version_type locked_server_version, const UploadChangeset*,
-                                        std::size_t num_changesets);
+                                        std::size_t num_changesets, bool is_flx_sync, std::string user_identity,
+                                        bool user_is_admin);
 
     // bootstrap_client_session calls the function of same name in server_history
     // but corrects the upload_progress with information from pending
@@ -585,6 +2072,25 @@ private:
     // A map of the sessions whose client file identifier is known, i.e, those
     // for which an IDENT message has been received.
     std::map<file_ident_type, Session*> m_identified_sessions;
+
+    // FLX sessions need the old visible set after reconnect to know which
+    // objects must be erased from the local filtered file.
+    std::map<file_ident_type, FLXVisibleObjects> m_flx_visible_objects_by_client_file;
+
+    FLXVisibleObjects load_flx_visible_objects(file_ident_type client_file_ident);
+    void persist_flx_visible_objects(file_ident_type client_file_ident, const FLXVisibleObjects& visible_objects);
+
+    // Read the client file identifiers currently present in the persisted FLX
+    // visible-state metadata table.
+    std::vector<file_ident_type> load_flx_visible_state_idents();
+
+    // Delete persisted FLX visible-state rows (and their in-memory cache
+    // entries) belonging to client files that have expired or never existed, so
+    // this per-client metadata does not accumulate without bound. Only removes
+    // rows for clients that are gone for good; a merely disconnected client
+    // keeps its state so reconnects stay correct.
+    void gc_flx_visible_state();
+    bool m_flx_visible_state_gc_done = false;
 
     // Used when a file used as partial view wants to allocate a client file
     // identifier from the reference Barq.
@@ -694,6 +2200,9 @@ private:
     // NOTE: These functions are executed by the worker thread
     void worker_allocate_file_identifiers();
     bool worker_integrate_changes_from_downstream(WorkerState&);
+    std::vector<FLXCompensationCandidate> worker_prepare_flx_compensation_candidates(DBRef);
+    bool worker_apply_flx_compensating_writes(ServerHistory&, DBRef,
+                                              const std::vector<FLXCompensationCandidate>&);
     ServerHistory& get_client_file_history(WorkerState& state, std::unique_ptr<ServerHistory>& hist_ptr,
                                            DBRef& sg_ptr);
     ServerHistory& get_reference_file_history(WorkerState& state);
@@ -1178,7 +2687,8 @@ public:
     SyncConnection(ServerImpl& serv, std::int_fast64_t id, std::unique_ptr<network::Socket>&& socket,
                    std::unique_ptr<network::ssl::Stream>&& ssl_stream,
                    std::unique_ptr<network::ReadAheadBuffer>&& read_ahead_buffer, int client_protocol_version,
-                   std::string client_user_agent, std::string remote_endpoint, std::string barq_request_id)
+                   SyncServerMode sync_server_mode, std::string client_user_agent, std::string remote_endpoint,
+                   std::string barq_request_id)
         : logger_ptr{std::make_shared<util::PrefixLogger>(util::LogCategory::server, make_logger_prefix(id),
                                                           serv.logger_ptr)} // Throws
         , logger{*logger_ptr}
@@ -1189,6 +2699,7 @@ public:
         , m_read_ahead_buffer{std::move(read_ahead_buffer)}
         , m_websocket{*this}
         , m_client_protocol_version{client_protocol_version}
+        , m_sync_server_mode{sync_server_mode}
         , m_client_user_agent{std::move(client_user_agent)}
         , m_remote_endpoint{std::move(remote_endpoint)}
         , m_barq_request_id{std::move(barq_request_id)}
@@ -1222,6 +2733,11 @@ public:
     int get_client_protocol_version()
     {
         return m_client_protocol_version;
+    }
+
+    bool is_flx_sync_connection() const noexcept
+    {
+        return m_sync_server_mode == SyncServerMode::FLX;
     }
 
     const std::string& get_client_user_agent() const noexcept
@@ -1403,6 +2919,13 @@ public:
                                version_type scan_client_version, version_type latest_server_version,
                                salt_type latest_server_version_salt);
 
+    void receive_ident_message(session_ident_type, file_ident_type client_file_ident,
+                               salt_type client_file_ident_salt, version_type scan_server_version,
+                               version_type scan_client_version, version_type latest_server_version,
+                               salt_type latest_server_version_salt, int64_t query_version, std::string query_body);
+
+    void receive_query_message(session_ident_type, int64_t query_version, std::string query_body);
+
     void receive_upload_message(session_ident_type, version_type progress_client_version,
                                 version_type progress_server_version, version_type locked_server_version,
                                 const UploadChangesets&);
@@ -1438,6 +2961,8 @@ private:
 
     // The protocol version in use by the connected client.
     const int m_client_protocol_version;
+
+    const SyncServerMode m_sync_server_mode;
 
     // The user agent description passed by the client.
     const std::string m_client_user_agent;
@@ -1740,6 +3265,7 @@ private:
     SteadyTimePoint m_last_activity_at;
     std::string m_remote_endpoint;
     int m_negotiated_protocol_version = 0;
+    SyncServerMode m_negotiated_sync_server_mode = SyncServerMode::PBS;
 
     void initiate_ssl_handshake()
     {
@@ -1836,14 +3362,24 @@ private:
                 value = *sec_websocket_protocol;
             HttpListHeaderValueParser parser{value};
             std::string_view elem;
+            bool saw_flx_protocol = false;
+            bool saw_pbs_protocol = false;
             while (parser.next(elem)) {
                 // FIXME: Use std::string_view::begins_with() in C++20.
                 const StringData protocol{elem};
                 std::string_view prefix;
-                if (protocol.begins_with(get_pbs_websocket_protocol_prefix()))
+                if (protocol.begins_with(get_flx_websocket_protocol_prefix())) {
+                    prefix = get_flx_websocket_protocol_prefix();
+                    saw_flx_protocol = true;
+                }
+                else if (protocol.begins_with(get_pbs_websocket_protocol_prefix())) {
                     prefix = get_pbs_websocket_protocol_prefix();
-                else if (protocol.begins_with(get_old_pbs_websocket_protocol_prefix()))
+                    saw_pbs_protocol = true;
+                }
+                else if (protocol.begins_with(get_old_pbs_websocket_protocol_prefix())) {
                     prefix = get_old_pbs_websocket_protocol_prefix();
+                    saw_pbs_protocol = true;
+                }
                 if (!prefix.empty()) {
                     auto parse_version = [&](std::string_view str) {
                         in.set_buffer(str.data(), str.data() + str.size());
@@ -1885,6 +3421,13 @@ private:
                              "specification of supported protocol versions"); // Throws
                 handle_400_bad_request("Protocol version negotiation failed: Missing specification "
                                        "of supported protocol versions\n"); // Throws
+                return;
+            }
+            m_negotiated_sync_server_mode = saw_flx_protocol && !saw_pbs_protocol ? SyncServerMode::FLX
+                                                                                  : SyncServerMode::PBS;
+            if (m_negotiated_sync_server_mode == SyncServerMode::FLX && !m_server.get_config().enable_flx_sync) {
+                logger.error("Protocol version negotiation failed: FLX sync is disabled"); // Throws
+                handle_400_bad_request("Protocol version negotiation failed: FLX sync is disabled\n"); // Throws
                 return;
             }
         }
@@ -1946,17 +3489,21 @@ private:
                 return;
             }
             m_negotiated_protocol_version = best_match;
-            logger.debug("Received: Sync HTTP request (negotiated_protocol_version=%1)",
-                         m_negotiated_protocol_version); // Throws
+            logger.debug("Received: Sync HTTP request (negotiated_protocol_version=%1, mode=%2)",
+                         m_negotiated_protocol_version,
+                         m_negotiated_sync_server_mode == SyncServerMode::FLX ? "FLX" : "PBS"); // Throws
             formatter.reset();
         }
 
         std::string sec_websocket_protocol_2;
         {
-            std::string_view prefix =
-                m_negotiated_protocol_version < SyncConnection::PBS_FLX_MIGRATION_PROTOCOL_VERSION
-                    ? get_old_pbs_websocket_protocol_prefix()
-                    : get_pbs_websocket_protocol_prefix();
+            std::string_view prefix = get_pbs_websocket_protocol_prefix();
+            if (m_negotiated_sync_server_mode == SyncServerMode::FLX) {
+                prefix = get_flx_websocket_protocol_prefix();
+            }
+            else if (m_negotiated_protocol_version < SyncConnection::PBS_FLX_MIGRATION_PROTOCOL_VERSION) {
+                prefix = get_old_pbs_websocket_protocol_prefix();
+            }
             std::ostringstream out;
             out.imbue(std::locale::classic());
             out << prefix << m_negotiated_protocol_version; // Throws
@@ -2011,7 +3558,8 @@ private:
             }
         }
 
-        auto handler = [protocol_version = m_negotiated_protocol_version, user_agent = std::move(user_agent),
+        auto handler = [protocol_version = m_negotiated_protocol_version,
+                        sync_server_mode = m_negotiated_sync_server_mode, user_agent = std::move(user_agent),
                         signed_access_token = std::move(signed_access_token), this](std::error_code ec) {
             // If the operation is aborted, the socket object may have been destroyed.
             if (ec != util::error::operation_aborted) {
@@ -2022,7 +3570,7 @@ private:
 
                 std::unique_ptr<SyncConnection> sync_conn = std::make_unique<SyncConnection>(
                     m_server, m_id, std::move(m_socket), std::move(m_ssl_stream), std::move(m_read_ahead_buffer),
-                    protocol_version, std::move(user_agent), std::move(m_remote_endpoint),
+                    protocol_version, sync_server_mode, std::move(user_agent), std::move(m_remote_endpoint),
                     get_barq_request_id()); // Throws
                 SyncConnection& sync_conn_ref = *sync_conn;
                 sync_conn_ref.set_signed_access_token(std::move(signed_access_token));
@@ -2337,6 +3885,24 @@ public:
             enlist_to_send();
     }
 
+    void enqueue_json_error(std::string body)
+    {
+        m_pending_json_errors.push_back(std::move(body)); // Throws
+        ensure_enlisted_to_send();
+    }
+
+    void enqueue_flx_forced_removal(FLXVisibleObject object)
+    {
+        if (!m_connection.is_flx_sync_connection()) {
+            return;
+        }
+
+        std::string visible_key = flx_visible_object_key(object.table_name, object.primary_key); // Throws
+        m_flx_visible_objects[visible_key] = std::move(object);                                  // Throws
+        m_server_file->set_flx_visible_objects(m_client_file_ident, m_flx_visible_objects);       // Throws
+        ensure_enlisted_to_send();
+    }
+
     void enlist_to_send() noexcept
     {
         m_connection.enlist_to_send(this);
@@ -2377,13 +3943,18 @@ public:
     void send_message()
     {
         if (BARQ_LIKELY(!unbind_message_received())) {
-            if (BARQ_LIKELY(!error_occurred())) {
-                if (BARQ_LIKELY(ident_message_received())) {
-                    // State is WaitForUnbind.
-                    bool relayed_alloc = (m_allocated_file_ident.ident != 0);
-                    if (BARQ_LIKELY(!relayed_alloc)) {
-                        // Send DOWNLOAD or MARK.
-                        continue_history_scan(); // Throws
+                if (BARQ_LIKELY(!error_occurred())) {
+                    if (BARQ_LIKELY(ident_message_received())) {
+                        // State is WaitForUnbind.
+                        bool relayed_alloc = (m_allocated_file_ident.ident != 0);
+                        if (BARQ_LIKELY(!relayed_alloc)) {
+                            if (!m_pending_json_errors.empty()) {
+                                send_json_error_message(); // Throws
+                                enlist_to_send();
+                                return;
+                            }
+                            // Send DOWNLOAD or MARK.
+                            continue_history_scan(); // Throws
                         // Session object may have been
                         // destroyed at this point (suicide)
                         return;
@@ -2409,17 +3980,43 @@ public:
     bool receive_bind_message(std::string path, std::string signed_user_token, bool need_client_file_ident,
                               bool is_subserver, ProtocolError& error)
     {
+        const bool is_flx_sync = m_connection.is_flx_sync_connection();
         if (logger.would_log(util::Logger::Level::info)) {
-            logger.detail("Received: BIND(server_path=%1, signed_user_token='%2', "
-                          "need_client_file_ident=%3, is_subserver=%4)",
-                          path, short_token_fmt(signed_user_token), int(need_client_file_ident),
-                          int(is_subserver)); // Throws
+            if (is_flx_sync) {
+                logger.detail("Received: BIND(flx_metadata=%1, signed_user_token='%2', "
+                              "need_client_file_ident=%3, is_subserver=%4)",
+                              path, short_token_fmt(signed_user_token), int(need_client_file_ident),
+                              int(is_subserver)); // Throws
+            }
+            else {
+                logger.detail("Received: BIND(server_path=%1, signed_user_token='%2', "
+                              "need_client_file_ident=%3, is_subserver=%4)",
+                              path, short_token_fmt(signed_user_token), int(need_client_file_ident),
+                              int(is_subserver)); // Throws
+            }
         }
 
         ServerImpl& server = m_connection.get_server();
         std::string file_path = path;   // The full server-side virtual path.
         std::string access_path = path; // The path checked against token.path.
         std::string tenant_id;
+        util::Optional<AccessToken> access_token;
+
+        if (is_flx_sync && !path.empty()) {
+            try {
+                auto metadata = nlohmann::json::parse(path);
+                if (!metadata.is_object()) {
+                    logger.error("FLX BIND rejected: metadata payload is not a JSON object"); // Throws
+                    error = ProtocolError::bad_syntax;
+                    return false;
+                }
+            }
+            catch (const nlohmann::json::exception& e) {
+                logger.error("FLX BIND rejected: bad metadata JSON: %1", e.what()); // Throws
+                error = ProtocolError::bad_syntax;
+                return false;
+            }
+        }
 
         // Authenticate the client before granting access to the file: verify the
         // signed access token, reject it if expired, and confirm it grants access
@@ -2429,7 +4026,7 @@ public:
             // the sync request, not in the BIND message body, so authenticate
             // using the token captured from the connection's HTTP handshake.
             AccessToken::ParseError parse_error = AccessToken::ParseError::none;
-            util::Optional<AccessToken> access_token =
+            access_token =
                 server.get_access_control().verify_access_token(m_connection.get_signed_access_token(), &parse_error);
             if (!access_token) {
                 logger.error("BIND rejected (path='%1'): invalid access token (parse_error=%2)", path,
@@ -2441,11 +4038,23 @@ public:
                 error = ProtocolError::permission_denied;
                 return false;
             }
+
+            if (is_flx_sync) {
+                if (!access_token->path || access_token->path->empty()) {
+                    logger.error("FLX BIND rejected (identity='%1'): access token is missing path",
+                                 access_token->identity); // Throws
+                    error = ProtocolError::permission_denied;
+                    return false;
+                }
+                file_path = *access_token->path;   // Throws
+                access_path = *access_token->path; // Throws
+            }
+
             if (server.get_access_control().uses_tenant_public_keys()) {
                 tenant_id = access_token->app_id; // Throws
-                if (!_impl::make_tenant_virtual_path(tenant_id, path, file_path, &access_path)) {
+                if (!_impl::make_tenant_virtual_path(tenant_id, access_path, file_path, &access_path)) {
                     logger.error("BIND rejected (tenant='%1', client_path='%2', identity='%3'): bad tenant path",
-                                 tenant_id, path, access_token->identity); // Throws
+                                 tenant_id, access_path, access_token->identity); // Throws
                     error = ProtocolError::illegal_barq_path;
                     return false;
                 }
@@ -2465,6 +4074,9 @@ public:
             logger.detail("BIND authenticated (path='%1', file_path='%2', tenant='%3', identity='%4')", access_path,
                           file_path, tenant_id, access_token->identity); // Throws
         }
+        BARQ_ASSERT(access_token);
+        m_user_identity = access_token->identity; // Throws
+        m_user_is_admin = server.get_access_control().is_admin(*access_token);
 
         _impl::VirtualPathComponents virt_path_components =
             _impl::parse_virtual_path(server.get_root_dir(), file_path); // Throws
@@ -2622,6 +4234,12 @@ public:
         m_server_file->identify_session(this, client_file_ident); // Throws
 
         m_client_file_ident = client_file_ident;
+        if (m_connection.is_flx_sync_connection()) {
+            // First FLX bind on this file (this server run) sweeps visible-state
+            // metadata left behind by client files that are gone for good.
+            m_server_file->gc_flx_visible_state_once();
+            m_flx_visible_objects = m_server_file->get_flx_visible_objects(client_file_ident); // Throws
+        }
         m_download_progress = download_progress;
         m_upload_threshold = upload_threshold;
         m_locked_server_version = locked_server_version;
@@ -2638,6 +4256,45 @@ public:
         // Protocol  state is now WaitForUnbind
         enlist_to_send();
         return true;
+    }
+
+    bool receive_ident_message(file_ident_type client_file_ident, salt_type client_file_ident_salt,
+                               version_type scan_server_version, version_type scan_client_version,
+                               version_type latest_server_version, salt_type latest_server_version_salt,
+                               int64_t query_version, std::string query_body, ProtocolError& error)
+    {
+        bool success = receive_ident_message(client_file_ident, client_file_ident_salt, scan_server_version,
+                                             scan_client_version, latest_server_version, latest_server_version_salt,
+                                             error); // Throws
+        if (!success) {
+            return false;
+        }
+
+        std::string query_error;
+        if (!set_flx_query(query_version, query_body, true, query_error)) { // Throws
+            send_query_error_message(static_cast<int>(ProtocolError::bad_query), query_error, query_version);
+        }
+        return true;
+    }
+
+    void receive_query_message(int64_t query_version, std::string query_body)
+    {
+        BARQ_ASSERT(!m_send_ident_message);
+        BARQ_ASSERT(ident_message_received());
+        BARQ_ASSERT(!unbind_message_received());
+
+        logger.detail("Received: QUERY(query_version=%1, query_size=%2)", query_version, query_body.size()); // Throws
+
+        std::string query_error;
+        if (!set_flx_query(query_version, query_body, false, query_error)) { // Throws
+            send_query_error_message(static_cast<int>(ProtocolError::bad_query), query_error, query_version);
+            return;
+        }
+
+        // Force a tagged DOWNLOAD for this query version even if no new server
+        // history exists. This lets the client complete the subscription state.
+        m_one_download_message_sent = false;
+        ensure_enlisted_to_send();
     }
 
     bool receive_upload_message(version_type progress_client_version, version_type progress_server_version,
@@ -2907,8 +4564,33 @@ public:
             error = ProtocolError::limits_exceeded;
             return false;
         }
-        file.add_changesets_from_downstream(m_client_file_ident, upload_progress, locked_server_version_2,
-                                            upload_changesets.data() + offset, num_changesets_to_integrate); // Throws
+        // Flexible Sync enforces per-table rules via a compensating-write pass
+        // that can only revert *object* changes. Dropping a table or column is
+        // not an object change and cannot be undone once applied, so a non-admin
+        // client must never be allowed to destroy shared schema (and the data in
+        // it) for everyone on the file. Reject the whole UPLOAD before anything
+        // is integrated. (Admins, and non-FLX / partition sync, are unaffected;
+        // additive schema changes are still allowed so clients can establish
+        // their schema on first sync.)
+        if (m_connection.is_flx_sync_connection() && !m_user_is_admin) {
+            for (std::size_t i = offset; i < upload_changesets.size(); ++i) {
+                Changeset parsed;
+                ChunkedBinaryInputStream in{upload_changesets[i].changeset};
+                sync::parse_changeset(in, parsed); // Throws
+                if (flx_changeset_has_destructive_schema_change(parsed)) {
+                    logger.error("UPLOAD rejected (path='%1', identity='%2'): Flexible Sync clients "
+                                 "may not drop tables or columns",
+                                 file.get_virt_path(), m_user_identity); // Throws
+                    error = ProtocolError::invalid_schema_change;
+                    return false;
+                }
+            }
+        }
+
+        file.add_changesets_from_downstream(
+            m_client_file_ident, upload_progress, locked_server_version_2, upload_changesets.data() + offset,
+            num_changesets_to_integrate, m_connection.is_flx_sync_connection(), m_user_identity,
+            m_user_is_admin); // Throws
 
         m_locked_server_version = locked_server_version_2;
         return true;
@@ -2966,6 +4648,17 @@ public:
         logger.detail("Received: ERROR"); // Throws
     }
 
+    void send_query_error_message(int error_code, std::string_view message, int64_t query_version)
+    {
+        logger.detail("Sending: QUERY_ERROR(error_code=%1, message_size=%2, query_version=%3)", error_code,
+                      message.size(), query_version); // Throws
+
+        ServerProtocol& protocol = get_server_protocol();
+        OutputBuffer& out = m_connection.get_output_buffer();
+        protocol.make_query_error_message(out, error_code, message, m_session_ident, query_version); // Throws
+        m_connection.initiate_write_output_buffer();                                                // Throws
+    }
+
 private:
     SyncConnection& m_connection;
 
@@ -2994,6 +4687,109 @@ private:
 
     // Zero until the session receives an IDENT message from the client.
     file_ident_type m_client_file_ident = 0;
+
+    std::string m_user_identity;
+    bool m_user_is_admin = false;
+
+    struct FLXCompiledQuery {
+        std::unique_ptr<Query> query;
+    };
+
+    struct FLXCompiledTableQuery {
+        const Server::Config::FLXRule* rule = nullptr;
+        std::vector<FLXCompiledQuery> queries;
+    };
+
+    using FLXCompiledQueries = std::map<std::string, FLXCompiledTableQuery>;
+
+    struct FLXBootstrapState {
+        bool prepared = false;
+        version_type server_version = 0;
+        TransactionRef read_transaction;
+        std::vector<FLXVisibleObject> objects;
+        std::vector<FLXVisibleObject> removals;
+        FLXVisibleObjects final_visible_objects;
+        std::size_t object_index = 0;
+        std::size_t removal_index = 0;
+
+        void reset()
+        {
+            prepared = false;
+            server_version = 0;
+            read_transaction.reset();
+            objects.clear();
+            removals.clear();
+            final_visible_objects.clear();
+            object_index = 0;
+            removal_index = 0;
+        }
+    };
+
+    struct FLXIncrementalObject {
+        std::string visible_key;
+        FLXTouchedObject touched_object;
+    };
+
+    struct FLXIncrementalState {
+        bool prepared = false;
+        bool emitted_more_to_come = false;
+        DownloadCursor download_progress = {0, 0};
+        UploadCursor upload_progress = {0, 0};
+        TransactionRef read_transaction;
+        std::vector<FLXIncrementalObject> objects;
+        FLXCompiledQueries compiled_queries;
+        std::size_t object_index = 0;
+
+        void reset()
+        {
+            prepared = false;
+            emitted_more_to_come = false;
+            download_progress = {0, 0};
+            upload_progress = {0, 0};
+            read_transaction.reset();
+            objects.clear();
+            compiled_queries.clear();
+            object_index = 0;
+        }
+    };
+
+    class FLXDownloadHistoryEntryHandler : public ServerHistory::HistoryEntryHandler {
+    public:
+        FLXTouchedObjects touched_objects;
+        std::size_t accum_original_size = 0;
+        std::size_t accum_compacted_size = 0;
+
+        FLXDownloadHistoryEntryHandler(Session& session) noexcept
+            : m_session{session}
+        {
+        }
+
+        void handle(version_type, const HistoryEntry& entry, size_t original_size) override
+        {
+            if (entry.origin_file_ident == m_session.m_client_file_ident) {
+                return;
+            }
+
+            Changeset changeset;
+            ChunkedBinaryInputStream in{entry.changeset};
+            sync::parse_changeset(in, changeset); // Throws
+            m_session.collect_flx_touched_objects(changeset, touched_objects);
+            accum_original_size += original_size;
+            accum_compacted_size += entry.changeset.size();
+        }
+
+    private:
+        Session& m_session;
+    };
+
+    int64_t m_flx_query_version = 0;
+    std::map<std::string, std::string> m_flx_queries;
+    bool m_flx_bootstrap_pending = false;
+    bool m_flx_bootstrap_send_all_objects = true;
+    FLXVisibleObjects m_flx_visible_objects;
+    FLXBootstrapState m_flx_bootstrap_state;
+    FLXIncrementalState m_flx_incremental_state;
+    std::deque<std::string> m_pending_json_errors;
 
     // Zero until initiate_deactivation() is called.
     ProtocolError m_error_code = {};
@@ -3038,6 +4834,1097 @@ private:
     /// download progress is up to date.
     bool m_one_download_message_sent = false;
 
+    const Server::Config::FLXRule* get_flx_rule(const std::string& table_name) const noexcept
+    {
+        const Server::Config& config = m_connection.get_server().get_config();
+        if (auto rule = find_flx_rule(config.flx_rules, table_name)) {
+            return rule;
+        }
+        return find_flx_rule(config.flx_rules, std::string(Group::table_name_to_class_name(table_name)));
+    }
+
+    ConstTableRef get_flx_table(const Transaction& tr, const std::string& name,
+                                std::string* actual_name = nullptr) const
+    {
+        if (ConstTableRef table = tr.get_table(name)) {
+            if (actual_name) {
+                *actual_name = name; // Throws
+            }
+            return table;
+        }
+
+        Group::TableNameBuffer buffer;
+        StringData table_name = Group::class_name_to_table_name(name, buffer);
+        ConstTableRef table = tr.get_table(table_name);
+        if (table && actual_name) {
+            *actual_name = std::string(table_name); // Throws
+        }
+        return table;
+    }
+
+    bool validate_flx_rule_for_existing_table(const Server::Config::FLXRule* rule, const std::string& table_name,
+                                              ConstTableRef table, std::string& error) const
+    {
+        if (!rule) {
+            return true; // Default deny: the effective result is empty.
+        }
+
+        if (rule->mode == Server::Config::FLXRule::Mode::Owner) {
+            ColKey owner_col = table->get_column_key(rule->owner_field);
+            if (!owner_col) {
+                error = util::format("FLX owner rule for '%1' names missing owner field '%2'", table_name,
+                                     rule->owner_field);
+                return false;
+            }
+            if (DataType(owner_col.get_type()) != type_String) {
+                error = util::format("FLX owner rule for '%1' requires string owner field '%2'", table_name,
+                                     rule->owner_field);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool object_matches_flx_rule(const Server::Config::FLXRule* rule, ConstTableRef table, const Obj& obj) const
+    {
+        if (!rule) {
+            return false;
+        }
+        if (m_user_is_admin) {
+            return true;
+        }
+        if (rule->mode == Server::Config::FLXRule::Mode::PublicReadOnly) {
+            return true;
+        }
+
+        BARQ_ASSERT(rule->mode == Server::Config::FLXRule::Mode::Owner);
+        ColKey owner_col = table->get_column_key(rule->owner_field);
+        // The owner column must be a string. This mirrors the guard in
+        // flx_object_owner_matches() on the write path: `set_flx_query` validates
+        // the owner type when the table exists at subscription time, but the
+        // table may have been created (or the column re-typed) afterwards, so we
+        // must not call Mixed::get<StringData>() on a non-string here.
+        if (!owner_col || obj.is_null(owner_col) || DataType(owner_col.get_type()) != type_String) {
+            return false;
+        }
+        return obj.get_any(owner_col).get<StringData>() == m_user_identity;
+    }
+
+    std::string flx_primary_key_part(const FLXPrimaryKey& primary_key) const
+    {
+        switch (primary_key.type) {
+            case FLXPrimaryKey::Type::Null:
+                return "null";
+            case FLXPrimaryKey::Type::Int:
+                return util::format("int:%1", primary_key.int_value);
+            case FLXPrimaryKey::Type::String:
+                return util::format("string:%1:%2", primary_key.string_value.size(), primary_key.string_value);
+            case FLXPrimaryKey::Type::GlobalKey:
+                return util::format("global:%1", primary_key.global_key.to_string());
+            case FLXPrimaryKey::Type::ObjectId:
+                return util::format("objectid:%1", primary_key.object_id.to_string());
+            case FLXPrimaryKey::Type::UUID:
+                return util::format("uuid:%1", primary_key.uuid.to_string());
+        }
+        BARQ_UNREACHABLE();
+    }
+
+    std::string flx_visible_object_key(const std::string& table_name, const FLXPrimaryKey& primary_key) const
+    {
+        return table_name + "\t" + flx_primary_key_part(primary_key); // Throws
+    }
+
+    FLXPrimaryKey flx_primary_key_from_object(ConstTableRef table, const Obj& obj) const
+    {
+        return ::flx_primary_key_from_object(table, obj); // Throws
+    }
+
+    FLXPrimaryKey flx_primary_key_from_instruction(const Changeset& changeset,
+                                                   const Instruction::PrimaryKey& instruction_key) const
+    {
+        return mpark::visit(util::overload{
+                                [](mpark::monostate) {
+                                    return FLXPrimaryKey{};
+                                },
+                                [](int64_t value) {
+                                    FLXPrimaryKey primary_key;
+                                    primary_key.type = FLXPrimaryKey::Type::Int;
+                                    primary_key.int_value = value;
+                                    return primary_key;
+                                },
+                                [](GlobalKey value) {
+                                    FLXPrimaryKey primary_key;
+                                    primary_key.type = FLXPrimaryKey::Type::GlobalKey;
+                                    primary_key.global_key = value;
+                                    return primary_key;
+                                },
+                                [&](InternString value) {
+                                    FLXPrimaryKey primary_key;
+                                    primary_key.type = FLXPrimaryKey::Type::String;
+                                    primary_key.string_value = std::string(changeset.get_string(value)); // Throws
+                                    return primary_key;
+                                },
+                                [](ObjectId value) {
+                                    FLXPrimaryKey primary_key;
+                                    primary_key.type = FLXPrimaryKey::Type::ObjectId;
+                                    primary_key.object_id = value;
+                                    return primary_key;
+                                },
+                                [](UUID value) {
+                                    FLXPrimaryKey primary_key;
+                                    primary_key.type = FLXPrimaryKey::Type::UUID;
+                                    primary_key.uuid = value;
+                                    return primary_key;
+                                },
+                            },
+                            instruction_key);
+    }
+
+    Instruction::PrimaryKey flx_primary_key_to_instruction(Changeset& changeset,
+                                                           const FLXPrimaryKey& primary_key) const
+    {
+        switch (primary_key.type) {
+            case FLXPrimaryKey::Type::Null:
+                return mpark::monostate{};
+            case FLXPrimaryKey::Type::Int:
+                return primary_key.int_value;
+            case FLXPrimaryKey::Type::String:
+                return changeset.intern_string(primary_key.string_value);
+            case FLXPrimaryKey::Type::GlobalKey:
+                return primary_key.global_key;
+            case FLXPrimaryKey::Type::ObjectId:
+                return primary_key.object_id;
+            case FLXPrimaryKey::Type::UUID:
+                return primary_key.uuid;
+        }
+        BARQ_UNREACHABLE();
+    }
+
+    Obj flx_find_object(ConstTableRef table, const FLXPrimaryKey& primary_key) const
+    {
+        ColKey pk_col = table->get_primary_key_column();
+        ObjKey obj_key;
+        if (!pk_col) {
+            if (primary_key.type != FLXPrimaryKey::Type::GlobalKey) {
+                return {};
+            }
+            obj_key = table->get_objkey(primary_key.global_key);
+        }
+        else {
+            switch (primary_key.type) {
+                case FLXPrimaryKey::Type::Null:
+                    obj_key = table->find_primary_key(Mixed{});
+                    break;
+                case FLXPrimaryKey::Type::Int:
+                    obj_key = table->find_primary_key(Mixed{primary_key.int_value});
+                    break;
+                case FLXPrimaryKey::Type::String:
+                    obj_key = table->find_primary_key(Mixed{StringData{primary_key.string_value}});
+                    break;
+                case FLXPrimaryKey::Type::ObjectId:
+                    obj_key = table->find_primary_key(Mixed{primary_key.object_id});
+                    break;
+                case FLXPrimaryKey::Type::UUID:
+                    obj_key = table->find_primary_key(Mixed{primary_key.uuid});
+                    break;
+                case FLXPrimaryKey::Type::GlobalKey:
+                    return {};
+            }
+        }
+        if (!obj_key) {
+            return {};
+        }
+        return table->try_get_object(obj_key);
+    }
+
+    FLXVisibleObject make_flx_visible_object(const std::string& table_name, ConstTableRef table, const Obj& obj) const
+    {
+        FLXVisibleObject visible_object;
+        visible_object.table_name = table_name; // Throws
+        visible_object.primary_key = flx_primary_key_from_object(table, obj);
+        return visible_object;
+    }
+
+    void append_flx_link_dependency(ConstTableRef target_table, ObjKey target_key, Transaction& tr,
+                                    std::set<std::string>& visiting, std::set<std::string>& emitted)
+    {
+        Obj target = target_table ? target_table->try_get_object(target_key) : Obj{}; // Throws
+        if (!target) {
+            return;
+        }
+        FLXVisibleObject target_object =
+            make_flx_visible_object(std::string(target_table->get_name()), target_table, target); // Throws
+        std::string target_key_string =
+            flx_visible_object_key(target_object.table_name, target_object.primary_key); // Throws
+        auto target_visible = m_flx_bootstrap_state.final_visible_objects.find(target_key_string);
+        if (target_visible == m_flx_bootstrap_state.final_visible_objects.end()) {
+            return;
+        }
+        append_flx_bootstrap_object_with_dependencies(target_key_string, target_visible->second, tr, visiting,
+                                                      emitted); // Throws
+    }
+
+    void append_flx_mixed_link_dependency(ConstTableRef context_table, Mixed value, Transaction& tr,
+                                          std::set<std::string>& visiting, std::set<std::string>& emitted)
+    {
+        if (value.is_null() || !value.is_type(type_TypedLink)) {
+            return;
+        }
+
+        ObjLink link = value.get<ObjLink>();
+        ConstTableRef target_table = flx_typed_link_target_table(context_table, link); // Throws
+        if (!target_table) {
+            return;
+        }
+        append_flx_link_dependency(target_table, link.get_obj_key(), tr, visiting, emitted); // Throws
+    }
+
+    void append_flx_mixed_column_link_dependencies(ConstTableRef table, const Obj& obj, ColKey col_key,
+                                                   Transaction& tr, std::set<std::string>& visiting,
+                                                   std::set<std::string>& emitted)
+    {
+        if (DataType(col_key.get_type()) != type_Mixed ||
+            !flx_column_current_value_can_bootstrap(table, obj, col_key)) {
+            return;
+        }
+
+        if (!col_key.is_collection()) {
+            append_flx_mixed_link_dependency(table, obj.get_any(col_key), tr, visiting, emitted); // Throws
+            return;
+        }
+        if (col_key.is_list()) {
+            auto list = obj.get_listbase_ptr(col_key); // Throws
+            for (size_t i = 0; i < list->size(); ++i) {
+                append_flx_mixed_link_dependency(table, list->get_any(i), tr, visiting, emitted); // Throws
+            }
+            return;
+        }
+        if (col_key.is_set()) {
+            auto set = obj.get_setbase_ptr(col_key); // Throws
+            for (size_t i = 0; i < set->size(); ++i) {
+                append_flx_mixed_link_dependency(table, set->get_any(i), tr, visiting, emitted); // Throws
+            }
+            return;
+        }
+        if (col_key.is_dictionary()) {
+            auto dictionary = obj.get_dictionary(col_key); // Throws
+            for (size_t i = 0; i < dictionary.size(); ++i) {
+                append_flx_mixed_link_dependency(table, dictionary.get_any(i), tr, visiting, emitted); // Throws
+            }
+        }
+    }
+
+    void append_flx_bootstrap_object_with_dependencies(const std::string& visible_key,
+                                                       const FLXVisibleObject& visible_object, Transaction& tr,
+                                                       std::set<std::string>& visiting,
+                                                       std::set<std::string>& emitted)
+    {
+        if (emitted.count(visible_key) != 0) {
+            return;
+        }
+        if (visiting.count(visible_key) != 0) {
+            return;
+        }
+        if (!m_flx_bootstrap_send_all_objects && m_flx_visible_objects.count(visible_key) != 0) {
+            emitted.insert(visible_key); // Throws
+            return;
+        }
+
+        visiting.insert(visible_key); // Throws
+        ConstTableRef table = tr.get_table(visible_object.table_name);
+        Obj obj = table ? flx_find_object(table, visible_object.primary_key) : Obj{}; // Throws
+        if (obj) {
+            for (ColKey col_key : table->get_column_keys()) {
+                if (DataType(col_key.get_type()) == type_Mixed) {
+                    append_flx_mixed_column_link_dependencies(table, obj, col_key, tr, visiting, emitted); // Throws
+                    continue;
+                }
+                if (!flx_column_has_supported_link_target(table, col_key)) {
+                    continue;
+                }
+                ConstTableRef target_table = table->get_link_target(col_key);
+                if (flx_column_can_bootstrap_link_value(table, col_key)) {
+                    if (!obj.is_null(col_key)) {
+                        append_flx_link_dependency(target_table, obj.get<ObjKey>(col_key), tr, visiting,
+                                                   emitted); // Throws
+                    }
+                }
+                else if (col_key.is_list()) {
+                    auto list = obj.get_linklist(col_key); // Throws
+                    for (size_t i = 0; i < list.size(); ++i) {
+                        append_flx_link_dependency(target_table, list.get(i), tr, visiting, emitted); // Throws
+                    }
+                }
+                else if (col_key.is_set()) {
+                    auto set = obj.get_linkset(col_key); // Throws
+                    for (size_t i = 0; i < set.size(); ++i) {
+                        append_flx_link_dependency(target_table, set.get(i), tr, visiting, emitted); // Throws
+                    }
+                }
+                else if (col_key.is_dictionary()) {
+                    auto dictionary = obj.get_dictionary(col_key); // Throws
+                    for (size_t i = 0; i < dictionary.size(); ++i) {
+                        append_flx_link_dependency(target_table, dictionary.get_any(i).get<ObjKey>(), tr, visiting,
+                                                   emitted); // Throws
+                    }
+                }
+            }
+        }
+
+        visiting.erase(visible_key);
+        emitted.insert(visible_key);                            // Throws
+        m_flx_bootstrap_state.objects.push_back(visible_object); // Throws
+    }
+
+    void flx_add_update(Changeset& changeset, InternString class_name, const Instruction::PrimaryKey& pk,
+                        InternString field, const Instruction::Path& path, Instruction::Payload payload)
+    {
+        Instruction::Update update;
+        update.table = class_name;
+        update.object = pk;
+        update.field = field;
+        update.path = path;
+        update.value = payload;
+        update.is_default = false;
+        changeset.push_back(update);
+    }
+
+    void flx_add_object(Changeset& changeset, ConstTableRef table, const Obj& obj)
+    {
+        InternString class_name = flx_class_name(changeset, table->get_name());
+        Instruction::PrimaryKey pk = flx_primary_key(changeset, table, obj);
+
+        Instruction::CreateObject create;
+        create.table = class_name;
+        create.object = pk;
+        changeset.push_back(create);
+
+        ColKey pk_col = table->get_primary_key_column();
+        for (ColKey col_key : table->get_column_keys()) {
+            if (col_key == pk_col || !flx_column_can_bootstrap_value(table, col_key) ||
+                !flx_column_current_value_can_bootstrap(table, obj, col_key)) {
+                continue;
+            }
+
+            InternString field = changeset.intern_string(table->get_column_name(col_key));
+            if (flx_column_can_bootstrap_list_value(table, col_key)) {
+                flx_add_list(changeset, class_name, pk, field, obj, col_key); // Throws
+            }
+            else if (flx_column_can_bootstrap_set_value(table, col_key)) {
+                flx_add_set(changeset, class_name, pk, field, obj, col_key); // Throws
+            }
+            else if (flx_column_can_bootstrap_dictionary_value(table, col_key)) {
+                flx_add_dictionary(changeset, class_name, pk, field, obj, col_key); // Throws
+            }
+            else if (flx_column_can_bootstrap_embedded_object_value(table, col_key)) {
+                flx_add_embedded_object(changeset, class_name, pk, field, obj, col_key); // Throws
+            }
+            else if (flx_column_can_bootstrap_link_value(table, col_key)) {
+                Instruction::Path path;
+                flx_add_update(changeset, class_name, pk, field, path, flx_link_payload(changeset, table, obj, col_key));
+            }
+            else {
+                Instruction::Path path;
+                flx_add_update(changeset, class_name, pk, field, path, flx_payload(changeset, table, obj.get_any(col_key)));
+            }
+        }
+    }
+
+    void flx_add_embedded_values(Changeset& changeset, InternString class_name, const Instruction::PrimaryKey& pk,
+                                 InternString field, const Obj& obj, ConstTableRef table, Instruction::Path path)
+    {
+        ColKey pk_col = table->get_primary_key_column();
+        for (ColKey col_key : table->get_column_keys()) {
+            if (col_key == pk_col || !flx_column_can_bootstrap_value(table, col_key) ||
+                !flx_column_current_value_can_bootstrap(table, obj, col_key)) {
+                continue;
+            }
+
+            Instruction::Path child_path = path;
+            child_path.push_back(changeset.intern_string(table->get_column_name(col_key)));
+            if (flx_column_can_bootstrap_list_value(table, col_key)) {
+                flx_add_list(changeset, class_name, pk, field, obj, col_key, child_path); // Throws
+            }
+            else if (flx_column_can_bootstrap_set_value(table, col_key)) {
+                flx_add_set(changeset, class_name, pk, field, obj, col_key, child_path); // Throws
+            }
+            else if (flx_column_can_bootstrap_dictionary_value(table, col_key)) {
+                flx_add_dictionary(changeset, class_name, pk, field, obj, col_key, child_path); // Throws
+            }
+            else if (flx_column_can_bootstrap_embedded_object_value(table, col_key)) {
+                flx_add_embedded_object(changeset, class_name, pk, field, obj, col_key, child_path); // Throws
+            }
+            else if (flx_column_can_bootstrap_link_value(table, col_key)) {
+                flx_add_update(changeset, class_name, pk, field, child_path,
+                               flx_link_payload(changeset, table, obj, col_key)); // Throws
+            }
+            else {
+                flx_add_update(changeset, class_name, pk, field, child_path,
+                               flx_payload(changeset, table, obj.get_any(col_key))); // Throws
+            }
+        }
+    }
+
+    void flx_add_embedded_object(Changeset& changeset, InternString class_name, const Instruction::PrimaryKey& pk,
+                                 InternString field, const Obj& obj, ColKey col_key, Instruction::Path path = {})
+    {
+        if (obj.is_null(col_key)) {
+            flx_add_update(changeset, class_name, pk, field, path, Instruction::Payload{});
+            return;
+        }
+
+        flx_add_update(changeset, class_name, pk, field, path,
+                       Instruction::Payload{Instruction::Payload::ObjectValue{}});
+        ConstTableRef target_table = obj.get_table()->get_link_target(col_key);
+        Obj embedded = obj.get_linked_object(col_key); // Throws
+        if (target_table && embedded) {
+            flx_add_embedded_values(changeset, class_name, pk, field, embedded, target_table, path); // Throws
+        }
+    }
+
+    void flx_add_dictionary(Changeset& changeset, InternString class_name, const Instruction::PrimaryKey& pk,
+                            InternString field, const Obj& obj, ColKey col_key, Instruction::Path path = {})
+    {
+        auto dictionary = obj.get_dictionary(col_key); // Throws
+
+        Instruction::Clear clear;
+        clear.table = class_name;
+        clear.object = pk;
+        clear.field = field;
+        clear.path = path;
+        clear.collection_type = Instruction::CollectionType::Dictionary;
+        changeset.push_back(clear);
+
+        if (flx_column_can_bootstrap_embedded_dictionary_value(obj.get_table(), col_key)) {
+            ConstTableRef target_table = obj.get_table()->get_link_target(col_key);
+            for (uint32_t i = 0; i < dictionary.size(); ++i) {
+                std::string key = std::string(dictionary.get_key(i).get_string()); // Throws
+                Instruction::Path item_path = path;
+                item_path.push_back(changeset.intern_string(key));
+                flx_add_update(changeset, class_name, pk, field, item_path,
+                               Instruction::Payload{Instruction::Payload::ObjectValue{}});
+
+                Obj embedded = dictionary.get_object(StringData{key}); // Throws
+                if (target_table && embedded) {
+                    flx_add_embedded_values(changeset, class_name, pk, field, embedded, target_table,
+                                            item_path); // Throws
+                }
+            }
+            return;
+        }
+
+        if (flx_column_can_bootstrap_link_collection_value(obj.get_table(), col_key)) {
+            ConstTableRef target_table = obj.get_table()->get_link_target(col_key);
+            for (uint32_t i = 0; i < dictionary.size(); ++i) {
+                Instruction::Update update;
+                update.table = class_name;
+                update.object = pk;
+                update.field = field;
+                update.path = path;
+                update.path.push_back(changeset.intern_string(dictionary.get_key(i).get_string()));
+                update.value = flx_link_payload(changeset, target_table, dictionary.get_any(i).get<ObjKey>()); // Throws
+                update.is_default = false;
+                changeset.push_back(update);
+            }
+            return;
+        }
+
+        for (uint32_t i = 0; i < dictionary.size(); ++i) {
+            Instruction::Update update;
+            update.table = class_name;
+            update.object = pk;
+            update.field = field;
+            update.path = path;
+            update.path.push_back(changeset.intern_string(dictionary.get_key(i).get_string()));
+            update.value = flx_payload(changeset, obj.get_table(), dictionary.get_any(i)); // Throws
+            update.is_default = false;
+            changeset.push_back(update);
+        }
+    }
+
+    void flx_add_set(Changeset& changeset, InternString class_name, const Instruction::PrimaryKey& pk,
+                     InternString field, const Obj& obj, ColKey col_key, Instruction::Path path = {})
+    {
+        auto set = obj.get_setbase_ptr(col_key); // Throws
+
+        Instruction::Clear clear;
+        clear.table = class_name;
+        clear.object = pk;
+        clear.field = field;
+        clear.path = path;
+        clear.collection_type = Instruction::CollectionType::Set;
+        changeset.push_back(clear);
+
+        if (flx_column_can_bootstrap_link_collection_value(obj.get_table(), col_key)) {
+            ConstTableRef target_table = obj.get_table()->get_link_target(col_key);
+            auto link_set = obj.get_linkset(col_key); // Throws
+            for (uint32_t i = 0; i < link_set.size(); ++i) {
+                Instruction::SetInsert insert;
+                insert.table = class_name;
+                insert.object = pk;
+                insert.field = field;
+                insert.path = path;
+                insert.value = flx_link_payload(changeset, target_table, link_set.get(i)); // Throws
+                changeset.push_back(insert);
+            }
+            return;
+        }
+
+        for (uint32_t i = 0; i < set->size(); ++i) {
+            Instruction::SetInsert insert;
+            insert.table = class_name;
+            insert.object = pk;
+            insert.field = field;
+            insert.path = path;
+            insert.value = flx_payload(changeset, obj.get_table(), set->get_any(i)); // Throws
+            changeset.push_back(insert);
+        }
+    }
+
+    void flx_add_list(Changeset& changeset, InternString class_name, const Instruction::PrimaryKey& pk,
+                      InternString field, const Obj& obj, ColKey col_key, Instruction::Path path = {})
+    {
+        auto list = obj.get_listbase_ptr(col_key); // Throws
+
+        Instruction::Clear clear;
+        clear.table = class_name;
+        clear.object = pk;
+        clear.field = field;
+        clear.path = path;
+        clear.collection_type = Instruction::CollectionType::List;
+        changeset.push_back(clear);
+
+        if (flx_column_can_bootstrap_embedded_list_value(obj.get_table(), col_key)) {
+            ConstTableRef target_table = obj.get_table()->get_link_target(col_key);
+            auto link_list = obj.get_linklist(col_key); // Throws
+            for (uint32_t i = 0; i < link_list.size(); ++i) {
+                Instruction::Path item_path = path;
+                item_path.push_back(i);
+                Instruction::ArrayInsert insert;
+                insert.table = class_name;
+                insert.object = pk;
+                insert.field = field;
+                insert.path = item_path;
+                insert.value = Instruction::Payload{Instruction::Payload::ObjectValue{}};
+                insert.prior_size = i;
+                changeset.push_back(insert);
+
+                Obj embedded = link_list.get_object(i); // Throws
+                if (target_table && embedded) {
+                    flx_add_embedded_values(changeset, class_name, pk, field, embedded, target_table,
+                                            item_path); // Throws
+                }
+            }
+            return;
+        }
+
+        if (flx_column_can_bootstrap_link_collection_value(obj.get_table(), col_key)) {
+            ConstTableRef target_table = obj.get_table()->get_link_target(col_key);
+            auto link_list = obj.get_linklist(col_key); // Throws
+            for (uint32_t i = 0; i < link_list.size(); ++i) {
+                Instruction::ArrayInsert insert;
+                insert.table = class_name;
+                insert.object = pk;
+                insert.field = field;
+                insert.path = path;
+                insert.path.push_back(i);
+                insert.value = flx_link_payload(changeset, target_table, link_list.get(i)); // Throws
+                insert.prior_size = i;
+                changeset.push_back(insert);
+            }
+            return;
+        }
+
+        for (uint32_t i = 0; i < list->size(); ++i) {
+            Instruction::ArrayInsert insert;
+            insert.table = class_name;
+            insert.object = pk;
+            insert.field = field;
+            insert.path = path;
+            insert.path.push_back(i);
+            insert.value = flx_payload(changeset, obj.get_table(), list->get_any(i)); // Throws
+            insert.prior_size = i;
+            changeset.push_back(insert);
+        }
+    }
+
+    void flx_add_erase_object(Changeset& changeset, const FLXVisibleObject& visible_object)
+    {
+        Instruction::EraseObject erase;
+        erase.table = flx_class_name(changeset, visible_object.table_name);
+        erase.object = flx_primary_key_to_instruction(changeset, visible_object.primary_key);
+        changeset.push_back(erase);
+    }
+
+    std::string flx_table_name_from_instruction(const Changeset& changeset, InternString class_name) const
+    {
+        Group::TableNameBuffer buffer;
+        StringData table_name = Group::class_name_to_table_name(changeset.get_string(class_name), buffer);
+        return std::string(table_name); // Throws
+    }
+
+    void collect_flx_touched_instruction(const Changeset& changeset, const Instruction& instruction,
+                                         FLXTouchedObjects& touched_objects) const
+    {
+        if (instruction.is_vector()) {
+            for (std::size_t i = 0; i < instruction.size(); ++i) {
+                collect_flx_touched_instruction(changeset, instruction.at(i), touched_objects); // Throws
+            }
+            return;
+        }
+
+        const Instruction::ObjectInstruction* object_instruction =
+            instruction.get_if<Instruction::ObjectInstruction>();
+        if (!object_instruction) {
+            return;
+        }
+
+        std::string table_name = flx_table_name_from_instruction(changeset, object_instruction->table); // Throws
+        FLXPrimaryKey primary_key = flx_primary_key_from_instruction(changeset, object_instruction->object); // Throws
+        std::string key = flx_visible_object_key(table_name, primary_key); // Throws
+        touched_objects[key] = FLXTouchedObject{std::move(table_name), std::move(primary_key)}; // Throws
+    }
+
+    void collect_flx_touched_objects(const Changeset& changeset, FLXTouchedObjects& touched_objects) const
+    {
+        for (auto it = changeset.begin(); it != changeset.end(); ++it) {
+            if (const Instruction* instruction = *it) {
+                collect_flx_touched_instruction(changeset, *instruction, touched_objects); // Throws
+            }
+        }
+    }
+
+    FLXCompiledQueries compile_flx_queries(const Transaction& tr) const
+    {
+        FLXCompiledQueries compiled_queries;
+        for (const auto& [subscription_table_name, query_string] : m_flx_queries) {
+            std::string actual_table_name;
+            ConstTableRef subscription_table = get_flx_table(tr, subscription_table_name, &actual_table_name);
+            if (!subscription_table || subscription_table->is_embedded() || subscription_table->is_asymmetric()) {
+                continue;
+            }
+
+            const Server::Config::FLXRule* rule = get_flx_rule(actual_table_name);
+            if (!rule) {
+                continue; // Default deny.
+            }
+
+            FLXCompiledQuery compiled_query;
+            if (!flx_query_is_match_all(query_string)) {
+                Query query = subscription_table->query(query_string); // Throws; validated before storing.
+                query.find();                                         // Throws; initializes parser-built query nodes.
+                compiled_query.query = std::make_unique<Query>(std::move(query)); // Throws
+            }
+
+            auto& compiled_table = compiled_queries[actual_table_name]; // Throws
+            compiled_table.rule = rule;
+            compiled_table.queries.push_back(std::move(compiled_query)); // Throws
+        }
+        return compiled_queries;
+    }
+
+    bool object_matches_flx_compiled_table(const FLXCompiledTableQuery& compiled_table, ConstTableRef table,
+                                           const Obj& obj) const
+    {
+        if (!object_matches_flx_rule(compiled_table.rule, table, obj)) {
+            return false;
+        }
+
+        for (const auto& compiled_query : compiled_table.queries) {
+            if (!compiled_query.query) {
+                return true;
+            }
+
+            if (compiled_query.query->eval_object(obj)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool object_matches_flx_effective_query(const FLXCompiledQueries& compiled_queries,
+                                            const std::string& table_name, ConstTableRef table, const Obj& obj) const
+    {
+        auto compiled_table = compiled_queries.find(table_name);
+        if (compiled_table == compiled_queries.end()) {
+            return false;
+        }
+        return object_matches_flx_compiled_table(compiled_table->second, table, obj);
+    }
+
+    void prepare_flx_bootstrap_state(version_type server_version)
+    {
+        m_flx_bootstrap_state.reset();
+
+        auto& file = m_server_file->access(); // Throws
+        m_flx_bootstrap_state.read_transaction = file.shared_group->start_read(); // Throws
+        m_flx_bootstrap_state.server_version = server_version;
+        m_flx_bootstrap_state.prepared = true;
+        Transaction& tr = *m_flx_bootstrap_state.read_transaction;
+        FLXCompiledQueries compiled_queries = compile_flx_queries(tr); // Throws
+
+        for (const auto& [table_name, compiled_table] : compiled_queries) {
+            ConstTableRef table = tr.get_table(table_name); // Throws
+            if (!table) {
+                continue;
+            }
+
+            for (const Obj& obj : *table) {
+                if (!object_matches_flx_compiled_table(compiled_table, table, obj)) {
+                    continue;
+                }
+
+                FLXVisibleObject visible_object = make_flx_visible_object(table_name, table, obj); // Throws
+                std::string visible_key =
+                    flx_visible_object_key(visible_object.table_name, visible_object.primary_key); // Throws
+                m_flx_bootstrap_state.final_visible_objects.emplace(visible_key, visible_object);  // Throws
+            }
+        }
+
+        for (const auto& [old_key, old_object] : m_flx_visible_objects) {
+            if (m_flx_bootstrap_state.final_visible_objects.count(old_key) != 0) {
+                continue;
+            }
+
+            m_flx_bootstrap_state.removals.push_back(old_object); // Throws
+        }
+
+        std::set<std::string> visiting;
+        std::set<std::string> emitted;
+        for (const auto& entry : m_flx_bootstrap_state.final_visible_objects) {
+            append_flx_bootstrap_object_with_dependencies(entry.first, entry.second, tr, visiting, emitted); // Throws
+        }
+    }
+
+    template <class AddInstruction>
+    bool flx_accept_candidate_changeset(Changeset& changeset, std::size_t max_download_size, bool has_changes,
+                                        AddInstruction add_instruction)
+    {
+        Changeset candidate = changeset; // Throws
+        add_instruction(candidate);       // Throws
+
+        ChangesetEncoder::Buffer encoded;
+        encode_changeset(candidate, encoded); // Throws
+        if (has_changes && encoded.size() > max_download_size) {
+            return false;
+        }
+
+        changeset = std::move(candidate); // Throws
+        return true;
+    }
+
+    double flx_bootstrap_progress_estimate() const noexcept
+    {
+        std::size_t total = m_flx_bootstrap_state.objects.size() + m_flx_bootstrap_state.removals.size();
+        if (total == 0) {
+            return 1.0;
+        }
+        std::size_t done = m_flx_bootstrap_state.object_index + m_flx_bootstrap_state.removal_index;
+        return double(done) / double(total);
+    }
+
+    void make_flx_bootstrap_body(OutputBuffer& body, version_type server_version, version_type client_version,
+                                 std::size_t max_download_size, std::size_t& num_changesets,
+                                 FLXVisibleObjects& visible_objects, sync::DownloadBatchState& batch_state,
+                                 double& progress_estimate)
+    {
+        num_changesets = 0;
+        body.reset();
+
+        if (!m_flx_bootstrap_state.prepared) {
+            prepare_flx_bootstrap_state(server_version); // Throws
+        }
+
+        Changeset changeset;
+        std::set<std::string> emitted_schema_tables;
+        TransactionRef tr = m_flx_bootstrap_state.read_transaction;
+        BARQ_ASSERT(tr);
+        bool has_changes = false;
+
+        while (m_flx_bootstrap_state.object_index < m_flx_bootstrap_state.objects.size()) {
+            const FLXVisibleObject& visible_object = m_flx_bootstrap_state.objects[m_flx_bootstrap_state.object_index];
+            ConstTableRef table = tr->get_table(visible_object.table_name); // Throws
+            if (!table) {
+                ++m_flx_bootstrap_state.object_index;
+                continue;
+            }
+            Obj obj = flx_find_object(table, visible_object.primary_key);
+            if (!obj) {
+                ++m_flx_bootstrap_state.object_index;
+                continue;
+            }
+
+            bool add_schema = emitted_schema_tables.count(visible_object.table_name) == 0;
+            bool accepted = flx_accept_candidate_changeset(changeset, max_download_size, has_changes,
+                                                           [&](Changeset& candidate) {
+                                                               if (add_schema) {
+                                                                   flx_add_schema(candidate, table); // Throws
+                                                               }
+                                                               flx_add_object(candidate, table, obj); // Throws
+                                                           }); // Throws
+            if (!accepted) {
+                break;
+            }
+            if (add_schema) {
+                emitted_schema_tables.insert(visible_object.table_name); // Throws
+            }
+            has_changes = true;
+            ++m_flx_bootstrap_state.object_index;
+        }
+
+        if (m_flx_bootstrap_state.object_index == m_flx_bootstrap_state.objects.size()) {
+            while (m_flx_bootstrap_state.removal_index < m_flx_bootstrap_state.removals.size()) {
+                const FLXVisibleObject& visible_object =
+                    m_flx_bootstrap_state.removals[m_flx_bootstrap_state.removal_index];
+                bool accepted = flx_accept_candidate_changeset(changeset, max_download_size, has_changes,
+                                                               [&](Changeset& candidate) {
+                                                                   flx_add_erase_object(candidate,
+                                                                                        visible_object); // Throws
+                                                               }); // Throws
+                if (!accepted) {
+                    break;
+                }
+                has_changes = true;
+                ++m_flx_bootstrap_state.removal_index;
+            }
+        }
+
+        bool has_more = (m_flx_bootstrap_state.object_index < m_flx_bootstrap_state.objects.size() ||
+                         m_flx_bootstrap_state.removal_index < m_flx_bootstrap_state.removals.size());
+        batch_state = has_more ? sync::DownloadBatchState::MoreToCome : sync::DownloadBatchState::LastInBatch;
+        progress_estimate = has_more ? flx_bootstrap_progress_estimate() : 1.0;
+        if (!has_more) {
+            visible_objects = m_flx_bootstrap_state.final_visible_objects; // Throws
+        }
+        if (changeset.empty()) {
+            return;
+        }
+
+        ChangesetEncoder::Buffer encoded;
+        encode_changeset(changeset, encoded); // Throws
+
+        sync::HistoryEntry entry;
+        entry.origin_timestamp = sync::generate_changeset_timestamp(); // Throws
+        entry.origin_file_ident = 1;
+        entry.remote_version = client_version;
+        entry.changeset = BinaryData(encoded.data(), encoded.size());
+
+        ServerProtocol::ChangesetInfo info{m_flx_bootstrap_state.server_version, entry.remote_version, entry,
+                                           encoded.size()};
+        get_server_protocol().insert_single_changeset_download_message(body, info, logger); // Throws
+        num_changesets = 1;
+    }
+
+    void prepare_flx_incremental_state(DownloadCursor download_progress, UploadCursor upload_progress,
+                                       const FLXTouchedObjects& touched_objects)
+    {
+        m_flx_incremental_state.reset();
+        m_flx_incremental_state.prepared = true;
+        m_flx_incremental_state.download_progress = download_progress;
+        m_flx_incremental_state.upload_progress = upload_progress;
+
+        auto& file = m_server_file->access(); // Throws
+        m_flx_incremental_state.read_transaction = file.shared_group->start_read(); // Throws
+        m_flx_incremental_state.compiled_queries =
+            compile_flx_queries(*m_flx_incremental_state.read_transaction); // Throws
+
+        for (const auto& [visible_key, touched_object] : touched_objects) {
+            FLXIncrementalObject object;
+            object.visible_key = visible_key;          // Throws
+            object.touched_object = touched_object;    // Throws
+            m_flx_incremental_state.objects.push_back(std::move(object)); // Throws
+        }
+    }
+
+    double flx_incremental_progress_estimate() const noexcept
+    {
+        if (m_flx_incremental_state.objects.empty()) {
+            return 1.0;
+        }
+        return double(m_flx_incremental_state.object_index) / double(m_flx_incremental_state.objects.size());
+    }
+
+    void make_flx_incremental_body(OutputBuffer& body, version_type client_version, std::size_t max_download_size,
+                                   FLXVisibleObjects& visible_objects, std::size_t& num_changesets,
+                                   sync::DownloadBatchState& batch_state, double& progress_estimate)
+    {
+        num_changesets = 0;
+        body.reset();
+        if (!m_flx_incremental_state.prepared || m_flx_incremental_state.objects.empty()) {
+            batch_state = sync::DownloadBatchState::SteadyState;
+            progress_estimate = 1.0;
+            return;
+        }
+
+        Changeset changeset;
+        std::set<std::string> emitted_schema_tables;
+        TransactionRef tr = m_flx_incremental_state.read_transaction;
+        BARQ_ASSERT(tr);
+        bool has_changes = false;
+
+        while (m_flx_incremental_state.object_index < m_flx_incremental_state.objects.size()) {
+            const FLXIncrementalObject& touched_entry =
+                m_flx_incremental_state.objects[m_flx_incremental_state.object_index];
+            const std::string& visible_key = touched_entry.visible_key;
+            const FLXTouchedObject& touched_object = touched_entry.touched_object;
+            auto visible_it = visible_objects.find(visible_key);
+            ConstTableRef table = tr->get_table(touched_object.table_name); // Throws
+            if (!table || table->is_embedded() || table->is_asymmetric()) {
+                if (visible_it != visible_objects.end()) {
+                    bool accepted = flx_accept_candidate_changeset(changeset, max_download_size, has_changes,
+                                                                   [&](Changeset& candidate) {
+                                                                       flx_add_erase_object(
+                                                                           candidate, visible_it->second); // Throws
+                                                                   }); // Throws
+                    if (!accepted) {
+                        break;
+                    }
+                    has_changes = true;
+                    visible_objects.erase(visible_it);
+                }
+                ++m_flx_incremental_state.object_index;
+                continue;
+            }
+
+            Obj obj = flx_find_object(table, touched_object.primary_key);
+            bool is_visible_now =
+                obj && object_matches_flx_effective_query(m_flx_incremental_state.compiled_queries,
+                                                          touched_object.table_name, table, obj); // Throws
+            if (is_visible_now) {
+                bool add_schema = emitted_schema_tables.count(touched_object.table_name) == 0;
+                bool accepted = flx_accept_candidate_changeset(changeset, max_download_size, has_changes,
+                                                               [&](Changeset& candidate) {
+                                                                   if (add_schema) {
+                                                                       flx_add_schema(candidate, table); // Throws
+                                                                   }
+                                                                   flx_add_object(candidate, table, obj); // Throws
+                                                               }); // Throws
+                if (!accepted) {
+                    break;
+                }
+                FLXVisibleObject visible_object =
+                    make_flx_visible_object(touched_object.table_name, table, obj); // Throws
+                visible_objects[visible_key] = visible_object;                      // Throws
+                if (add_schema) {
+                    emitted_schema_tables.insert(touched_object.table_name); // Throws
+                }
+                has_changes = true;
+            }
+            else if (visible_it != visible_objects.end()) {
+                bool accepted = flx_accept_candidate_changeset(changeset, max_download_size, has_changes,
+                                                               [&](Changeset& candidate) {
+                                                                   flx_add_erase_object(
+                                                                       candidate, visible_it->second); // Throws
+                                                               }); // Throws
+                if (!accepted) {
+                    break;
+                }
+                has_changes = true;
+                visible_objects.erase(visible_it);
+            }
+            ++m_flx_incremental_state.object_index;
+        }
+
+        bool has_more = m_flx_incremental_state.object_index < m_flx_incremental_state.objects.size();
+        if (has_more) {
+            batch_state = sync::DownloadBatchState::MoreToCome;
+            m_flx_incremental_state.emitted_more_to_come = true;
+            progress_estimate = flx_incremental_progress_estimate();
+        }
+        else if (m_flx_incremental_state.emitted_more_to_come) {
+            batch_state = sync::DownloadBatchState::LastInBatch;
+            progress_estimate = 1.0;
+        }
+        else {
+            batch_state = sync::DownloadBatchState::SteadyState;
+            progress_estimate = 1.0;
+        }
+
+        if (changeset.empty()) {
+            return;
+        }
+
+        ChangesetEncoder::Buffer encoded;
+        encode_changeset(changeset, encoded); // Throws
+
+        sync::HistoryEntry entry;
+        entry.origin_timestamp = sync::generate_changeset_timestamp(); // Throws
+        entry.origin_file_ident = 1;
+        entry.remote_version = client_version;
+        entry.changeset = BinaryData(encoded.data(), encoded.size());
+
+        ServerProtocol::ChangesetInfo info{m_flx_incremental_state.download_progress.server_version,
+                                           entry.remote_version, entry, encoded.size()};
+        get_server_protocol().insert_single_changeset_download_message(body, info, logger); // Throws
+        num_changesets = 1;
+    }
+
+    bool set_flx_query(int64_t query_version, std::string_view query_body, bool send_all_visible_objects,
+                       std::string& error)
+    {
+        if (!m_connection.is_flx_sync_connection()) {
+            error = "Received FLX query on a PBS session";
+            return false;
+        }
+        if (query_version < 0) {
+            error = "Query version must not be negative";
+            return false;
+        }
+
+        std::map<std::string, std::string> parsed_queries;
+        try {
+            auto json = nlohmann::json::parse(query_body);
+            if (!json.is_object()) {
+                error = "Subscription query body must be a JSON object";
+                return false;
+            }
+            for (auto it = json.begin(); it != json.end(); ++it) {
+                if (!it.value().is_string()) {
+                    error = util::format("Subscription query for '%1' must be a string", it.key());
+                    return false;
+                }
+                parsed_queries.emplace(it.key(), it.value().get<std::string>()); // Throws
+            }
+        }
+        catch (const nlohmann::json::exception& e) {
+            error = util::format("Bad subscription query JSON: %1", e.what());
+            return false;
+        }
+
+        auto& file = m_server_file->access(); // Throws
+        TransactionRef tr = file.shared_group->start_read(); // Throws
+        for (const auto& [table_name, query_string] : parsed_queries) {
+            std::string actual_table_name;
+            ConstTableRef table = get_flx_table(*tr, table_name, &actual_table_name); // Throws
+            if (!table) {
+                continue; // Missing tables are empty for FLX.
+            }
+            try {
+                if (!flx_query_is_match_all(query_string)) {
+                    table->query(query_string).find(); // Throws
+                }
+            }
+            catch (const std::exception& e) {
+                error = util::format("Bad subscription query for '%1': %2", table_name, e.what());
+                return false;
+            }
+            if (!validate_flx_rule_for_existing_table(get_flx_rule(actual_table_name), actual_table_name, table,
+                                                      error)) {
+                return false;
+            }
+        }
+
+        m_flx_query_version = query_version;
+        m_flx_queries = std::move(parsed_queries);
+        m_flx_bootstrap_pending = query_version > 0;
+        m_flx_bootstrap_send_all_objects = send_all_visible_objects;
+        m_flx_bootstrap_state.reset();
+        m_flx_incremental_state.reset();
+        return true;
+    }
+
     static std::string make_logger_prefix(session_ident_type session_ident)
     {
         std::ostringstream out;
@@ -3073,9 +5960,108 @@ private:
         if (BARQ_UNLIKELY(m_disable_download))
             return;
 
-        bool have_more_to_scan =
-            (last_server_version.version > m_download_progress.server_version || !m_one_download_message_sent);
+        bool is_flx_sync = m_connection.is_flx_sync_connection();
+        bool have_more_to_scan = (last_server_version.version > m_download_progress.server_version ||
+                                  !m_one_download_message_sent ||
+                                  (is_flx_sync && (m_flx_bootstrap_pending || m_flx_incremental_state.prepared)));
         if (have_more_to_scan) {
+            if (is_flx_sync) {
+                // Do not send the PBS whole-file history on an FLX session.
+                m_server_file->register_client_access(m_client_file_ident);     // Throws
+                const ServerHistory& history = m_server_file->access().history; // Throws
+                ServerProtocol& protocol = get_server_protocol();
+                OutputBuffer& out = m_connection.get_output_buffer();
+                sync::DownloadBatchState batch_state = sync::DownloadBatchState::SteadyState;
+                double progress_estimate = 1.0;
+                OutputBuffer& body_buffer = server.get_misc_buffers().download_message;
+                body_buffer.reset();
+                std::size_t num_changesets = 0;
+                FLXVisibleObjects visible_objects = m_flx_visible_objects; // Throws
+                DownloadCursor download_progress = m_download_progress;
+                UploadCursor upload_progress = {0, 0};
+                bool was_bootstrap_pending = m_flx_bootstrap_pending;
+                bool was_incremental_pending = m_flx_incremental_state.prepared;
+                if (was_bootstrap_pending) {
+                    make_flx_bootstrap_body(body_buffer, last_server_version.version,
+                                            download_progress.last_integrated_client_version,
+                                            config.max_download_size, num_changesets, visible_objects, batch_state,
+                                            progress_estimate); // Throws
+                    if (BARQ_UNLIKELY(config.flx_bootstrap_batch_callback)) {
+                        config.flx_bootstrap_batch_callback(m_server_file->get_virt_path(), m_client_file_ident,
+                                                            batch_state, num_changesets); // Throws
+                    }
+                    download_progress.server_version = m_flx_bootstrap_state.server_version;
+                    upload_progress = m_upload_progress;
+                }
+                else if (was_incremental_pending) {
+                    download_progress = m_flx_incremental_state.download_progress;
+                    upload_progress = m_flx_incremental_state.upload_progress;
+                    make_flx_incremental_body(body_buffer, download_progress.last_integrated_client_version,
+                                              config.max_download_size, visible_objects, num_changesets, batch_state,
+                                              progress_estimate); // Throws
+                }
+                else {
+                    FLXDownloadHistoryEntryHandler handler{*this};
+                    std::uint_fast64_t cumulative_byte_size_current = 0;
+                    std::uint_fast64_t cumulative_byte_size_total = 0;
+                    bool not_expired = history.fetch_download_info(
+                        m_client_file_ident, download_progress, last_server_version.version, upload_progress,
+                        handler, cumulative_byte_size_current, cumulative_byte_size_total,
+                        config.max_download_size); // Throws
+                    if (BARQ_UNLIKELY(!not_expired)) {
+                        logger.debug("History scanning failed: Client file entry "
+                                     "expired during FLX session"); // Throws
+                        get_connection().protocol_error(ProtocolError::client_file_expired, this);
+                        // Session object may have been destroyed at this point
+                        // (suicide).
+                        return;
+                    }
+
+                    if (!handler.touched_objects.empty()) {
+                        prepare_flx_incremental_state(download_progress, upload_progress,
+                                                      handler.touched_objects); // Throws
+                        was_incremental_pending = true;
+                        make_flx_incremental_body(body_buffer, download_progress.last_integrated_client_version,
+                                                  config.max_download_size, visible_objects, num_changesets,
+                                                  batch_state, progress_estimate); // Throws
+                    }
+                }
+                if (upload_progress.client_version < m_upload_threshold.client_version) {
+                    upload_progress = m_upload_threshold;
+                }
+                if (upload_progress.client_version < m_upload_progress.client_version) {
+                    upload_progress = m_upload_progress;
+                }
+                const char* body = body_buffer.data();
+                std::size_t body_size = body_buffer.size();
+                protocol.make_download_message(
+                    m_connection.get_client_protocol_version(), out, m_session_ident, download_progress.server_version,
+                    download_progress.last_integrated_client_version,
+                    last_server_version.version, last_server_version.salt, upload_progress.client_version,
+                    upload_progress.last_integrated_server_version, 0, num_changesets, body, body_size, 0, false,
+                    logger, true,
+                    m_flx_query_version, batch_state, progress_estimate); // Throws
+
+                m_download_progress = download_progress;
+                if (!was_bootstrap_pending || batch_state == sync::DownloadBatchState::LastInBatch) {
+                    m_flx_visible_objects = std::move(visible_objects); // Throws
+                    m_server_file->set_flx_visible_objects(m_client_file_ident, m_flx_visible_objects); // Throws
+                }
+                if (batch_state == sync::DownloadBatchState::LastInBatch) {
+                    m_flx_bootstrap_pending = false;
+                    m_flx_bootstrap_state.reset();
+                    m_flx_incremental_state.reset();
+                }
+                else if (was_incremental_pending &&
+                         m_flx_incremental_state.object_index == m_flx_incremental_state.objects.size()) {
+                    m_flx_incremental_state.reset();
+                }
+                send_download_message();
+                m_one_download_message_sent = true;
+                enlist_to_send();
+                return;
+            }
+
             m_server_file->register_client_access(m_client_file_ident);     // Throws
             const ServerHistory& history = m_server_file->access().history; // Throws
             const char* body;
@@ -3090,7 +6076,8 @@ private:
             std::size_t accum_original_size;
             std::size_t accum_compacted_size;
             ServerProtocol& protocol = get_server_protocol();
-            bool enable_cache = (config.enable_download_bootstrap_cache && m_download_progress.server_version == 0 &&
+            bool enable_cache = (!is_flx_sync && config.enable_download_bootstrap_cache &&
+                                 m_download_progress.server_version == 0 &&
                                  m_upload_progress.client_version == 0 && m_upload_threshold.client_version == 0);
             DownloadCache& cache = m_server_file->get_download_cache();
             bool fetch_from_cache = (enable_cache && cache.body && end_version == cache.end_version);
@@ -3187,14 +6174,21 @@ private:
             }
 
             OutputBuffer& out = m_connection.get_output_buffer();
+            sync::DownloadBatchState batch_state =
+                is_flx_sync && m_flx_bootstrap_pending ? sync::DownloadBatchState::LastInBatch
+                                                       : sync::DownloadBatchState::SteadyState;
             protocol.make_download_message(
                 m_connection.get_client_protocol_version(), out, m_session_ident, download_progress.server_version,
                 download_progress.last_integrated_client_version, last_server_version.version,
                 last_server_version.salt, upload_progress.client_version,
                 upload_progress.last_integrated_server_version, downloadable_bytes, num_changesets, body,
-                uncompressed_body_size, compressed_body_size, body_is_compressed, logger); // Throws
+                uncompressed_body_size, compressed_body_size, body_is_compressed, logger, is_flx_sync,
+                m_flx_query_version, batch_state, 1.0); // Throws
 
             m_download_progress = download_progress;
+            if (batch_state == sync::DownloadBatchState::LastInBatch) {
+                m_flx_bootstrap_pending = false;
+            }
             logger.debug("Setting of m_download_progress.server_version = %1",
                          m_download_progress.server_version); // Throws
             send_download_message();
@@ -3254,6 +6248,21 @@ private:
         OutputBuffer& out = m_connection.get_output_buffer();
         protocol.make_mark_message(out, m_session_ident, request_ident); // Throws
         m_connection.initiate_write_output_buffer();                     // Throws
+    }
+
+    void send_json_error_message()
+    {
+        BARQ_ASSERT(!m_pending_json_errors.empty());
+        const std::string& body = m_pending_json_errors.front();
+        logger.detail("Sending: JSON_ERROR(error_code=%1, message_size=%2)",
+                      int(ProtocolError::compensating_write), body.size()); // Throws
+
+        ServerProtocol& protocol = get_server_protocol();
+        OutputBuffer& out = m_connection.get_output_buffer();
+        protocol.make_json_error_message(out, m_session_ident, int(ProtocolError::compensating_write),
+                                         body);                  // Throws
+        m_connection.initiate_write_output_buffer();             // Throws
+        m_pending_json_errors.pop_front();
     }
 
     void send_alloc_message()
@@ -3509,6 +6518,148 @@ Session* ServerFile::get_identified_session(file_ident_type client_file_ident) n
     return i->second;
 }
 
+FLXVisibleObjects ServerFile::load_flx_visible_objects(file_ident_type client_file_ident)
+{
+    auto& file = access();                          // Throws
+    TransactionRef tr = file.shared_group->start_read(); // Throws
+    ConstTableRef table = tr->get_table(c_flx_visible_state_table); // Throws
+    if (!table) {
+        return {};
+    }
+
+    ColKey json_col = table->get_column_key(c_flx_visible_state_json);
+    if (!json_col || table->get_column_type(json_col) != type_String) {
+        return {};
+    }
+
+    Obj row = table->get_object_with_primary_key(int64_t(client_file_ident)); // Throws
+    if (!row || row.is_null(json_col)) {
+        return {};
+    }
+
+    StringData json = row.get<StringData>(json_col); // Throws
+    return flx_visible_objects_from_json(std::string_view{json.data(), json.size()}); // Throws
+}
+
+std::vector<file_ident_type> ServerFile::load_flx_visible_state_idents()
+{
+    std::vector<file_ident_type> idents;
+    auto& file = access();                               // Throws
+    TransactionRef tr = file.shared_group->start_read(); // Throws
+    ConstTableRef table = tr->get_table(c_flx_visible_state_table); // Throws
+    if (!table) {
+        return idents;
+    }
+    ColKey pk_col = table->get_primary_key_column();
+    if (!pk_col) {
+        return idents;
+    }
+    idents.reserve(table->size());
+    for (const Obj& row : *table) {
+        idents.push_back(file_ident_type(row.get<int64_t>(pk_col))); // Throws
+    }
+    return idents;
+}
+
+void ServerFile::gc_flx_visible_state()
+{
+    if (!m_server.get_config().enable_flx_sync) {
+        return;
+    }
+
+    std::vector<file_ident_type> idents = load_flx_visible_state_idents(); // Throws
+    if (idents.empty()) {
+        return;
+    }
+
+    std::vector<file_ident_type> expired;
+    for (file_ident_type ident : idents) {
+        if (access().history.is_client_file_expired(ident)) { // Throws
+            expired.push_back(ident);
+        }
+    }
+    if (expired.empty()) {
+        return;
+    }
+
+    VersionInfo version_info;
+    access().history.transact_without_sync_history(
+        [&](Transaction& tr) {
+            TableRef table = tr.get_table(c_flx_visible_state_table); // Throws
+            if (!table) {
+                return false;
+            }
+            bool dirty = false;
+            for (file_ident_type ident : expired) {
+                if (Obj row = table->get_object_with_primary_key(int64_t(ident))) { // Throws
+                    row.remove(); // Throws
+                    dirty = true;
+                }
+            }
+            return dirty;
+        },
+        version_info); // Throws
+
+    for (file_ident_type ident : expired) {
+        m_flx_visible_objects_by_client_file.erase(ident);
+    }
+
+    logger.debug("FLX visible-state GC removed %1 expired client entries", expired.size()); // Throws
+}
+
+void ServerFile::gc_flx_visible_state_once() noexcept
+{
+    if (m_flx_visible_state_gc_done) {
+        return;
+    }
+    m_flx_visible_state_gc_done = true;
+    try {
+        gc_flx_visible_state(); // Throws
+    }
+    catch (const std::exception& e) {
+        logger.error("FLX visible-state GC failed: %1", e.what()); // Throws
+    }
+}
+
+void ServerFile::persist_flx_visible_objects(file_ident_type client_file_ident,
+                                             const FLXVisibleObjects& visible_objects)
+{
+    std::string visible_json = flx_visible_objects_to_json(visible_objects); // Throws
+    VersionInfo version_info;
+    access().history.transact_without_sync_history(
+        [&](Transaction& tr) {
+            TableRef table = flx_get_or_create_visible_state_table(tr); // Throws
+            ColKey json_col = table->get_column_key(c_flx_visible_state_json);
+            Obj row = table->create_object_with_primary_key(int64_t(client_file_ident)); // Throws
+            row.set(json_col, visible_json);                                             // Throws
+            return true;
+        },
+        version_info); // Throws
+}
+
+FLXVisibleObjects ServerFile::get_flx_visible_objects(file_ident_type client_file_ident)
+{
+    auto i = m_flx_visible_objects_by_client_file.find(client_file_ident);
+    if (i == m_flx_visible_objects_by_client_file.end()) {
+        FLXVisibleObjects visible_objects = load_flx_visible_objects(client_file_ident); // Throws
+        i = m_flx_visible_objects_by_client_file.emplace(client_file_ident, std::move(visible_objects)).first;
+    }
+    return i->second;
+}
+
+void ServerFile::set_flx_visible_objects(file_ident_type client_file_ident, FLXVisibleObjects visible_objects)
+{
+    auto i = m_flx_visible_objects_by_client_file.find(client_file_ident);
+    if (i != m_flx_visible_objects_by_client_file.end() &&
+        flx_visible_objects_have_same_keys(i->second, visible_objects)) {
+        i->second = std::move(visible_objects); // Throws
+        return;
+    }
+
+    persist_flx_visible_objects(client_file_ident, visible_objects);                      // Throws
+    m_flx_visible_objects_by_client_file[client_file_ident] = std::move(visible_objects); // Throws
+}
+
 bool ServerFile::can_add_changesets_from_downstream() const noexcept
 {
     return (m_blocked_changesets_from_downstream_byte_size < m_server.get_max_upload_backlog());
@@ -3517,13 +6668,19 @@ bool ServerFile::can_add_changesets_from_downstream() const noexcept
 
 void ServerFile::add_changesets_from_downstream(file_ident_type client_file_ident, UploadCursor upload_progress,
                                                 version_type locked_server_version, const UploadChangeset* changesets,
-                                                std::size_t num_changesets)
+                                                std::size_t num_changesets, bool is_flx_sync,
+                                                std::string user_identity, bool user_is_admin)
 {
     register_client_access(client_file_ident); // Throws
 
     bool dirty = false;
 
     IntegratableChangesetList& list = m_changesets_from_downstream[client_file_ident]; // Throws
+    if (is_flx_sync) {
+        list.is_flx_sync = true;
+        list.flx_user_identity = std::move(user_identity); // Throws
+        list.flx_user_is_admin = user_is_admin;
+    }
     std::size_t num_bytes = 0;
     for (std::size_t i = 0; i < num_changesets; ++i) {
         const UploadChangeset& uc = changesets[i];
@@ -3776,6 +6933,201 @@ void ServerFile::worker_allocate_file_identifiers()
 }
 
 
+std::vector<FLXCompensationCandidate> ServerFile::worker_prepare_flx_compensation_candidates(DBRef shared_group)
+{
+    std::vector<FLXCompensationCandidate> candidates;
+    bool has_flx_changesets = false;
+    for (const auto& [client_file_ident, list] : m_work.changesets_from_downstream) {
+        static_cast<void>(client_file_ident);
+        if (list.is_flx_sync && list.has_changesets()) {
+            has_flx_changesets = true;
+            break;
+        }
+    }
+    if (!has_flx_changesets) {
+        return candidates;
+    }
+
+    TransactionRef tr = shared_group->start_read(); // Throws
+    std::map<std::string, std::size_t> candidate_indexes;
+    const Server::Config& config = m_server.get_config();
+
+    for (const auto& [client_file_ident, list] : m_work.changesets_from_downstream) {
+        if (!list.is_flx_sync) {
+            continue;
+        }
+
+        for (const IntegratableChangeset& integratable : list.changesets) {
+            Changeset changeset;
+            BinaryData changeset_data{integratable.changeset.data(), integratable.changeset.size()};
+            ChunkedBinaryInputStream in{changeset_data};
+            sync::parse_changeset(in, changeset); // Throws
+
+            FLXTouchedObjects touched_objects;
+            collect_flx_touched_objects(changeset, touched_objects); // Throws
+            for (const auto& [visible_key, touched_object] : touched_objects) {
+                std::string candidate_key = util::format("%1\t%2", client_file_ident, visible_key); // Throws
+                auto [it, inserted] = candidate_indexes.emplace(candidate_key, candidates.size());   // Throws
+                FLXCompensationCandidate* candidate = nullptr;
+                if (inserted) {
+                    candidates.push_back({}); // Throws
+                    candidate = &candidates.back();
+                    candidate->client_file_ident = client_file_ident;
+                    candidate->user_identity = list.flx_user_identity; // Throws
+                    candidate->user_is_admin = list.flx_user_is_admin;
+                    candidate->rejected_client_version = integratable.upload_cursor.client_version;
+
+                    ConstTableRef table = tr->get_table(touched_object.table_name); // Throws
+                    if (table) {
+                        candidate->before =
+                            flx_snapshot_object(table, touched_object.table_name, touched_object.primary_key); // Throws
+                        const Server::Config::FLXRule* rule =
+                            find_flx_rule_for_table(config.flx_rules, touched_object.table_name); // Throws
+                        if (rule && rule->mode == Server::Config::FLXRule::Mode::Owner && candidate->before.existed) {
+                            Obj before = flx_find_object(table, touched_object.primary_key); // Throws
+                            candidate->before_matches_owner =
+                                before && flx_object_owner_matches(table, before, rule->owner_field,
+                                                                  candidate->user_identity); // Throws
+                        }
+                    }
+                    else {
+                        candidate->before.table_name = touched_object.table_name; // Throws
+                        candidate->before.primary_key = touched_object.primary_key;
+                    }
+                }
+                else {
+                    candidate = &candidates[it->second];
+                    candidate->rejected_client_version =
+                        std::max(candidate->rejected_client_version, integratable.upload_cursor.client_version);
+                }
+            }
+        }
+    }
+    return candidates;
+}
+
+
+bool ServerFile::worker_apply_flx_compensating_writes(
+    ServerHistory& history, DBRef, const std::vector<FLXCompensationCandidate>& candidates)
+{
+    if (candidates.empty()) {
+        return false;
+    }
+
+    std::vector<FLXRejectedUpdate> rejected_updates;
+    std::vector<Work::PendingFLXForcedRemoval> forced_removals;
+    const Server::Config& config = m_server.get_config();
+    bool produced_new_barq_version = history.transact(
+        [&](Transaction& tr) {
+            bool dirty = false;
+            for (const FLXCompensationCandidate& candidate : candidates) {
+                const Server::Config::FLXRule* rule =
+                    find_flx_rule_for_table(config.flx_rules, candidate.before.table_name); // Throws
+                bool reject = false;
+                std::string reason;
+
+                TableRef table = tr.get_table(candidate.before.table_name); // Throws
+                Obj after;
+                if (table) {
+                    after = flx_find_object(table, candidate.before.primary_key); // Throws
+                }
+
+                if (!rule) {
+                    reject = true;
+                    reason = "write denied: no FLX rule configured for table"; // Throws
+                }
+                else if (candidate.user_is_admin) {
+                    reject = false;
+                }
+                else if (rule->mode == Server::Config::FLXRule::Mode::PublicReadOnly) {
+                    reject = true;
+                    reason = "write denied: table is read-only"; // Throws
+                }
+                else {
+                    BARQ_ASSERT(rule->mode == Server::Config::FLXRule::Mode::Owner);
+                    if (candidate.before.existed && !candidate.before_matches_owner) {
+                        reject = true;
+                        reason = "write denied: object is not owned by the user"; // Throws
+                    }
+                    else if (after && !flx_object_owner_matches(table, after, rule->owner_field,
+                                                               candidate.user_identity)) { // Throws
+                        reject = true;
+                        reason = "write denied: owner field does not match the user"; // Throws
+                    }
+                }
+
+                if (!reject) {
+                    continue;
+                }
+
+                bool restored = flx_restore_snapshot(tr, candidate.before); // Throws
+                if (!restored) {
+                    continue;
+                }
+                dirty = true;
+
+                FLXRejectedUpdate update;
+                update.client_file_ident = candidate.client_file_ident;
+                update.rejected_client_version = candidate.rejected_client_version;
+                update.table_name = candidate.before.table_name;     // Throws
+                update.primary_key = candidate.before.primary_key;   // Throws
+                update.reason = std::move(reason);
+                rejected_updates.push_back(std::move(update)); // Throws
+
+                if (!candidate.before.existed) {
+                    Work::PendingFLXForcedRemoval removal;
+                    removal.client_file_ident = candidate.client_file_ident;
+                    removal.object.table_name = candidate.before.table_name;   // Throws
+                    removal.object.primary_key = candidate.before.primary_key; // Throws
+                    forced_removals.push_back(std::move(removal));             // Throws
+                }
+            }
+            return dirty;
+        },
+        m_work.version_info); // Throws
+
+    if (!produced_new_barq_version || rejected_updates.empty()) {
+        return produced_new_barq_version;
+    }
+
+    version_type compensating_write_server_version = m_work.version_info.sync_version.version;
+    std::map<file_ident_type, nlohmann::json> errors_by_client;
+    for (const FLXRejectedUpdate& update : rejected_updates) {
+        nlohmann::json& error = errors_by_client[update.client_file_ident]; // Throws
+        if (error.empty()) {
+            error = nlohmann::json::object(); // Throws
+            error["isRecoveryModeDisabled"] = false;
+            error["tryAgain"] = true;
+            error["message"] = "Client attempted a write that is disallowed by permissions, and the server undid it";
+            error["logURL"] = "";
+            error["shouldClientReset"] = false;
+            error["action"] = "Warning";
+            error["rejectedUpdates"] = nlohmann::json::array();
+            error["rejectedClientVersion"] = update.rejected_client_version;
+            error["compensatingWriteServerVersion"] = compensating_write_server_version;
+        }
+        else {
+            error["rejectedClientVersion"] =
+                std::max(error["rejectedClientVersion"].get<version_type>(), update.rejected_client_version);
+        }
+
+        error["rejectedUpdates"].push_back({
+            {"reason", update.reason},
+            {"table", Group::table_name_to_class_name(update.table_name)},
+            {"pk", flx_base64_primary_key(update.primary_key)},
+        }); // Throws
+    }
+
+    for (auto& [client_file_ident, body] : errors_by_client) {
+        m_work.pending_json_errors.push_back({client_file_ident, body.dump()}); // Throws
+    }
+    for (auto& removal : forced_removals) {
+        m_work.pending_flx_forced_removals.push_back(std::move(removal)); // Throws
+    }
+    return true;
+}
+
+
 // Returns true when, and only when this function produces a new sync version
 // (adds a new entry to the sync history).
 //
@@ -3787,6 +7139,10 @@ bool ServerFile::worker_integrate_changes_from_downstream(WorkerState& state)
     std::unique_ptr<ServerHistory> hist_ptr;
     DBRef sg_ptr;
     ServerHistory& hist = get_client_file_history(state, hist_ptr, sg_ptr);
+    DBRef shared_group = state.use_file_cache ? worker_access().shared_group : sg_ptr; // Throws
+    std::vector<FLXCompensationCandidate> flx_compensation_candidates =
+        worker_prepare_flx_compensation_candidates(shared_group); // Throws
+
     bool backup_whole_barq = false;
     bool produced_new_barq_version = hist.integrate_client_changesets(
         m_work.changesets_from_downstream, m_work.version_info, backup_whole_barq, m_work.integration_result,
@@ -3798,6 +7154,14 @@ bool ServerFile::worker_integrate_changes_from_downstream(WorkerState& state)
         if (produced_new_sync_version) {
             m_work.produced_new_sync_version = true;
         }
+    }
+
+    bool produced_compensating_write =
+        worker_apply_flx_compensating_writes(hist, shared_group, flx_compensation_candidates); // Throws
+    if (produced_compensating_write) {
+        m_work.produced_new_barq_version = true;
+        m_work.produced_new_sync_version = true;
+        produced_new_sync_version = true;
     }
     return produced_new_sync_version;
 }
@@ -3937,6 +7301,25 @@ void ServerFile::finalize_work_stage_2()
     }
     m_file_ident_requests.erase(begin, i);
 
+    for (auto& removal : m_work.pending_flx_forced_removals) {
+        if (Session* session = get_identified_session(removal.client_file_ident)) {
+            session->enqueue_flx_forced_removal(std::move(removal.object)); // Throws
+        }
+        else {
+            FLXVisibleObjects visible_objects = get_flx_visible_objects(removal.client_file_ident); // Throws
+            std::string visible_key =
+                flx_visible_object_key(removal.object.table_name, removal.object.primary_key); // Throws
+            visible_objects[visible_key] = std::move(removal.object);                          // Throws
+            set_flx_visible_objects(removal.client_file_ident, std::move(visible_objects));     // Throws
+        }
+    }
+
+    for (auto& pending_error : m_work.pending_json_errors) {
+        if (Session* session = get_identified_session(pending_error.client_file_ident)) {
+            session->enqueue_json_error(std::move(pending_error.body)); // Throws
+        }
+    }
+
     // Resume download to downstream clients
     if (resume_download_and_upload) {
         resume_download();
@@ -4020,6 +7403,23 @@ Server::Config validate_server_config(Server::Config config)
                              limits.max_storage_bytes != 0;
     if (has_tenant_limits && !config.tenant_public_keys) {
         throw std::invalid_argument("tenant_limits requires tenant_public_keys");
+    }
+    std::set<std::string> flx_rule_tables;
+    for (const auto& rule : config.flx_rules) {
+        if (rule.table.empty()) {
+            throw std::invalid_argument("flx_rules table must not be empty");
+        }
+        if (!flx_rule_tables.insert(rule.table).second) {
+            throw std::invalid_argument(util::format("duplicate flx_rules entry for table '%1'", rule.table));
+        }
+        if (rule.mode == Server::Config::FLXRule::Mode::Owner && rule.owner_field.empty()) {
+            throw std::invalid_argument(util::format("flx_rules owner_field must not be empty for table '%1'",
+                                                    rule.table));
+        }
+        if (rule.mode == Server::Config::FLXRule::Mode::PublicReadOnly && !rule.owner_field.empty()) {
+            throw std::invalid_argument(util::format("flx_rules owner_field must be empty for public table '%1'",
+                                                    rule.table));
+        }
     }
     return config;
 }
@@ -4574,6 +7974,69 @@ void SyncConnection::receive_ident_message(session_ident_type session_ident, fil
                                               error); // Throws
     if (BARQ_UNLIKELY(!success))                     // Throws
         protocol_error(error, &sess);                 // Throws
+}
+
+void SyncConnection::receive_ident_message(session_ident_type session_ident, file_ident_type client_file_ident,
+                                           salt_type client_file_ident_salt, version_type scan_server_version,
+                                           version_type scan_client_version, version_type latest_server_version,
+                                           salt_type latest_server_version_salt, int64_t query_version,
+                                           std::string query_body)
+{
+    auto i = m_sessions.find(session_ident);
+    if (BARQ_UNLIKELY(i == m_sessions.end())) {
+        bad_session_ident("IDENT", session_ident); // Throws
+        return;
+    }
+    Session& sess = *i->second;
+    if (BARQ_UNLIKELY(sess.unbind_message_received())) {
+        message_after_unbind("IDENT", session_ident); // Throws
+        return;
+    }
+    if (BARQ_UNLIKELY(sess.error_occurred())) {
+        return;
+    }
+    if (BARQ_UNLIKELY(sess.must_send_ident_message())) {
+        logger.error("Received IDENT message before IDENT message was sent"); // Throws
+        protocol_error(ProtocolError::bad_message_order);                     // Throws
+        return;
+    }
+    if (BARQ_UNLIKELY(sess.ident_message_received())) {
+        logger.error("Received second IDENT message for session"); // Throws
+        protocol_error(ProtocolError::bad_message_order);          // Throws
+        return;
+    }
+
+    ProtocolError error = {};
+    bool success = sess.receive_ident_message(client_file_ident, client_file_ident_salt, scan_server_version,
+                                              scan_client_version, latest_server_version, latest_server_version_salt,
+                                              query_version, std::move(query_body), error); // Throws
+    if (BARQ_UNLIKELY(!success))                                                          // Throws
+        protocol_error(error, &sess);                                                      // Throws
+}
+
+void SyncConnection::receive_query_message(session_ident_type session_ident, int64_t query_version,
+                                           std::string query_body)
+{
+    auto i = m_sessions.find(session_ident);
+    if (BARQ_UNLIKELY(i == m_sessions.end())) {
+        bad_session_ident("QUERY", session_ident); // Throws
+        return;
+    }
+    Session& sess = *i->second;
+    if (BARQ_UNLIKELY(sess.unbind_message_received())) {
+        message_after_unbind("QUERY", session_ident); // Throws
+        return;
+    }
+    if (BARQ_UNLIKELY(sess.error_occurred())) {
+        return;
+    }
+    if (BARQ_UNLIKELY(!sess.ident_message_received())) {
+        logger.error("Received QUERY before IDENT");       // Throws
+        protocol_error(ProtocolError::bad_message_order);  // Throws
+        return;
+    }
+
+    sess.receive_query_message(query_version, std::move(query_body)); // Throws
 }
 
 void SyncConnection::receive_upload_message(session_ident_type session_ident, version_type progress_client_version,

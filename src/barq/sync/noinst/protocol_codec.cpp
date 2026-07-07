@@ -236,14 +236,21 @@ void ServerProtocol::make_download_message(int protocol_version, OutputBuffer& o
                                            std::uint_fast64_t downloadable_bytes, std::size_t num_changesets,
                                            const char* body, std::size_t uncompressed_body_size,
                                            std::size_t compressed_body_size, bool body_is_compressed,
-                                           util::Logger& logger)
+                                           util::Logger& logger, bool is_flx_sync, int64_t query_version,
+                                           sync::DownloadBatchState batch_state, double progress_estimate)
 {
     static_cast<void>(protocol_version);
     // The header of the download message.
     out << "download " << session_ident << " " << download_server_version << " " << download_client_version << " "
         << latest_server_version << " " << latest_server_version_salt << " " << upload_client_version << " "
-        << upload_server_version << " " << downloadable_bytes << " " << int(body_is_compressed) << " "
-        << uncompressed_body_size << " " << compressed_body_size << "\n"; // Throws
+        << upload_server_version << " "; // Throws
+    if (is_flx_sync) {
+        out << query_version << " " << static_cast<int>(batch_state) << " " << progress_estimate << " "; // Throws
+    }
+    else {
+        out << downloadable_bytes << " "; // Throws
+    }
+    out << int(body_is_compressed) << " " << uncompressed_body_size << " " << compressed_body_size << "\n"; // Throws
 
     std::size_t body_size = (body_is_compressed ? compressed_body_size : uncompressed_body_size);
     out.write(body, body_size);
@@ -253,10 +260,12 @@ void ServerProtocol::make_download_message(int protocol_version, OutputBuffer& o
                   "latest_server_version=%3, latest_server_version_salt=%4, "
                   "upload_client_version=%5, upload_server_version=%6, "
                   "num_changesets=%7, is_body_compressed=%8, body_size=%9, "
-                  "compressed_body_size=%10)",
+                  "compressed_body_size=%10, is_flx_sync=%11, query_version=%12, batch_state=%13, "
+                  "progress_estimate=%14)",
                   download_server_version, download_client_version, latest_server_version, latest_server_version_salt,
                   upload_client_version, upload_server_version, num_changesets, body_is_compressed,
-                  uncompressed_body_size, compressed_body_size); // Throws
+                  uncompressed_body_size, compressed_body_size, is_flx_sync, query_version, batch_state,
+                  progress_estimate); // Throws
 }
 
 
@@ -283,6 +292,23 @@ void ServerProtocol::make_error_message(int protocol_version, OutputBuffer& out,
     out << "error " << int(error_code_2) << " " << message_size << " " << int(try_again) << " " << session_ident
         << "\n";                      // Throws
     out.write(message, message_size); // Throws
+}
+
+void ServerProtocol::make_query_error_message(OutputBuffer& out, int error_code, std::string_view message,
+                                              session_ident_type session_ident, int64_t query_version)
+{
+    out << "query_error " << error_code << " " << message.size() << " " << session_ident << " " << query_version
+        << "\n"; // Throws
+    out.write(message.data(), message.size()); // Throws
+}
+
+
+void ServerProtocol::make_json_error_message(OutputBuffer& out, session_ident_type session_ident, int error_code,
+                                             std::string_view error_body)
+{
+    out << "json_error " << error_code << " " << error_body.size() << " " << session_ident << "\n"
+        << error_body; // Throws
+    BARQ_ASSERT(!out.fail());
 }
 
 

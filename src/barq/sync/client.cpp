@@ -887,6 +887,16 @@ void SessionImpl::process_pending_flx_bootstrap()
         call_debug_hook(SyncClientHookEvent::BootstrapBatchAboutToProcess, *pending_batch.progress, query_version,
                         batch_state, pending_batch.changesets.size());
 
+        if (pending_batch.changesets.empty()) {
+            BARQ_ASSERT_EX(batch_state == DownloadBatchState::LastInBatch, batch_state);
+            bootstrap_store->pop_front_pending(*transact, 0);
+            auto version = transact->commit_and_continue_as_read();
+            new_version.barq_version = version.version;
+            new_version.sync_version = {version.version, 0};
+            progress = *pending_batch.progress;
+            continue;
+        }
+
         history.integrate_server_changesets(
             *pending_batch.progress, 1.0, pending_batch.changesets, new_version, batch_state, logger, transact,
             [&](const Transaction& tr, util::Span<Changeset> changesets_applied) {
