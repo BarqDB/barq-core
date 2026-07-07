@@ -5708,6 +5708,43 @@ static void sync_error_handler(void* p, barq_sync_session_t*, const barq_sync_er
     userdata_p->error.message = userdata_p->error_message.c_str();
 }
 
+TEST_CASE("C API - token sync user", "[sync][c_api]") {
+    SECTION("creates a tenant/token user and derives validated sync configs") {
+        auto user = cptr(barq_sync_user_new_from_token("shop", "user_0", "jwt-token"));
+        REQUIRE(user);
+        CHECK((*user)->app_id() == "shop");
+        CHECK((*user)->user_id() == "user_0");
+        CHECK((*user)->access_token() == "jwt-token");
+
+        // A route must be set before a config can be built.
+        CHECK(!cptr(barq_sync_user_make_flexible_sync_config(user.get())));
+
+        barq_sync_user_set_route(user.get(), "ws://127.0.0.1:9090/barq-sync", true);
+
+        auto flx = cptr(barq_sync_user_make_flexible_sync_config(user.get()));
+        REQUIRE(flx);
+        CHECK(flx->flx_sync_requested);
+        CHECK(flx->partition_value.empty());
+
+        auto pbs = cptr(barq_sync_user_make_sync_config(user.get(), "orders"));
+        REQUIRE(pbs);
+        CHECK_FALSE(pbs->flx_sync_requested);
+
+        // A partition relative to the tenant is required; a leading '/' is rejected.
+        CHECK(!cptr(barq_sync_user_make_sync_config(user.get(), "/orders")));
+
+        // Refreshing the token is shared logic too.
+        barq_sync_user_set_access_token(user.get(), "jwt-token-2");
+        CHECK((*user)->access_token() == "jwt-token-2");
+    }
+
+    SECTION("rejects empty arguments") {
+        CHECK(!cptr(barq_sync_user_new_from_token("", "user_0", "t")));
+        CHECK(!cptr(barq_sync_user_new_from_token("shop", "", "t")));
+        CHECK(!cptr(barq_sync_user_new_from_token("shop", "user_0", "")));
+    }
+}
+
 TEST_CASE("C API - async_open", "[sync][pbs][c_api]") {
     TestSyncManager init_sync_manager;
     SyncTestFile test_config(init_sync_manager, "default");

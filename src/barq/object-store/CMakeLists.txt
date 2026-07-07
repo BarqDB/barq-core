@@ -98,6 +98,7 @@ if(BARQ_ENABLE_SYNC)
         sync/sync_manager.hpp
         sync/sync_session.hpp
         sync/sync_user.hpp
+        sync/token_sync_user.hpp
 
         sync/impl/network_reachability.hpp
         sync/impl/sync_client.hpp
@@ -109,7 +110,8 @@ if(BARQ_ENABLE_SYNC)
         sync/impl/sync_file.cpp
         sync/jwt.cpp
         sync/sync_manager.cpp
-        sync/sync_session.cpp)
+        sync/sync_session.cpp
+        sync/token_sync_user.cpp)
 
     if(APPLE)
         list(APPEND HEADERS
