@@ -3,9 +3,12 @@
 #define BARQ_NOINST_SERVER_FILE_ACCESS_CACHE_HPP
 
 #include <utility>
+#include <map>
 #include <memory>
 #include <string>
+#include <vector>
 #include <random>
+#include <array>
 
 #include <barq/util/assert.hpp>
 #include <barq/util/logger.hpp>
@@ -15,6 +18,9 @@
 
 namespace barq {
 namespace _impl {
+
+std::array<char, 64> derive_tenant_encryption_key(const std::string& tenant_id,
+                                                  const std::vector<char>& master_secret);
 
 /// This class maintains a list of open Barq files ordered according to the
 /// time when they were last accessed.
@@ -30,7 +36,9 @@ public:
     /// cache object before the first invocation of Slot::access() on an
     /// associated file file slot.
     ServerFileAccessCache(long max_open_files, util::Logger&, ServerHistory::Context&,
-                          util::Optional<std::array<char, 64>> encryption_key);
+                          util::Optional<std::array<char, 64>> encryption_key,
+                          util::Optional<std::vector<char>> tenant_encryption_master_secret = util::none,
+                          std::size_t max_open_files_per_tenant = 0);
 
     ~ServerFileAccessCache() noexcept;
 
@@ -49,6 +57,9 @@ private:
 
     const long m_max_open_files;
     const util::Optional<std::array<char, 64>> m_encryption_key;
+    const util::Optional<std::vector<char>> m_tenant_encryption_master_secret;
+    const std::size_t m_max_open_files_per_tenant;
+    std::map<std::string, long> m_num_open_files_by_tenant;
     // The ServerFileAccessCache is tied to the lifetime of the Server, so no shared_ptr needed
     util::Logger& m_logger;
     ServerHistory::Context& m_history_context;
@@ -56,6 +67,7 @@ private:
     void access(Slot&);
     void remove(Slot&) noexcept;
     void insert(Slot&) noexcept;
+    void close_least_recently_accessed_for_tenant(const std::string& tenant_id);
 };
 
 
@@ -67,9 +79,10 @@ class ServerFileAccessCache::Slot {
 public:
     const std::string barq_path;
     const std::string virt_path;
+    const std::string tenant_id;
 
     Slot(ServerFileAccessCache&, std::string barq_path, std::string virt_path, bool claim_sync_agent,
-         bool disable_sync_to_disk) noexcept;
+         bool disable_sync_to_disk);
 
     Slot(Slot&&) = default;
 
@@ -102,6 +115,7 @@ private:
     ServerFileAccessCache& m_cache;
     const bool m_disable_sync_to_disk;
     const bool m_claim_sync_agent;
+    util::Optional<std::array<char, 64>> m_tenant_encryption_key;
 
     Slot* m_prev_open_file = nullptr;
     Slot* m_next_open_file = nullptr;
@@ -131,13 +145,18 @@ private:
 
 inline ServerFileAccessCache::ServerFileAccessCache(long max_open_files, util::Logger& logger,
                                                     ServerHistory::Context& history_context,
-                                                    util::Optional<std::array<char, 64>> encryption_key)
+                                                    util::Optional<std::array<char, 64>> encryption_key,
+                                                    util::Optional<std::vector<char>> tenant_encryption_master_secret,
+                                                    std::size_t max_open_files_per_tenant)
     : m_max_open_files{max_open_files}
-    , m_encryption_key{encryption_key}
+    , m_encryption_key{std::move(encryption_key)}
+    , m_tenant_encryption_master_secret{std::move(tenant_encryption_master_secret)}
+    , m_max_open_files_per_tenant{max_open_files_per_tenant}
     , m_logger{logger}
     , m_history_context{history_context}
 {
     BARQ_ASSERT(m_max_open_files >= 1);
+    BARQ_ASSERT(!(m_encryption_key && m_tenant_encryption_master_secret));
 }
 
 inline ServerFileAccessCache::~ServerFileAccessCache() noexcept
@@ -183,13 +202,25 @@ inline void ServerFileAccessCache::insert(Slot& slot) noexcept
 }
 
 inline ServerFileAccessCache::Slot::Slot(ServerFileAccessCache& cache, std::string rp, std::string vp,
-                                         bool claim_sync_agent, bool dstd) noexcept
+                                         bool claim_sync_agent, bool dstd)
     : barq_path{std::move(rp)}
     , virt_path{std::move(vp)}
+    , tenant_id{[&] {
+        if (virt_path.empty())
+            return std::string{};
+        std::size_t begin = (virt_path.front() == '/') ? 1 : 0;
+        if (begin >= virt_path.size())
+            return std::string{};
+        std::size_t end = virt_path.find('/', begin);
+        return virt_path.substr(begin, end - begin); // Throws
+    }()}
     , m_cache{cache}
     , m_disable_sync_to_disk{dstd}
     , m_claim_sync_agent{claim_sync_agent}
 {
+    if (m_cache.m_tenant_encryption_master_secret) {
+        m_tenant_encryption_key = derive_tenant_encryption_key(tenant_id, *m_cache.m_tenant_encryption_master_secret);
+    }
 }
 
 inline ServerFileAccessCache::Slot::~Slot() noexcept
@@ -225,7 +256,9 @@ inline void ServerFileAccessCache::Slot::close() noexcept
 inline DBOptions ServerFileAccessCache::Slot::make_shared_group_options() const noexcept
 {
     DBOptions options;
-    if (m_cache.m_encryption_key)
+    if (m_tenant_encryption_key)
+        options.encryption_key = m_tenant_encryption_key->data();
+    else if (m_cache.m_encryption_key)
         options.encryption_key = m_cache.m_encryption_key->data();
     if (m_disable_sync_to_disk)
         options.durability = DBOptions::Durability::Unsafe;
@@ -236,6 +269,12 @@ inline void ServerFileAccessCache::Slot::do_close() noexcept
 {
     BARQ_ASSERT(is_open());
     --m_cache.m_num_open_files;
+    auto i = m_cache.m_num_open_files_by_tenant.find(tenant_id);
+    if (i != m_cache.m_num_open_files_by_tenant.end()) {
+        --i->second;
+        if (i->second == 0)
+            m_cache.m_num_open_files_by_tenant.erase(i);
+    }
     m_cache.remove(*this);
     m_file.reset();
 }

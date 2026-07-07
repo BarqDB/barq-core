@@ -4,9 +4,7 @@
 
 using namespace barq;
 
-namespace {
-
-bool valid_virt_path_segment(const std::string& seg)
+bool _impl::valid_virt_path_segment(const std::string& seg)
 {
     if (seg.empty())
         return false;
@@ -30,8 +28,6 @@ bool valid_virt_path_segment(const std::string& seg)
     }
     return true;
 }
-
-} // unnamed namespace
 
 
 _impl::VirtualPathComponents _impl::parse_virtual_path(const std::string& root_path, const std::string& virt_path)
@@ -68,6 +64,27 @@ _impl::VirtualPathComponents _impl::parse_virtual_path(const std::string& root_p
     result.is_valid = true;
     result.real_barq_path = real_path + ".barq";
     return result;
+}
+
+
+bool _impl::make_tenant_virtual_path(const std::string& tenant_id, const std::string& client_path,
+                                     std::string& virt_path, std::string* relative_path)
+{
+    if (!valid_virt_path_segment(tenant_id))
+        return false;
+    if (client_path.empty())
+        return false;
+    if (client_path.front() == '/')
+        return false;
+
+    VirtualPathComponents client_path_components = parse_virtual_path("", "/" + client_path); // Throws
+    if (!client_path_components.is_valid)
+        return false;
+
+    virt_path = "/" + tenant_id + "/" + client_path; // Throws
+    if (relative_path)
+        *relative_path = client_path; // Throws
+    return true;
 }
 
 
@@ -110,7 +127,7 @@ void _impl::make_dirs(const std::string& root_path, const std::string& virt_path
         if (pos == std::string::npos)
             break;
         std::string name = virt_path.substr(prev_pos, pos - prev_pos);
-        BARQ_ASSERT(valid_virt_path_segment(name));
+        BARQ_ASSERT(_impl::valid_virt_path_segment(name));
         real_path = util::File::resolve(name, real_path);
         util::try_make_dir(real_path);
         prev_pos = pos;

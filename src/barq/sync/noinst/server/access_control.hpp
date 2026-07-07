@@ -1,6 +1,10 @@
 #ifndef BARQ_SYNC_ACCESS_CONTROL_HPP
 #define BARQ_SYNC_ACCESS_CONTROL_HPP
 
+#include <map>
+#include <memory>
+#include <vector>
+
 #include <barq/string_data.hpp>
 #include <barq/sync/noinst/server/access_token.hpp>
 #include <barq/sync/noinst/server/crypto_server.hpp>
@@ -10,12 +14,17 @@ namespace barq {
 namespace sync {
 
 struct AccessControl {
+    struct PublicKeyStore {
+        std::map<AppIdent, std::vector<PKey>> keys;
+    };
+
     /// Opens the Barq database at path \a db_path and initializes this
     /// AccessControl object to verify access tokens using \a public_key.
     ///
     /// If \a public_key is not present, access tokens without a signature
     /// will pass verification.
-    AccessControl(util::Optional<PKey> public_key);
+    AccessControl(util::Optional<PKey> public_key,
+                  std::shared_ptr<const PublicKeyStore> tenant_public_keys = nullptr);
     ~AccessControl();
 
     /// Verify a string representing an access token.
@@ -42,6 +51,8 @@ struct AccessControl {
     bool is_admin(const AccessToken&) const noexcept;
 
     AccessToken::Verifier& verifier() const noexcept;
+
+    bool uses_tenant_public_keys() const noexcept;
 
 private:
     struct Impl;

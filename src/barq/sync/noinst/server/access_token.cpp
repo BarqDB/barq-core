@@ -322,3 +322,8 @@ bool AccessToken::parse(StringData signed_token, AccessToken& token, ParseError&
     token = std::move(token_parser.m_token);
     return true;
 }
+
+bool AccessToken::parse_unverified(StringData signed_token, AccessToken& token, ParseError& error)
+{
+    return parse(signed_token, token, error, nullptr);
+}

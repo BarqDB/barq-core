@@ -3,11 +3,48 @@
 using namespace barq;
 using namespace barq::sync;
 
+namespace {
+
+class SingleKeyVerifier final : public AccessToken::Verifier {
+public:
+    explicit SingleKeyVerifier(const PKey& public_key)
+        : m_public_key{public_key}
+    {
+    }
+
+    bool verify(BinaryData access_token, BinaryData signature) const override final
+    {
+        return m_public_key.verify(access_token, signature); // Throws
+    }
+
+private:
+    const PKey& m_public_key;
+};
+
+StringData without_leading_slash(const BarqFileIdent& path) noexcept
+{
+    StringData data{path};
+    if (data.size() > 0 && data[0] == '/')
+        return data.substr(1);
+    return data;
+}
+
+bool token_path_matches(const AccessToken& token, const BarqFileIdent& barq_file) noexcept
+{
+    if (!token.path)
+        return true;
+    return without_leading_slash(*token.path) == without_leading_slash(barq_file);
+}
+
+} // unnamed namespace
+
 struct AccessControl::Impl final : public AccessToken::Verifier {
     util::Optional<PKey> m_public_key;
+    std::shared_ptr<const PublicKeyStore> m_tenant_public_keys;
 
-    Impl(util::Optional<PKey> public_key)
+    Impl(util::Optional<PKey> public_key, std::shared_ptr<const PublicKeyStore> tenant_public_keys)
         : m_public_key(std::move(public_key))
+        , m_tenant_public_keys(std::move(tenant_public_keys))
     {
     }
 
@@ -19,8 +56,9 @@ struct AccessControl::Impl final : public AccessToken::Verifier {
     }
 };
 
-AccessControl::AccessControl(util::Optional<PKey> public_key)
-    : m_impl(new Impl(std::move(public_key)))
+AccessControl::AccessControl(util::Optional<PKey> public_key,
+                             std::shared_ptr<const PublicKeyStore> tenant_public_keys)
+    : m_impl(new Impl(std::move(public_key), std::move(tenant_public_keys)))
 {
 }
 
@@ -31,6 +69,38 @@ util::Optional<AccessToken> AccessControl::verify_access_token(StringData signed
 {
     AccessToken::ParseError error;
     AccessToken token;
+    if (m_impl->m_tenant_public_keys) {
+        if (!AccessToken::parse_unverified(signed_token, token, error)) {
+            if (out_error)
+                *out_error = error;
+            return util::none;
+        }
+        if (token.app_id.empty()) {
+            if (out_error)
+                *out_error = AccessToken::ParseError::missing_app_id;
+            return util::none;
+        }
+        auto keys = m_impl->m_tenant_public_keys->keys.find(token.app_id);
+        if (keys == m_impl->m_tenant_public_keys->keys.end() || keys->second.empty()) {
+            if (out_error)
+                *out_error = AccessToken::ParseError::unknown_app_id;
+            return util::none;
+        }
+
+        for (const PKey& key : keys->second) {
+            AccessToken verified_token;
+            SingleKeyVerifier verifier{key};
+            if (AccessToken::parse(signed_token, verified_token, error, &verifier)) {
+                if (out_error)
+                    *out_error = AccessToken::ParseError::none;
+                return verified_token;
+            }
+        }
+        if (out_error)
+            *out_error = AccessToken::ParseError::invalid_signature;
+        return util::none;
+    }
+
     // For the purpose of testing, public key is allowed to be absent. When it
     // is absent, we set `out_error` to
     // `AccessToken::ParseError::invalid_signature` but still pass the parsed
@@ -57,7 +127,7 @@ util::Optional<AccessToken> AccessControl::verify_access_token(StringData signed
 bool AccessControl::can(const AccessToken& token, Privilege permission,
                         const BarqFileIdent& barq_file) const noexcept
 {
-    if (token.path && *token.path != barq_file) {
+    if (!token_path_matches(token, barq_file)) {
         return false;
     }
     unsigned int p = static_cast<unsigned int>(permission);
@@ -66,7 +136,7 @@ bool AccessControl::can(const AccessToken& token, Privilege permission,
 
 bool AccessControl::can(const AccessToken& token, unsigned int mask, const BarqFileIdent& barq_file) const noexcept
 {
-    if (token.path && *token.path != barq_file) {
+    if (!token_path_matches(token, barq_file)) {
         return false;
     }
     return (token.access & mask) == mask;
@@ -75,6 +145,11 @@ bool AccessControl::can(const AccessToken& token, unsigned int mask, const BarqF
 AccessToken::Verifier& AccessControl::verifier() const noexcept
 {
     return *m_impl;
+}
+
+bool AccessControl::uses_tenant_public_keys() const noexcept
+{
+    return bool(m_impl->m_tenant_public_keys);
 }
 
 // This is_admin() function is more complicated than it should be due to
