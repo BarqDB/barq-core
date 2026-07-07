@@ -482,6 +482,27 @@ void InstructionApplier::operator()(const Instruction::Update& instr)
             // Update (insert) of dictionary element.
 
             auto visitor = util::overload{
+                [&](const ObjLink& link) {
+                    auto col = dict.get_col_key();
+                    auto data_type = DataType(col.get_type());
+                    auto table = dict.get_table();
+                    if (data_type == type_Link) {
+                        auto target_table = table->get_link_target(col);
+                        if (target_table->get_key() != link.get_table_key()) {
+                            m_applier->bad_transaction_log(
+                                "Update: Target table mismatch for dictionary link in '%2.%1'", table->get_column_name(col),
+                                table->get_name());
+                        }
+                        dict.insert(key, Mixed{link});
+                    }
+                    else if (data_type == type_TypedLink || data_type == type_Mixed) {
+                        dict.insert(key, Mixed{link});
+                    }
+                    else {
+                        m_applier->bad_transaction_log("Update: Link value in non-link dictionary '%2.%1'",
+                                                       table->get_column_name(col), table->get_name());
+                    }
+                },
                 [&](Mixed value) {
                     if (value.is_null()) {
                         // FIXME: Separate handling of NULL is needed because

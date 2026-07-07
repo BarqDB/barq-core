@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -9,13 +11,28 @@
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <vector>
+
+#if defined(BARQ_SYNC_SERVER_BINARY) && !defined(_WIN32) && !BARQ_ANDROID && !BARQ_IOS
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+#if defined(BARQ_SYNC_SERVER_BINARY) && !defined(_WIN32) && !BARQ_ANDROID && !BARQ_IOS
+extern char** environ;
+#endif
 
 #include <barq.hpp>
 #include <barq/chunked_binary.hpp>
 #include <barq/data_type.hpp>
+#include <barq/dictionary.hpp>
 #include <barq/history.hpp>
 #include <barq/impl/simulated_failure.hpp>
 #include <barq/list.hpp>
@@ -30,11 +47,13 @@
 #include <barq/sync/network/network.hpp>
 #include <barq/sync/network/websocket.hpp>
 #include <barq/sync/noinst/protocol_codec.hpp>
+#include <barq/sync/noinst/server/access_control.hpp>
 #include <barq/sync/noinst/server/server.hpp>
 #include <barq/sync/noinst/server/server_dir.hpp>
 #include <barq/sync/noinst/server/server_history.hpp>
 #include <barq/sync/object_id.hpp>
 #include <barq/sync/protocol.hpp>
+#include <barq/sync/subscriptions.hpp>
 #include <barq/sync/transform.hpp>
 #include <barq/util/buffer.hpp>
 #include <barq/util/features.h>
@@ -125,6 +144,252 @@ ClientHistory& get_history(DBRef db)
 {
     return get_replication(db).get_history();
 }
+
+const char g_tenant_pbs_user_token[] =
+    "eyJpZGVudGl0eSI6InBic191c2VyIiwiYWRtaW4iOmZhbHNlLCJ0aW1lc3RhbXAiOjE0NTU1MzA2MTQs"
+    "ImV4cGlyZXMiOm51bGwsImFwcF9pZCI6InRlbmFudC1wYnMiLCJwYXRoIjoicGJzIiwiYWNjZXNzIjpb"
+    "ImRvd25sb2FkIiwidXBsb2FkIiwibWFuYWdlIl19"
+    ":"
+    "ScYHEV1RPldbhtHlLoip6bhxJbOrrDMZXsdsjpPQjpNFjo+I8rfPAJYthlLBEHIHM/cwj/yeCcOYJFnA"
+    "fp+yA87jExVJ0HSn0XTlj2M8LP8cYap7F68P309gCQrw0omO7PQcJIukOtXjcYV8of5XH+rKqU2LN8l"
+    "66Z1x7kB8vZDPHRw3j4UeaO+tTgF/HqWAQQ4aE7Bx5yZjtG43xi57Og7CbELPAOhV8yBllhRwfbEM/o"
+    "fQfuTbTTALYGSsUbFwE07N6A8jfwIw4HKV3F5f8ymz6HPj6/J833ROU/9J6No6CBsdH9j7BDz7WrAMH"
+    "HWNLu9CAjOoL9CJU4YboW9dZg==";
+
+const char g_tenant_flx_seed_token[] =
+    "eyJpZGVudGl0eSI6ImZseF9zZWVkIiwiYWRtaW4iOmZhbHNlLCJ0aW1lc3RhbXAiOjE0NTU1MzA2MTQs"
+    "ImV4cGlyZXMiOm51bGwsImFwcF9pZCI6InRlbmFudC1mbHgiLCJwYXRoIjoiZmx4IiwiYWNjZXNzIjpb"
+    "ImRvd25sb2FkIiwidXBsb2FkIiwibWFuYWdlIl19"
+    ":"
+    "3DpSoDLSeqoQIcv55oUhZdF4+Dei2ASOJwt6zyeU9NWBPuIuB9oXDjbownZLVBHGM/Xey2BpMF9lt1w"
+    "r1rZje++b7t2uQsTgQYDicRNcO3VZ1o+IXWbpe5CX4aObBgJ5ZLakTMIOELoG9hjsIvCqaqGEh0iCn"
+    "kYSeQAlhNu0Xbw5GZPYV7itLOmKuppMsWS03Dc4fKKsyQO8O0PPGc0tFswobaaL0p4xa8ICcILETmi"
+    "7gJJ+pI6o/zouXkmcEEZItUpnfIBd8xQc2vVgkX59qzSE45RZXGxFIkiHzPaiQ4KNGf5rdjsMJa2rT"
+    "ySXuOsOSDT4BN+4Oa3803pWavTIRw==";
+
+const char g_tenant_flx_user_token[] =
+    "eyJpZGVudGl0eSI6InVzZXJfMCIsImFkbWluIjpmYWxzZSwidGltZXN0YW1wIjoxNDU1NTMwNjE0LCJl"
+    "eHBpcmVzIjpudWxsLCJhcHBfaWQiOiJ0ZW5hbnQtZmx4IiwicGF0aCI6ImZseCIsImFjY2VzcyI6WyJk"
+    "b3dubG9hZCIsInVwbG9hZCIsIm1hbmFnZSJdfQ=="
+    ":"
+    "s8slSB6fCJGJiYTEIO8QswZTEna+dM+dwcC04TRLCa7cb7/QobG14t0kkF3dTLSValH643+JPrNtFsl"
+    "waqeHf+UPPfgJbdYhtSoG21iU7+dwWyHFIeaMPeQBhcZbcsNS35ERxbRxM5xYMwgBR9BBCs55+hstQ"
+    "mbib05YSBH3dpTNhoTMZmDt9761v3rWXNp/+85LJiU9awmXnlRLCH+uovtVf/zAJ81tEXPlqdxNIkT"
+    "nlnFEjMptECzAg3/NSOY8K6SjbvivnZRH6oEYrexhE6YyDz9KST4yhouJTSEYTbwBWey7pBcD7mG+5"
+    "RuJR6TJado1sQSwK++WsI6qrFT+SA==";
+
+#if defined(BARQ_SYNC_SERVER_BINARY) && !defined(_WIN32) && !BARQ_ANDROID && !BARQ_IOS
+class ExternalServerProcess {
+public:
+    explicit ExternalServerProcess(std::vector<std::string> args)
+    {
+        int pipe_fds[2];
+        if (pipe(pipe_fds) != 0) {
+            throw std::runtime_error(util::format("pipe() failed: %1", errno));
+        }
+
+        m_stdout_fd = pipe_fds[0];
+        int stdout_write_fd = pipe_fds[1];
+
+        posix_spawn_file_actions_t actions;
+        if (posix_spawn_file_actions_init(&actions) != 0) {
+            close(stdout_write_fd);
+            close(m_stdout_fd);
+            m_stdout_fd = -1;
+            throw std::runtime_error("posix_spawn_file_actions_init() failed");
+        }
+
+        posix_spawn_file_actions_adddup2(&actions, stdout_write_fd, STDOUT_FILENO);
+        posix_spawn_file_actions_addclose(&actions, m_stdout_fd);
+        posix_spawn_file_actions_addclose(&actions, stdout_write_fd);
+
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 1);
+        for (std::string& arg : args) {
+            argv.push_back(arg.data());
+        }
+        argv.push_back(nullptr);
+
+        int ret = posix_spawn(&m_pid, argv[0], &actions, nullptr, argv.data(), environ);
+        posix_spawn_file_actions_destroy(&actions);
+        close(stdout_write_fd);
+
+        if (ret != 0) {
+            close(m_stdout_fd);
+            m_stdout_fd = -1;
+            throw std::runtime_error(util::format("posix_spawn(%1) failed: %2", args.front(), ret));
+        }
+    }
+
+    ~ExternalServerProcess()
+    {
+        stop();
+        if (m_stdout_fd != -1) {
+            close(m_stdout_fd);
+        }
+    }
+
+    ExternalServerProcess(const ExternalServerProcess&) = delete;
+    ExternalServerProcess& operator=(const ExternalServerProcess&) = delete;
+
+    std::string wait_for_route()
+    {
+        std::string output;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (auto route = find_route(output); !route.empty()) {
+                return route;
+            }
+
+            pollfd pfd;
+            pfd.fd = m_stdout_fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+
+            int ret = poll(&pfd, 1, 100);
+            if (ret < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(util::format("poll() failed: %1", errno));
+            }
+            if (ret == 0) {
+                continue;
+            }
+
+            char buffer[512];
+            ssize_t n = read(m_stdout_fd, buffer, sizeof(buffer));
+            if (n > 0) {
+                output.append(buffer, size_t(n)); // Throws
+                continue;
+            }
+            break;
+        }
+
+        throw std::runtime_error("barq-server did not print a listening route. Output: " + output);
+    }
+
+private:
+    static std::string find_route(const std::string& output)
+    {
+        std::string marker = " listening on "; // Throws
+        std::size_t begin = output.find(marker);
+        if (begin == std::string::npos) {
+            return {};
+        }
+        begin += marker.size();
+        std::size_t end = output.find('\n', begin);
+        if (end == std::string::npos) {
+            return {};
+        }
+        return output.substr(begin, end - begin); // Throws
+    }
+
+    void stop()
+    {
+        if (m_pid <= 0) {
+            return;
+        }
+
+        kill(m_pid, SIGTERM);
+        int status = 0;
+        for (int i = 0; i < 50; ++i) {
+            pid_t ret = waitpid(m_pid, &status, WNOHANG);
+            if (ret == m_pid) {
+                m_pid = -1;
+                return;
+            }
+            if (ret == -1 && errno != EINTR) {
+                m_pid = -1;
+                return;
+            }
+            usleep(100000);
+        }
+
+        kill(m_pid, SIGKILL);
+        while (waitpid(m_pid, &status, 0) == -1 && errno == EINTR) {
+        }
+        m_pid = -1;
+    }
+
+    pid_t m_pid = -1;
+    int m_stdout_fd = -1;
+};
+
+class ExternalSyncClient {
+public:
+    explicit ExternalSyncClient(std::shared_ptr<util::Logger> logger)
+        : m_logger(std::move(logger))
+        , m_socket_provider(std::make_shared<websocket::DefaultSocketProvider>(
+              m_logger, "", nullptr, websocket::DefaultSocketProvider::AutoStart{false}))
+    {
+        Client::Config config;
+        config.socket_provider = m_socket_provider;
+        config.logger = m_logger;
+        config.reconnect_mode = ReconnectMode::testing;
+        config.ping_keepalive_period = 100000000;
+        config.pong_keepalive_timeout = 100000000;
+        config.fix_up_object_ids = true;
+        m_client = std::make_unique<Client>(std::move(config));
+        m_socket_provider->start();
+    }
+
+    ~ExternalSyncClient()
+    {
+        m_client->shutdown_and_wait();
+        m_socket_provider.reset();
+    }
+
+    Client& get() noexcept
+    {
+        return *m_client;
+    }
+
+private:
+    std::shared_ptr<util::Logger> m_logger;
+    std::shared_ptr<websocket::DefaultSocketProvider> m_socket_provider;
+    std::unique_ptr<Client> m_client;
+};
+
+Session::Config make_external_cli_session_config(Session::port_type port, const char* token, const char* user_id,
+                                                 unit_test::TestContext& test_context)
+{
+    Session::Config config;
+    config.service_identifier = "/barq-sync";
+    config.barq_identifier = "/test";
+    config.signed_user_token = token;
+    config.user_id = user_id;
+    config.server_address = "127.0.0.1";
+    config.server_port = port;
+    config.connection_state_change_listener = [&](ConnectionState state, std::optional<SessionErrorInfo> error_info) {
+        if (state != ConnectionState::disconnected) {
+            return;
+        }
+        BARQ_ASSERT(error_info);
+        test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status, error_info->is_fatal);
+        bool client_error_occurred = true;
+        CHECK_NOT(client_error_occurred);
+    };
+    return config;
+}
+
+Session::port_type parse_external_cli_server_port(const std::string& route)
+{
+    std::string suffix = "/barq-sync";
+    std::size_t suffix_pos = route.rfind(suffix);
+    if (suffix_pos == std::string::npos) {
+        throw std::runtime_error("barq-server route is missing /barq-sync: " + route);
+    }
+
+    std::size_t colon_pos = route.rfind(':', suffix_pos);
+    if (colon_pos == std::string::npos) {
+        throw std::runtime_error("barq-server route is missing a port: " + route);
+    }
+
+    unsigned long port = std::stoul(route.substr(colon_pos + 1, suffix_pos - colon_pos - 1)); // Throws
+    return Session::port_type(port);
+}
+#endif
 
 Changeset get_reciprocal_changeset(ClientHistory& hist, version_type version)
 {
@@ -6506,6 +6771,3896 @@ TEST(Sync_DifferentUsersMultiplexing)
     CHECK_EQUAL(user_2_sess_1.sess.get_barq_connection_id(), user_2_sess_2.sess.get_barq_connection_id());
     CHECK_NOT_EQUAL(user_1_sess_1.sess.get_barq_connection_id(), user_2_sess_1.sess.get_barq_connection_id());
     CHECK_NOT_EQUAL(user_1_sess_2.sess.get_barq_connection_id(), user_2_sess_2.sess.get_barq_connection_id());
+}
+
+namespace {
+
+void create_flx_isolation_schema(DBRef db, int64_t order_id, const char* owner_id, bool add_catalog_row)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto orders = wt.get_group().add_table_with_primary_key("class_Order", type_Int, "id");
+        orders->add_column(type_String, "owner_id");
+        orders->add_column(type_String, "item");
+
+        auto catalog = wt.get_group().add_table_with_primary_key("class_Catalog", type_Int, "id");
+        catalog->add_column(type_String, "name");
+
+        if (owner_id) {
+            auto order = orders->create_object_with_primary_key(order_id);
+            order.set("owner_id", std::string(owner_id));
+            order.set("item", util::format("item_%1", order_id));
+        }
+        if (add_catalog_row) {
+            auto item = catalog->create_object_with_primary_key(10);
+            item.set("name", "shared");
+        }
+    });
+}
+
+SubscriptionSet subscribe_to_flx_isolation_tables(DBRef db, const SubscriptionStoreRef& sub_store)
+{
+    auto rt = db->start_read();
+    auto mut = sub_store->get_latest().make_mutable_copy();
+    mut.insert_or_assign("orders", rt->get_table("class_Order")->where());
+    mut.insert_or_assign("catalog", rt->get_table("class_Catalog")->where());
+    return mut.commit();
+}
+
+SubscriptionSet subscribe_to_flx_isolation_tables_with_category(DBRef db, const SubscriptionStoreRef& sub_store)
+{
+    auto rt = db->start_read();
+    auto mut = sub_store->get_latest().make_mutable_copy();
+    mut.insert_or_assign("orders", rt->get_table("class_Order")->where());
+    mut.insert_or_assign("catalog", rt->get_table("class_Catalog")->where());
+    mut.insert_or_assign("category", rt->get_table("class_Category")->where());
+    return mut.commit();
+}
+
+SubscriptionSet set_flx_isolation_subscriptions(DBRef db, const SubscriptionStoreRef& sub_store, bool include_orders,
+                                                bool include_catalog)
+{
+    auto rt = db->start_read();
+    auto mut = sub_store->get_latest().make_mutable_copy();
+    mut.clear();
+    if (include_orders) {
+        mut.insert_or_assign("orders", rt->get_table("class_Order")->where());
+    }
+    if (include_catalog) {
+        mut.insert_or_assign("catalog", rt->get_table("class_Catalog")->where());
+    }
+    return mut.commit();
+}
+
+void upsert_order_owner(DBRef db, int64_t order_id, const char* owner_id)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto orders = wt.get_group().get_table("class_Order");
+        auto order = orders->get_object_with_primary_key(order_id);
+        if (!order)
+            order = orders->create_object_with_primary_key(order_id);
+        order.set("owner_id", std::string(owner_id));
+        order.set("item", util::format("item_%1", order_id));
+    });
+}
+
+void update_order_item_and_create_order(DBRef db, int64_t allowed_order_id, const char* item, int64_t denied_order_id,
+                                        const char* denied_owner_id)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto orders = wt.get_group().get_table("class_Order");
+        auto allowed = orders->get_object_with_primary_key(allowed_order_id);
+        if (!allowed) {
+            throw std::runtime_error(util::format("Allowed order %1 not found", allowed_order_id));
+        }
+        allowed.set("item", std::string(item));
+
+        auto denied = orders->get_object_with_primary_key(denied_order_id);
+        if (!denied) {
+            denied = orders->create_object_with_primary_key(denied_order_id);
+        }
+        denied.set("owner_id", std::string(denied_owner_id));
+        denied.set("item", util::format("item_%1", denied_order_id));
+    });
+}
+
+void add_flx_orders(DBRef db, int64_t first_order_id, int64_t last_order_id, const char* owner_id)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto orders = wt.get_group().get_table("class_Order");
+        for (int64_t order_id = first_order_id; order_id <= last_order_id; ++order_id) {
+            auto order = orders->create_object_with_primary_key(order_id);
+            order.set("owner_id", std::string(owner_id));
+            order.set("item", util::format("item_%1", order_id));
+        }
+    });
+}
+
+void delete_flx_order(DBRef db, int64_t order_id)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto orders = wt.get_group().get_table("class_Order");
+        auto order = orders->get_object_with_primary_key(order_id);
+        if (order) {
+            order.remove();
+        }
+    });
+}
+
+void add_flx_catalog_items(DBRef db, int64_t first_item_id, int64_t last_item_id)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        for (int64_t item_id = first_item_id; item_id <= last_item_id; ++item_id) {
+            auto item = catalog->create_object_with_primary_key(item_id);
+            item.set("name", util::format("shared_%1", item_id));
+        }
+    });
+}
+
+void set_flx_catalog_name(DBRef db, int64_t item_id, const char* name)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto item = catalog->get_object_with_primary_key(item_id);
+        if (!item)
+            item = catalog->create_object_with_primary_key(item_id);
+        item.set("name", std::string(name));
+    });
+}
+
+void delete_flx_catalog_item(DBRef db, int64_t item_id)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto item = catalog->get_object_with_primary_key(item_id);
+        if (item) {
+            item.remove();
+        }
+    });
+}
+
+void add_flx_catalog_scores_schema(DBRef db, const std::vector<int64_t>& scores)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto scores_col = catalog->get_column_key("scores");
+        if (!scores_col) {
+            scores_col = catalog->add_column_list(type_Int, "scores");
+        }
+
+        auto item = catalog->get_object_with_primary_key(10);
+        if (!item) {
+            return;
+        }
+
+        auto list = item.get_list<int64_t>(scores_col);
+        list.clear();
+        for (int64_t score : scores) {
+            list.add(score);
+        }
+    });
+}
+
+void set_flx_catalog_scores(DBRef db, const std::vector<int64_t>& scores)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto item = catalog->get_object_with_primary_key(10);
+        auto list = item.get_list<int64_t>("scores");
+        list.clear();
+        for (int64_t score : scores) {
+            list.add(score);
+        }
+    });
+}
+
+void add_flx_catalog_score_set_schema(DBRef db, const std::vector<int64_t>& scores)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto scores_col = catalog->get_column_key("score_set");
+        if (!scores_col) {
+            scores_col = catalog->add_column_set(type_Int, "score_set");
+        }
+
+        auto item = catalog->get_object_with_primary_key(10);
+        if (!item) {
+            return;
+        }
+
+        auto set = item.get_set<int64_t>(scores_col);
+        set.clear();
+        for (int64_t score : scores) {
+            set.insert(score);
+        }
+    });
+}
+
+void set_flx_catalog_score_set(DBRef db, const std::vector<int64_t>& scores)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto item = catalog->get_object_with_primary_key(10);
+        auto set = item.get_set<int64_t>("score_set");
+        set.clear();
+        for (int64_t score : scores) {
+            set.insert(score);
+        }
+    });
+}
+
+void add_flx_catalog_note_dict_schema(DBRef db, const std::vector<std::pair<std::string, std::string>>& notes)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto notes_col = catalog->get_column_key("notes");
+        if (!notes_col) {
+            notes_col = catalog->add_column_dictionary(type_String, "notes");
+        }
+
+        auto item = catalog->get_object_with_primary_key(10);
+        if (!item) {
+            return;
+        }
+
+        auto dictionary = item.get_dictionary(notes_col);
+        dictionary.clear();
+        for (const auto& note : notes) {
+            dictionary.insert(StringData(note.first), StringData(note.second));
+        }
+    });
+}
+
+void set_flx_catalog_note_dict(DBRef db, const std::vector<std::pair<std::string, std::string>>& notes)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto item = catalog->get_object_with_primary_key(10);
+        auto dictionary = item.get_dictionary("notes");
+        dictionary.clear();
+        for (const auto& note : notes) {
+            dictionary.insert(StringData(note.first), StringData(note.second));
+        }
+    });
+}
+
+void add_flx_catalog_category_schema(DBRef db, bool add_row)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto category = wt.get_group().get_table("class_Category");
+        if (!category) {
+            category = wt.get_group().add_table_with_primary_key("class_Category", type_Int, "id");
+            category->add_column(type_String, "label");
+        }
+        else if (!category->get_column_key("label")) {
+            category->add_column(type_String, "label");
+        }
+
+        auto category_col = catalog->get_column_key("category");
+        if (!category_col) {
+            category_col = catalog->add_column(*category, "category");
+        }
+
+        if (!add_row) {
+            return;
+        }
+
+        auto target = category->get_object_with_primary_key(50);
+        if (!target) {
+            target = category->create_object_with_primary_key(50);
+        }
+        target.set("label", "tools");
+
+        auto item = catalog->get_object_with_primary_key(10);
+        if (item) {
+            item.set<ObjKey>(category_col, target.get_key());
+        }
+    });
+}
+
+void set_flx_catalog_category_null(DBRef db)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto item = catalog->get_object_with_primary_key(10);
+        item.set<ObjKey>(catalog->get_column_key("category"), ObjKey{});
+    });
+}
+
+void add_flx_catalog_category_collections_schema(DBRef db, bool add_rows)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto category = wt.get_group().get_table("class_Category");
+        if (!category) {
+            category = wt.get_group().add_table_with_primary_key("class_Category", type_Int, "id");
+            category->add_column(type_String, "label");
+        }
+        else if (!category->get_column_key("label")) {
+            category->add_column(type_String, "label");
+        }
+
+        auto list_col = catalog->get_column_key("category_list");
+        if (!list_col) {
+            list_col = catalog->add_column_list(*category, "category_list");
+        }
+        auto set_col = catalog->get_column_key("category_set");
+        if (!set_col) {
+            set_col = catalog->add_column_set(*category, "category_set");
+        }
+        auto dict_col = catalog->get_column_key("category_dict");
+        if (!dict_col) {
+            dict_col = catalog->add_column_dictionary(*category, "category_dict");
+        }
+
+        if (!add_rows) {
+            return;
+        }
+
+        auto first = category->get_object_with_primary_key(50);
+        if (!first) {
+            first = category->create_object_with_primary_key(50);
+        }
+        first.set("label", "tools");
+
+        auto second = category->get_object_with_primary_key(51);
+        if (!second) {
+            second = category->create_object_with_primary_key(51);
+        }
+        second.set("label", "books");
+
+        auto item = catalog->get_object_with_primary_key(10);
+        if (!item) {
+            return;
+        }
+
+        auto list = item.get_linklist(list_col);
+        list.clear();
+        list.add(first.get_key());
+        list.add(second.get_key());
+
+        auto set = item.get_linkset(set_col);
+        set.clear();
+        set.insert(first.get_key());
+        set.insert(second.get_key());
+
+        auto dictionary = item.get_dictionary(dict_col);
+        dictionary.clear();
+        dictionary.insert("primary", first.get_link());
+        dictionary.insert("secondary", second.get_link());
+    });
+}
+
+void set_flx_catalog_category_collections_to_second(DBRef db)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto category = wt.get_group().get_table("class_Category");
+        auto second = category->get_object_with_primary_key(51);
+        auto item = catalog->get_object_with_primary_key(10);
+
+        auto list = item.get_linklist("category_list");
+        list.clear();
+        list.add(second.get_key());
+
+        auto set = item.get_linkset("category_set");
+        set.clear();
+        set.insert(second.get_key());
+
+        auto dictionary = item.get_dictionary("category_dict");
+        dictionary.clear();
+        dictionary.insert("secondary", second.get_link());
+    });
+}
+
+void add_flx_catalog_detail_schema(DBRef db, bool add_row)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto detail = wt.get_group().get_table("class_CatalogDetail");
+        if (!detail) {
+            detail = wt.get_group().add_table("class_CatalogDetail", Table::Type::Embedded);
+            detail->add_column(type_String, "summary");
+            detail->add_column(type_Int, "rating");
+        }
+
+        auto detail_col = catalog->get_column_key("detail");
+        if (!detail_col) {
+            detail_col = catalog->add_column(*detail, "detail");
+        }
+
+        if (!add_row) {
+            return;
+        }
+
+        auto item = catalog->get_object_with_primary_key(10);
+        if (!item) {
+            return;
+        }
+
+        auto detail_obj = item.get_linked_object(detail_col);
+        if (!detail_obj) {
+            detail_obj = item.create_and_set_linked_object(detail_col);
+        }
+        detail_obj.set("summary", "seeded");
+        detail_obj.set("rating", int64_t(5));
+    });
+}
+
+void set_flx_catalog_detail_summary(DBRef db, const char* summary)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto item = catalog->get_object_with_primary_key(10);
+        auto detail_col = catalog->get_column_key("detail");
+        auto detail = item.get_linked_object(detail_col);
+        if (!detail) {
+            detail = item.create_and_set_linked_object(detail_col);
+        }
+        detail.set("summary", std::string(summary));
+    });
+}
+
+void add_flx_catalog_detail_collections_schema(DBRef db, bool add_rows)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto detail = wt.get_group().get_table("class_CatalogDetailEntry");
+        if (!detail) {
+            detail = wt.get_group().add_table("class_CatalogDetailEntry", Table::Type::Embedded);
+            detail->add_column(type_String, "summary");
+            detail->add_column(type_Int, "rating");
+        }
+
+        auto list_col = catalog->get_column_key("detail_list");
+        if (!list_col) {
+            list_col = catalog->add_column_list(*detail, "detail_list");
+        }
+        auto dict_col = catalog->get_column_key("detail_dict");
+        if (!dict_col) {
+            dict_col = catalog->add_column_dictionary(*detail, "detail_dict");
+        }
+
+        if (!add_rows) {
+            return;
+        }
+
+        auto item = catalog->get_object_with_primary_key(10);
+        if (!item) {
+            return;
+        }
+
+        auto list = item.get_linklist(list_col);
+        list.clear();
+        list.create_and_insert_linked_object(0).set_all("list_one", int64_t(1));
+        list.create_and_insert_linked_object(1).set_all("list_two", int64_t(2));
+
+        auto dictionary = item.get_dictionary(dict_col);
+        dictionary.clear();
+        dictionary.create_and_insert_linked_object("primary").set_all("dict_one", int64_t(3));
+        dictionary.create_and_insert_linked_object("secondary").set_all("dict_two", int64_t(4));
+    });
+}
+
+void set_flx_catalog_detail_collections_hacked(DBRef db)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto item = catalog->get_object_with_primary_key(10);
+
+        auto list = item.get_linklist("detail_list");
+        list.clear();
+        list.create_and_insert_linked_object(0).set_all("hacked_list", int64_t(99));
+
+        auto dictionary = item.get_dictionary("detail_dict");
+        dictionary.clear();
+        dictionary.create_and_insert_linked_object("bad").set_all("hacked_dict", int64_t(100));
+    });
+}
+
+void add_flx_catalog_mixed_schema(DBRef db, bool add_values)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        if (!catalog->get_column_key("mixed_value")) {
+            catalog->add_column(type_Mixed, "mixed_value", true);
+        }
+        if (!catalog->get_column_key("mixed_list")) {
+            catalog->add_column_list(type_Mixed, "mixed_list");
+        }
+        if (!catalog->get_column_key("mixed_set")) {
+            catalog->add_column_set(type_Mixed, "mixed_set");
+        }
+        if (!catalog->get_column_key("mixed_dict")) {
+            catalog->add_column_dictionary(type_Mixed, "mixed_dict");
+        }
+
+        if (!add_values) {
+            return;
+        }
+
+        auto item = catalog->get_object_with_primary_key(10);
+        if (!item) {
+            return;
+        }
+
+        item.set("mixed_value", Mixed{int64_t(42)});
+
+        auto list = item.get_list<Mixed>("mixed_list");
+        list.clear();
+        list.insert(0, Mixed{"alpha"});
+        list.insert(1, Mixed{int64_t(7)});
+        list.insert(2, Mixed{true});
+
+        auto set = item.get_set<Mixed>("mixed_set");
+        set.clear();
+        set.insert(Mixed{int64_t(3)});
+        set.insert(Mixed{"set_value"});
+
+        auto dictionary = item.get_dictionary("mixed_dict");
+        dictionary.clear();
+        dictionary.insert("name", Mixed{"dict_value"});
+        dictionary.insert("count", Mixed{int64_t(9)});
+    });
+}
+
+void set_flx_catalog_mixed_hacked(DBRef db)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto item = catalog->get_object_with_primary_key(10);
+
+        item.set("mixed_value", Mixed{"hacked"});
+
+        auto list = item.get_list<Mixed>("mixed_list");
+        list.clear();
+        list.insert(0, Mixed{int64_t(99)});
+
+        auto set = item.get_set<Mixed>("mixed_set");
+        set.clear();
+        set.insert(Mixed{"bad"});
+
+        auto dictionary = item.get_dictionary("mixed_dict");
+        dictionary.clear();
+        dictionary.insert("bad", Mixed{int64_t(100)});
+    });
+}
+
+void add_flx_catalog_mixed_link_schema(DBRef db, bool add_values)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto category = wt.get_group().get_table("class_Category");
+        if (!category) {
+            category = wt.get_group().add_table_with_primary_key("class_Category", type_Int, "id");
+            category->add_column(type_String, "label");
+        }
+        else if (!category->get_column_key("label")) {
+            category->add_column(type_String, "label");
+        }
+
+        if (!catalog->get_column_key("mixed_link")) {
+            catalog->add_column(type_Mixed, "mixed_link", true);
+        }
+        if (!catalog->get_column_key("mixed_link_list")) {
+            catalog->add_column_list(type_Mixed, "mixed_link_list");
+        }
+        if (!catalog->get_column_key("mixed_link_set")) {
+            catalog->add_column_set(type_Mixed, "mixed_link_set");
+        }
+        if (!catalog->get_column_key("mixed_link_dict")) {
+            catalog->add_column_dictionary(type_Mixed, "mixed_link_dict");
+        }
+
+        if (!add_values) {
+            return;
+        }
+
+        auto first = category->get_object_with_primary_key(50);
+        if (!first) {
+            first = category->create_object_with_primary_key(50);
+        }
+        first.set("label", "tools");
+
+        auto second = category->get_object_with_primary_key(51);
+        if (!second) {
+            second = category->create_object_with_primary_key(51);
+        }
+        second.set("label", "books");
+
+        auto item = catalog->get_object_with_primary_key(10);
+        if (!item) {
+            return;
+        }
+
+        item.set("mixed_link", Mixed{first.get_link()});
+
+        auto list = item.get_list<Mixed>("mixed_link_list");
+        list.clear();
+        list.insert(0, Mixed{first.get_link()});
+        list.insert(1, Mixed{second.get_link()});
+
+        auto set = item.get_set<Mixed>("mixed_link_set");
+        set.clear();
+        set.insert(Mixed{first.get_link()});
+        set.insert(Mixed{second.get_link()});
+
+        auto dictionary = item.get_dictionary("mixed_link_dict");
+        dictionary.clear();
+        dictionary.insert("primary", Mixed{first.get_link()});
+        dictionary.insert("secondary", Mixed{second.get_link()});
+    });
+}
+
+void set_flx_catalog_mixed_links_to_second(DBRef db)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto catalog = wt.get_group().get_table("class_Catalog");
+        auto category = wt.get_group().get_table("class_Category");
+        auto second = category->get_object_with_primary_key(51);
+        auto item = catalog->get_object_with_primary_key(10);
+
+        item.set("mixed_link", Mixed{second.get_link()});
+
+        auto list = item.get_list<Mixed>("mixed_link_list");
+        list.clear();
+        list.insert(0, Mixed{second.get_link()});
+
+        auto set = item.get_set<Mixed>("mixed_link_set");
+        set.clear();
+        set.insert(Mixed{second.get_link()});
+
+        auto dictionary = item.get_dictionary("mixed_link_dict");
+        dictionary.clear();
+        dictionary.insert("bad", Mixed{second.get_link()});
+    });
+}
+
+void add_flx_private_schema(DBRef db)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto table = wt.get_group().get_table("class_Private");
+        if (table) {
+            return;
+        }
+        table = wt.get_group().add_table_with_primary_key("class_Private", type_Int, "id");
+        table->add_column(type_String, "value");
+    });
+}
+
+SubscriptionSet subscribe_to_flx_private_table(DBRef db, const SubscriptionStoreRef& sub_store)
+{
+    auto rt = db->start_read();
+    auto table = rt->get_table("class_Private");
+    auto mut = sub_store->get_latest().make_mutable_copy();
+    mut.insert_or_assign("private", table->where());
+    return mut.commit();
+}
+
+void create_flx_person_schema(DBRef db)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto people = wt.get_group().add_table_with_primary_key("class_Person", type_Int, "id");
+        people->add_column(type_Int, "age");
+    });
+}
+
+SubscriptionSet subscribe_to_adult_people(DBRef db, const SubscriptionStoreRef& sub_store)
+{
+    auto rt = db->start_read();
+    auto people = rt->get_table("class_Person");
+    auto mut = sub_store->get_latest().make_mutable_copy();
+    mut.insert_or_assign("adults", people->where().greater(people->get_column_key("age"), int64_t(18)));
+    return mut.commit();
+}
+
+void replace_subscription_query(unit_test::TestContext& test_context, DBRef db, int64_t version, const char* query)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto sub_sets = wt.get_group().get_table("flx_subscription_sets");
+        CHECK(sub_sets);
+        auto sub_set = sub_sets->get_object_with_primary_key(version);
+        CHECK(sub_set);
+        auto subscriptions = sub_set.get_linklist("subscriptions");
+        CHECK_EQUAL(subscriptions.size(), 1);
+        subscriptions.get_object(0).set("query", std::string(query));
+    });
+}
+
+void upsert_flx_person(DBRef db, int64_t person_id, int64_t age)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto people = wt.get_group().get_table("class_Person");
+        auto person = people->get_object_with_primary_key(person_id);
+        if (!person)
+            person = people->create_object_with_primary_key(person_id);
+        person.set("age", age);
+    });
+}
+
+bool wait_for_subscription_state(SubscriptionSet& sub_set, SubscriptionSet::State state)
+{
+    for (size_t i = 0; i < 500; ++i) {
+        sub_set.refresh();
+        if (sub_set.state() == state)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    return false;
+}
+
+void upsert_flx_private_object(DBRef db, int64_t object_id, const char* value)
+{
+    write_transaction(db, [&](WriteTransaction& wt) {
+        auto table = wt.get_group().get_table("class_Private");
+        auto obj = table->get_object_with_primary_key(object_id);
+        if (!obj)
+            obj = table->create_object_with_primary_key(object_id);
+        obj.set("value", std::string(value));
+    });
+}
+
+void check_order_visibility(unit_test::TestContext& test_context, DBRef db, bool has_order_1, bool has_order_2)
+{
+    auto rt = db->start_read();
+    auto orders = rt->get_table("class_Order");
+    CHECK_EQUAL(bool(orders->get_object_with_primary_key(1)), has_order_1);
+    CHECK_EQUAL(bool(orders->get_object_with_primary_key(2)), has_order_2);
+    CHECK_EQUAL(orders->size(), size_t(has_order_1) + size_t(has_order_2));
+}
+
+void check_catalog_visible(unit_test::TestContext& test_context, DBRef db)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    CHECK_EQUAL(catalog->size(), 1);
+    CHECK(catalog->get_object_with_primary_key(10));
+}
+
+void check_catalog_count(unit_test::TestContext& test_context, DBRef db, std::size_t count)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    CHECK_EQUAL(catalog->size(), count);
+}
+
+void check_catalog_name(unit_test::TestContext& test_context, DBRef db, int64_t item_id, const char* name)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    auto item = catalog->get_object_with_primary_key(item_id);
+    CHECK(item);
+    CHECK_EQUAL(item.get<StringData>("name"), StringData(name));
+}
+
+void check_catalog_scores(unit_test::TestContext& test_context, DBRef db, const std::vector<int64_t>& expected)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    auto item = catalog->get_object_with_primary_key(10);
+    CHECK(item);
+    auto list = item.get_list<int64_t>("scores");
+    CHECK_EQUAL(list.size(), expected.size());
+    for (size_t i = 0; i < expected.size() && i < list.size(); ++i) {
+        CHECK_EQUAL(list.get(i), expected[i]);
+    }
+}
+
+void check_catalog_score_set(unit_test::TestContext& test_context, DBRef db, const std::vector<int64_t>& expected)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    auto item = catalog->get_object_with_primary_key(10);
+    CHECK(item);
+    auto set = item.get_set<int64_t>("score_set");
+    CHECK_EQUAL(set.size(), expected.size());
+    for (int64_t score : expected) {
+        CHECK_NOT_EQUAL(set.find(score), npos);
+    }
+}
+
+void check_catalog_note_dict(unit_test::TestContext& test_context, DBRef db,
+                             const std::vector<std::pair<std::string, std::string>>& expected)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    auto item = catalog->get_object_with_primary_key(10);
+    CHECK(item);
+    auto dictionary = item.get_dictionary("notes");
+    CHECK_EQUAL(dictionary.size(), expected.size());
+    for (const auto& note : expected) {
+        auto value = dictionary.try_get(StringData(note.first));
+        CHECK(value);
+        if (value) {
+            CHECK_EQUAL(value->get<StringData>(), StringData(note.second));
+        }
+    }
+}
+
+void check_catalog_category_label(unit_test::TestContext& test_context, DBRef db, const char* label)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    auto item = catalog->get_object_with_primary_key(10);
+    CHECK(item);
+    auto category = item.get_linked_object("category");
+    CHECK(category);
+    if (category) {
+        CHECK_EQUAL(category.get<StringData>("label"), StringData(label));
+    }
+}
+
+void check_catalog_category_unresolved(unit_test::TestContext& test_context, DBRef db)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    auto category = rt->get_table("class_Category");
+    CHECK(category);
+    CHECK_EQUAL(category->size(), 0);
+    CHECK_EQUAL(category->nb_unresolved(), 1);
+
+    auto item = catalog->get_object_with_primary_key(10);
+    CHECK(item);
+    auto category_col = catalog->get_column_key("category");
+    CHECK(category_col);
+    CHECK(item.is_unresolved(category_col));
+}
+
+void check_catalog_category_collections(unit_test::TestContext& test_context, DBRef db)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    auto category = rt->get_table("class_Category");
+    auto item = catalog->get_object_with_primary_key(10);
+    CHECK(item);
+
+    auto first = category->get_object_with_primary_key(50);
+    auto second = category->get_object_with_primary_key(51);
+    CHECK(first);
+    CHECK(second);
+
+    auto list = item.get_linklist("category_list");
+    CHECK_EQUAL(list.size(), 2);
+    if (list.size() == 2) {
+        CHECK_EQUAL(category->get_object(list.get(0)).get<StringData>("label"), StringData("tools"));
+        CHECK_EQUAL(category->get_object(list.get(1)).get<StringData>("label"), StringData("books"));
+    }
+
+    auto set = item.get_linkset("category_set");
+    CHECK_EQUAL(set.size(), 2);
+    CHECK_NOT_EQUAL(set.find(first.get_key()), npos);
+    CHECK_NOT_EQUAL(set.find(second.get_key()), npos);
+
+    auto dictionary = item.get_dictionary("category_dict");
+    CHECK_EQUAL(dictionary.size(), 2);
+    auto primary = dictionary.try_get("primary");
+    auto secondary = dictionary.try_get("secondary");
+    CHECK(primary);
+    CHECK(secondary);
+    if (primary) {
+        CHECK_EQUAL(category->get_object(primary->get<ObjKey>()).get<StringData>("label"), StringData("tools"));
+    }
+    if (secondary) {
+        CHECK_EQUAL(category->get_object(secondary->get<ObjKey>()).get<StringData>("label"), StringData("books"));
+    }
+}
+
+void check_catalog_detail(unit_test::TestContext& test_context, DBRef db, const char* summary, int64_t rating)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    auto item = catalog->get_object_with_primary_key(10);
+    CHECK(item);
+    auto detail = item.get_linked_object("detail");
+    CHECK(detail);
+    if (detail) {
+        CHECK_EQUAL(detail.get<StringData>("summary"), StringData(summary));
+        CHECK_EQUAL(detail.get<int64_t>("rating"), rating);
+    }
+}
+
+void check_catalog_detail_collections(unit_test::TestContext& test_context, DBRef db)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    auto item = catalog->get_object_with_primary_key(10);
+    CHECK(item);
+
+    auto list = item.get_linklist("detail_list");
+    CHECK_EQUAL(list.size(), 2);
+    if (list.size() == 2) {
+        auto first = list.get_object(0);
+        auto second = list.get_object(1);
+        CHECK_EQUAL(first.get<StringData>("summary"), StringData("list_one"));
+        CHECK_EQUAL(first.get<int64_t>("rating"), 1);
+        CHECK_EQUAL(second.get<StringData>("summary"), StringData("list_two"));
+        CHECK_EQUAL(second.get<int64_t>("rating"), 2);
+    }
+
+    auto dictionary = item.get_dictionary("detail_dict");
+    CHECK_EQUAL(dictionary.size(), 2);
+    auto primary = dictionary.get_object("primary");
+    auto secondary = dictionary.get_object("secondary");
+    CHECK(primary);
+    CHECK(secondary);
+    if (primary) {
+        CHECK_EQUAL(primary.get<StringData>("summary"), StringData("dict_one"));
+        CHECK_EQUAL(primary.get<int64_t>("rating"), 3);
+    }
+    if (secondary) {
+        CHECK_EQUAL(secondary.get<StringData>("summary"), StringData("dict_two"));
+        CHECK_EQUAL(secondary.get<int64_t>("rating"), 4);
+    }
+}
+
+void check_catalog_mixed_values(unit_test::TestContext& test_context, DBRef db)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    auto item = catalog->get_object_with_primary_key(10);
+    CHECK(item);
+
+    CHECK_EQUAL(item.get<Mixed>("mixed_value"), Mixed{int64_t(42)});
+
+    auto list = item.get_list<Mixed>("mixed_list");
+    CHECK_EQUAL(list.size(), 3);
+    if (list.size() == 3) {
+        CHECK_EQUAL(list.get(0), Mixed{"alpha"});
+        CHECK_EQUAL(list.get(1), Mixed{int64_t(7)});
+        CHECK_EQUAL(list.get(2), Mixed{true});
+    }
+
+    auto set = item.get_set<Mixed>("mixed_set");
+    CHECK_EQUAL(set.size(), 2);
+    CHECK_NOT_EQUAL(set.find(Mixed{int64_t(3)}), npos);
+    CHECK_NOT_EQUAL(set.find(Mixed{"set_value"}), npos);
+
+    auto dictionary = item.get_dictionary("mixed_dict");
+    CHECK_EQUAL(dictionary.size(), 2);
+    auto name = dictionary.try_get("name");
+    auto count = dictionary.try_get("count");
+    CHECK(name);
+    CHECK(count);
+    if (name) {
+        CHECK_EQUAL(*name, Mixed{"dict_value"});
+    }
+    if (count) {
+        CHECK_EQUAL(*count, Mixed{int64_t(9)});
+    }
+}
+
+void check_mixed_link_label(unit_test::TestContext& test_context, ConstTableRef category, Mixed value,
+                            const char* expected_label)
+{
+    CHECK(value.is_type(type_TypedLink));
+    if (!value.is_type(type_TypedLink)) {
+        return;
+    }
+
+    ObjLink link = value.get<ObjLink>();
+    CHECK_EQUAL(link.get_table_key(), category->get_key());
+    Obj target = category->try_get_object(link.get_obj_key());
+    CHECK(target);
+    if (target) {
+        CHECK_EQUAL(target.get<StringData>("label"), StringData(expected_label));
+    }
+}
+
+void check_catalog_mixed_links(unit_test::TestContext& test_context, DBRef db)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    auto category = rt->get_table("class_Category");
+    auto item = catalog->get_object_with_primary_key(10);
+    CHECK(item);
+    CHECK(category);
+    if (!item || !category) {
+        return;
+    }
+
+    Obj first = category->get_object_with_primary_key(50);
+    Obj second = category->get_object_with_primary_key(51);
+    CHECK(first);
+    CHECK(second);
+
+    check_mixed_link_label(test_context, category, item.get<Mixed>("mixed_link"), "tools");
+
+    auto list = item.get_list<Mixed>("mixed_link_list");
+    CHECK_EQUAL(list.size(), 2);
+    if (list.size() == 2) {
+        check_mixed_link_label(test_context, category, list.get(0), "tools");
+        check_mixed_link_label(test_context, category, list.get(1), "books");
+    }
+
+    auto set = item.get_set<Mixed>("mixed_link_set");
+    CHECK_EQUAL(set.size(), 2);
+    if (first) {
+        CHECK_NOT_EQUAL(set.find(Mixed{first.get_link()}), npos);
+    }
+    if (second) {
+        CHECK_NOT_EQUAL(set.find(Mixed{second.get_link()}), npos);
+    }
+
+    auto dictionary = item.get_dictionary("mixed_link_dict");
+    CHECK_EQUAL(dictionary.size(), 2);
+    auto primary = dictionary.try_get("primary");
+    auto secondary = dictionary.try_get("secondary");
+    CHECK(primary);
+    CHECK(secondary);
+    if (primary) {
+        check_mixed_link_label(test_context, category, *primary, "tools");
+    }
+    if (secondary) {
+        check_mixed_link_label(test_context, category, *secondary, "books");
+    }
+}
+
+void check_mixed_link_pending(unit_test::TestContext& test_context, Mixed value)
+{
+    CHECK(value.is_null() || value.is_unresolved_link());
+}
+
+void check_catalog_mixed_links_pending(unit_test::TestContext& test_context, DBRef db)
+{
+    auto rt = db->start_read();
+    auto catalog = rt->get_table("class_Catalog");
+    auto category = rt->get_table("class_Category");
+    auto item = catalog->get_object_with_primary_key(10);
+    CHECK(item);
+    CHECK(category);
+    if (!item || !category) {
+        return;
+    }
+    CHECK_EQUAL(category->size(), 0);
+    CHECK_EQUAL(category->nb_unresolved(), 2);
+
+    check_mixed_link_pending(test_context, item.get<Mixed>("mixed_link"));
+
+    auto list = item.get_list<Mixed>("mixed_link_list");
+    CHECK_EQUAL(list.size(), 2);
+    for (size_t i = 0; i < list.size(); ++i) {
+        check_mixed_link_pending(test_context, list.get(i));
+    }
+
+    auto set = item.get_set<Mixed>("mixed_link_set");
+    CHECK_EQUAL(set.size(), 2);
+    for (size_t i = 0; i < set.size(); ++i) {
+        check_mixed_link_pending(test_context, set.get_any(i));
+    }
+
+    auto dictionary = item.get_dictionary("mixed_link_dict");
+    CHECK_EQUAL(dictionary.size(), 2);
+    auto primary = dictionary.try_get("primary");
+    auto secondary = dictionary.try_get("secondary");
+    CHECK(primary);
+    CHECK(secondary);
+    if (primary) {
+        check_mixed_link_pending(test_context, *primary);
+    }
+    if (secondary) {
+        check_mixed_link_pending(test_context, *secondary);
+    }
+}
+
+void check_private_count(unit_test::TestContext& test_context, DBRef db, std::size_t count)
+{
+    auto rt = db->start_read();
+    auto table = rt->get_table("class_Private");
+    CHECK(table);
+    CHECK_EQUAL(table->size(), count);
+}
+
+void check_person_count(unit_test::TestContext& test_context, DBRef db, std::size_t count)
+{
+    auto rt = db->start_read();
+    auto table = rt->get_table("class_Person");
+    CHECK(table);
+    CHECK_EQUAL(table->size(), count);
+}
+
+void check_order_count(unit_test::TestContext& test_context, DBRef db, std::size_t count)
+{
+    auto rt = db->start_read();
+    auto orders = rt->get_table("class_Order");
+    CHECK_EQUAL(orders->size(), count);
+}
+
+void check_order_exists(unit_test::TestContext& test_context, DBRef db, int64_t order_id, bool exists)
+{
+    auto rt = db->start_read();
+    auto orders = rt->get_table("class_Order");
+    CHECK_EQUAL(bool(orders->get_object_with_primary_key(order_id)), exists);
+}
+
+void check_order_owner(unit_test::TestContext& test_context, DBRef db, int64_t order_id, const char* owner_id)
+{
+    auto rt = db->start_read();
+    auto orders = rt->get_table("class_Order");
+    auto order = orders->get_object_with_primary_key(order_id);
+    if (!order) {
+        CHECK(order);
+        return;
+    }
+    CHECK_EQUAL(order.get<StringData>("owner_id"), StringData(owner_id));
+}
+
+void check_order_item(unit_test::TestContext& test_context, DBRef db, int64_t order_id, const char* item)
+{
+    auto rt = db->start_read();
+    auto orders = rt->get_table("class_Order");
+    auto order = orders->get_object_with_primary_key(order_id);
+    if (!order) {
+        CHECK(order);
+        return;
+    }
+    CHECK_EQUAL(order.get<StringData>("item"), StringData(item));
+}
+
+void set_server_order_owner_directly(const std::string& server_path, int64_t order_id, const char* owner_id)
+{
+    TestServerHistoryContext context;
+    _impl::ServerHistory history{context};
+    DBRef server_db = DB::create(history, server_path);
+    write_transaction(server_db, [&](WriteTransaction& wt) {
+        auto orders = wt.get_group().get_table("class_Order");
+        auto order = orders->get_object_with_primary_key(order_id);
+        if (!order) {
+            throw std::runtime_error(util::format("Server order %1 not found", order_id));
+        }
+        order.set("owner_id", std::string(owner_id));
+    });
+}
+
+} // anonymous namespace
+
+TEST(Sync_FLXOwnerRulesIsolateUsersAndHandleReconnect)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+    TEST_CLIENT_DB(db_b);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    upsert_order_owner(seed_db, 2, "user_1");
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    create_flx_isolation_schema(db_b, 0, nullptr, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    auto sub_store_b = SubscriptionStore::create(db_b);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+    subscribe_to_flx_isolation_tables(db_b, sub_store_b);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(3, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    Session::Config config_b;
+    config_b.signed_user_token = g_user_1_path_test_token;
+    config_b.user_id = "user_1";
+    util::Optional<Session> session_b =
+        fixture.make_flx_session(2, 0, db_b, sub_store_b, "/test", std::move(config_b));
+    CHECK(session_b->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+
+    check_order_visibility(test_context, db_a, true, false);
+    check_order_visibility(test_context, db_b, false, true);
+    check_catalog_visible(test_context, db_a);
+    check_catalog_visible(test_context, db_b);
+
+    upsert_order_owner(seed_db, 1, "user_1");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+    check_order_visibility(test_context, db_a, false, false);
+    check_order_visibility(test_context, db_b, true, true);
+
+    upsert_order_owner(seed_db, 1, "user_0");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+    check_order_visibility(test_context, db_a, true, false);
+    check_order_visibility(test_context, db_b, false, true);
+
+    session_a.reset();
+
+    upsert_order_owner(seed_db, 1, "user_1");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+
+    Session::Config reconnect_config_a;
+    reconnect_config_a.signed_user_token = g_user_0_path_test_token;
+    reconnect_config_a.user_id = "user_0";
+    session_a = fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(reconnect_config_a));
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    check_order_visibility(test_context, db_a, false, false);
+    check_order_visibility(test_context, db_b, true, true);
+}
+
+TEST(Sync_FLXBootstrapCacheDoesNotLeakBetweenUsers)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+    TEST_CLIENT_DB(db_b);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    upsert_order_owner(seed_db, 2, "user_1");
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    create_flx_isolation_schema(db_b, 0, nullptr, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    auto sub_store_b = SubscriptionStore::create(db_b);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+    subscribe_to_flx_isolation_tables(db_b, sub_store_b);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    fixture_config.enable_download_bootstrap_cache = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(3, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    Session::Config config_b;
+    config_b.signed_user_token = g_user_1_path_test_token;
+    config_b.user_id = "user_1";
+    util::Optional<Session> session_b =
+        fixture.make_flx_session(2, 0, db_b, sub_store_b, "/test", std::move(config_b));
+    CHECK(session_b->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+
+    check_order_visibility(test_context, db_a, true, false);
+    check_order_visibility(test_context, db_b, false, true);
+    check_catalog_visible(test_context, db_a);
+    check_catalog_visible(test_context, db_b);
+}
+
+TEST(Sync_FLXPBSAndFLXClientsCanUseSameServerOnDifferentTenants)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(pbs_writer_db);
+    TEST_CLIENT_DB(pbs_reader_db);
+    TEST_CLIENT_DB(flx_seed_db);
+    TEST_CLIENT_DB(flx_user_db);
+
+    create_flx_isolation_schema(pbs_writer_db, 42, "pbs_user", true);
+    create_flx_isolation_schema(pbs_reader_db, 0, nullptr, false);
+    create_flx_isolation_schema(flx_seed_db, 1, "user_0", true);
+    create_flx_isolation_schema(flx_user_db, 0, nullptr, false);
+
+    auto flx_sub_store = SubscriptionStore::create(flx_user_db);
+    subscribe_to_flx_isolation_tables(flx_user_db, flx_sub_store);
+
+    auto tenant_public_keys = std::make_shared<AccessControl::PublicKeyStore>();
+    tenant_public_keys->keys["tenant-pbs"].push_back(PKey::load_public(test_util::get_test_resource_path() +
+                                                                       "test_pubkey.pem"));
+    tenant_public_keys->keys["tenant-flx"].push_back(PKey::load_public(test_util::get_test_resource_path() +
+                                                                       "test_pubkey.pem"));
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    fixture_config.tenant_public_keys = tenant_public_keys;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(4, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    std::string pbs_real_path = fixture.map_virtual_to_real_path(0, "/tenant-pbs/pbs");
+    std::string flx_real_path = fixture.map_virtual_to_real_path(0, "/tenant-flx/flx");
+    CHECK_NOT_EQUAL(pbs_real_path, flx_real_path);
+    CHECK(StringData{pbs_real_path}.ends_with("/tenant-pbs/pbs.barq"));
+    CHECK(StringData{flx_real_path}.ends_with("/tenant-flx/flx.barq"));
+
+    Session::Config pbs_writer_config;
+    pbs_writer_config.user_id = "pbs_user";
+    util::Optional<Session> pbs_writer_session =
+        fixture.make_bound_session(0, pbs_writer_db, 0, "pbs", g_tenant_pbs_user_token,
+                                   std::move(pbs_writer_config));
+    CHECK(pbs_writer_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config flx_seed_config;
+    flx_seed_config.user_id = "flx_seed";
+    util::Optional<Session> flx_seed_session =
+        fixture.make_bound_session(1, flx_seed_db, 0, "flx", g_tenant_flx_seed_token,
+                                   std::move(flx_seed_config));
+    CHECK(flx_seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config pbs_reader_config;
+    pbs_reader_config.user_id = "pbs_user";
+    util::Optional<Session> pbs_reader_session =
+        fixture.make_bound_session(2, pbs_reader_db, 0, "pbs", g_tenant_pbs_user_token,
+                                   std::move(pbs_reader_config));
+    CHECK(pbs_reader_session->wait_for_download_complete_or_client_stopped());
+
+    Session::Config flx_user_config;
+    flx_user_config.signed_user_token = g_tenant_flx_user_token;
+    flx_user_config.user_id = "user_0";
+    util::Optional<Session> flx_user_session =
+        fixture.make_flx_session(3, 0, flx_user_db, flx_sub_store, "flx", std::move(flx_user_config));
+    CHECK(flx_user_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(flx_user_session->wait_for_download_complete_or_client_stopped());
+
+    check_order_exists(test_context, pbs_reader_db, 42, true);
+    check_order_visibility(test_context, flx_user_db, true, false);
+    check_catalog_visible(test_context, flx_user_db);
+    CHECK(util::File::exists(pbs_real_path));
+    CHECK(util::File::exists(flx_real_path));
+
+    upsert_order_owner(pbs_writer_db, 43, "pbs_user");
+    CHECK(pbs_writer_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(pbs_reader_session->wait_for_download_complete_or_client_stopped());
+    CHECK(flx_user_session->wait_for_download_complete_or_client_stopped());
+    check_order_exists(test_context, pbs_reader_db, 43, true);
+    check_order_visibility(test_context, flx_user_db, true, false);
+
+    upsert_order_owner(flx_seed_db, 2, "user_0");
+    CHECK(flx_seed_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(flx_user_session->wait_for_download_complete_or_client_stopped());
+    CHECK(pbs_reader_session->wait_for_download_complete_or_client_stopped());
+    check_order_visibility(test_context, flx_user_db, true, true);
+    check_order_exists(test_context, pbs_reader_db, 2, false);
+}
+
+TEST(Sync_FLXUsesTokenPathNotBindIdentifier)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    create_flx_isolation_schema(db, 0, nullptr, false);
+
+    auto sub_store = SubscriptionStore::create(db);
+    subscribe_to_flx_isolation_tables(db, sub_store);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    std::string token_real_path = fixture.map_virtual_to_real_path(0, "/test");
+    std::string ignored_real_path = fixture.map_virtual_to_real_path(0, "/ignored-bind-path");
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(util::File::exists(token_real_path));
+    CHECK_NOT(util::File::exists(ignored_real_path));
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    util::Optional<Session> session =
+        fixture.make_flx_session(1, 0, db, sub_store, "/ignored-bind-path", std::move(config));
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+
+    check_order_visibility(test_context, db, true, false);
+    check_catalog_visible(test_context, db);
+    CHECK(util::File::exists(token_real_path));
+    CHECK_NOT(util::File::exists(ignored_real_path));
+}
+
+#if defined(BARQ_SYNC_SERVER_BINARY) && !defined(_WIN32) && !BARQ_ANDROID && !BARQ_IOS
+TEST(Sync_FLXServerBinaryRejectsQuerySyncWhenDisabled)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(db);
+
+    create_flx_isolation_schema(db, 0, nullptr, false);
+    auto sub_store = SubscriptionStore::create(db);
+    subscribe_to_flx_isolation_tables(db, sub_store);
+
+    std::string server_root = util::File::resolve("server-root", dir);
+    util::make_dir_recursive(server_root);
+
+    ExternalServerProcess server({
+        BARQ_SYNC_SERVER_BINARY,
+        "--root-dir",
+        server_root,
+        "--jwt-public-key",
+        test_server_key_path(),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--log-level",
+        "warn",
+    });
+    Session::port_type port = parse_external_cli_server_port(server.wait_for_route());
+
+    ExternalSyncClient client(std::make_shared<util::PrefixLogger>("CLI disabled FLX: ", test_context.logger));
+    std::atomic<bool> did_reject{false};
+
+    Session::Config config = make_external_cli_session_config(port, g_user_0_path_test_token, "user_0", test_context);
+    config.connection_state_change_listener = [&](ConnectionState state, std::optional<SessionErrorInfo> error_info) {
+        if (state == ConnectionState::disconnected && error_info) {
+            did_reject.store(true);
+            client.get().shutdown();
+        }
+    };
+
+    util::Optional<Session> session = Session{
+        client.get(),
+        db,
+        sub_store,
+        MigrationStore::create(db),
+        std::move(config),
+    };
+    CHECK_NOT(session->wait_for_download_complete_or_client_stopped());
+    CHECK(did_reject.load());
+}
+
+TEST(Sync_FLXServerBinaryCLIEnforcesRulesEndToEnd)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+    TEST_CLIENT_DB(db_b);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    upsert_order_owner(seed_db, 2, "user_1");
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    create_flx_isolation_schema(db_b, 0, nullptr, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    auto sub_store_b = SubscriptionStore::create(db_b);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+    subscribe_to_flx_isolation_tables(db_b, sub_store_b);
+
+    std::string server_root = util::File::resolve("server-root", dir);
+    util::make_dir_recursive(server_root);
+
+    ExternalServerProcess server({
+        BARQ_SYNC_SERVER_BINARY,
+        "--root-dir",
+        server_root,
+        "--jwt-public-key",
+        test_server_key_path(),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--enable-flx",
+        "--flx-owner-rule",
+        "Order:owner_id",
+        "--flx-public-readonly-rule",
+        "Catalog",
+        "--log-level",
+        "warn",
+    });
+    Session::port_type port = parse_external_cli_server_port(server.wait_for_route());
+
+    ExternalSyncClient seed_client(std::make_shared<util::PrefixLogger>("CLI seed: ", test_context.logger));
+    ExternalSyncClient client_a(std::make_shared<util::PrefixLogger>("CLI user A: ", test_context.logger));
+    ExternalSyncClient client_b(std::make_shared<util::PrefixLogger>("CLI user B: ", test_context.logger));
+
+    util::Optional<Session> seed_session = Session{
+        seed_client.get(),
+        seed_db,
+        nullptr,
+        nullptr,
+        make_external_cli_session_config(port, g_signed_test_user_token, "test", test_context),
+    };
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(util::File::exists(util::File::resolve("test.barq", server_root)));
+
+    util::Optional<Session> session_a = Session{
+        client_a.get(),
+        db_a,
+        sub_store_a,
+        MigrationStore::create(db_a),
+        make_external_cli_session_config(port, g_user_0_path_test_token, "user_0", test_context),
+    };
+    util::Optional<Session> session_b = Session{
+        client_b.get(),
+        db_b,
+        sub_store_b,
+        MigrationStore::create(db_b),
+        make_external_cli_session_config(port, g_user_1_path_test_token, "user_1", test_context),
+    };
+
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_b->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+
+    check_order_visibility(test_context, db_a, true, false);
+    check_order_visibility(test_context, db_b, false, true);
+    check_catalog_visible(test_context, db_a);
+    check_catalog_visible(test_context, db_b);
+
+    upsert_order_owner(seed_db, 1, "user_1");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+
+    check_order_visibility(test_context, db_a, false, false);
+    check_order_visibility(test_context, db_b, true, true);
+}
+#endif
+
+TEST(Sync_FLXVisibleStateSurvivesServerRestart)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+
+    auto make_fixture_config = [] {
+        MultiClientServerFixture::Config fixture_config;
+        fixture_config.enable_flx_sync = true;
+        using FLXRule = Server::Config::FLXRule;
+        fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+        fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+        return fixture_config;
+    };
+
+    {
+        MultiClientServerFixture fixture(2, 1, dir, test_context, make_fixture_config());
+        fixture.start();
+
+        util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+        CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+        Session::Config config_a;
+        config_a.signed_user_token = g_user_0_path_test_token;
+        config_a.user_id = "user_0";
+        util::Optional<Session> session_a =
+            fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+        CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+        CHECK(session_a->wait_for_download_complete_or_client_stopped());
+        check_order_visibility(test_context, db_a, true, false);
+
+        session_a.reset();
+        upsert_order_owner(seed_db, 1, "user_1");
+        CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+        seed_session.reset();
+    }
+
+    {
+        MultiClientServerFixture fixture(1, 1, dir, test_context, make_fixture_config());
+        fixture.start();
+
+        Session::Config reconnect_config_a;
+        reconnect_config_a.signed_user_token = g_user_0_path_test_token;
+        reconnect_config_a.user_id = "user_0";
+        util::Optional<Session> session_a =
+            fixture.make_flx_session(0, 0, db_a, sub_store_a, "/test", std::move(reconnect_config_a));
+        CHECK(session_a->wait_for_download_complete_or_client_stopped());
+        check_order_visibility(test_context, db_a, false, false);
+    }
+}
+
+TEST(Sync_FLXVisibleStateGarbageCollectsExpiredClients)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+
+    auto make_fixture_config = [] {
+        MultiClientServerFixture::Config fixture_config;
+        fixture_config.enable_flx_sync = true;
+        using FLXRule = Server::Config::FLXRule;
+        fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+        fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+        return fixture_config;
+    };
+
+    std::string server_real_path;
+
+    // A live FLX client connects and persists its per-client visible-state row.
+    {
+        MultiClientServerFixture fixture(2, 1, dir, test_context, make_fixture_config());
+        fixture.start();
+        server_real_path = fixture.map_virtual_to_real_path(0, "/test");
+
+        util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+        CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+        Session::Config config_a;
+        config_a.signed_user_token = g_user_0_path_test_token;
+        config_a.user_id = "user_0";
+        util::Optional<Session> session_a =
+            fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+        CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+        CHECK(session_a->wait_for_download_complete_or_client_stopped());
+        check_order_visibility(test_context, db_a, true, false);
+
+        session_a.reset();
+        seed_session.reset();
+    }
+
+    // Inject an orphan visible-state row for a client file identifier that was
+    // never allocated. This stands in for a client whose file has since been
+    // expired (its live entry would report last_seen == 0 just the same).
+    constexpr int64_t orphan_ident = 987654;
+    {
+        TestServerHistoryContext context;
+        _impl::ServerHistory history{context};
+        DBRef server_db = DB::create(history, server_real_path);
+        write_transaction(server_db, [&](WriteTransaction& wt) {
+            auto table = wt.get_group().get_table("flx_visible_state");
+            CHECK(table);
+            auto row = table->create_object_with_primary_key(orphan_ident);
+            row.set("visible_json", "[]");
+        });
+        auto rt = server_db->start_read();
+        auto table = rt->get_table("flx_visible_state");
+        CHECK(table);
+        CHECK_EQUAL(table->size(), 2); // live client row + injected orphan
+        CHECK(table->get_object_with_primary_key(orphan_ident));
+    }
+
+    // The first Flexible Sync bind after a restart garbage-collects visible-
+    // state rows for clients that are gone. Reconnecting the live client both
+    // triggers the sweep and confirms the live client keeps working.
+    {
+        MultiClientServerFixture fixture(1, 1, dir, test_context, make_fixture_config());
+        fixture.start();
+        Session::Config config_a;
+        config_a.signed_user_token = g_user_0_path_test_token;
+        config_a.user_id = "user_0";
+        util::Optional<Session> session_a =
+            fixture.make_flx_session(0, 0, db_a, sub_store_a, "/test", std::move(config_a));
+        CHECK(session_a->wait_for_download_complete_or_client_stopped());
+        check_order_visibility(test_context, db_a, true, false);
+        session_a.reset();
+    }
+
+    // The orphan row is reclaimed; the live (non-expired) client's row is kept.
+    {
+        TestServerHistoryContext context;
+        _impl::ServerHistory history{context};
+        DBRef server_db = DB::create(history, server_real_path);
+        auto rt = server_db->start_read();
+        auto table = rt->get_table("flx_visible_state");
+        CHECK(table);
+        CHECK_NOT(table->get_object_with_primary_key(orphan_ident));
+        CHECK_EQUAL(table->size(), 1);
+    }
+}
+
+TEST(Sync_FLXManyObjectsAndUsersIsolate)
+{
+    // A larger-than-toy check: thousands of owner-scoped rows on one shared file,
+    // several concurrent clients, and an admin aggregating across all of them.
+    // Proves the rule/subscription filtering holds well beyond the tiny datasets
+    // the other FLX tests use. (True millions-of-rows / thousands-of-users load
+    // testing needs a dedicated release-build harness; see doc/flexible_sync.md.)
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_0);
+    TEST_CLIENT_DB(db_1);
+    TEST_CLIENT_DB(db_admin);
+
+    constexpr int64_t per_user = 500;
+    constexpr std::size_t catalog_count = 11; // id 10 (from schema) + ids 11..20
+
+    create_flx_isolation_schema(seed_db, 0, nullptr, true); // schema + catalog id 10
+    add_flx_catalog_items(seed_db, 11, 20);                 // + 10 more shared products
+    add_flx_orders(seed_db, 1, per_user, "user_0");
+    add_flx_orders(seed_db, per_user + 1, 2 * per_user, "user_1");
+
+    create_flx_isolation_schema(db_0, 0, nullptr, false);
+    create_flx_isolation_schema(db_1, 0, nullptr, false);
+    create_flx_isolation_schema(db_admin, 0, nullptr, false);
+
+    auto sub_0 = SubscriptionStore::create(db_0);
+    auto sub_1 = SubscriptionStore::create(db_1);
+    auto sub_admin = SubscriptionStore::create(db_admin);
+    subscribe_to_flx_isolation_tables(db_0, sub_0);
+    subscribe_to_flx_isolation_tables(db_1, sub_1);
+    subscribe_to_flx_isolation_tables(db_admin, sub_admin);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(4, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    auto check_all_owned_by = [&](DBRef db, const char* owner, std::size_t expected) {
+        auto rt = db->start_read();
+        auto orders = rt->get_table("class_Order");
+        CHECK_EQUAL(orders->size(), expected);
+        ColKey owner_col = orders->get_column_key("owner_id");
+        std::size_t foreign = 0;
+        for (auto& obj : *orders) {
+            if (obj.get<StringData>(owner_col) != StringData(owner))
+                ++foreign;
+        }
+        CHECK_EQUAL(foreign, 0); // not one row belonging to another user leaked in
+        CHECK_EQUAL(rt->get_table("class_Catalog")->size(), catalog_count);
+    };
+
+    // Each user bootstraps and must see exactly its own `per_user` orders plus
+    // the shared catalog -- nothing belonging to the other user.
+    Session::Config config_0;
+    config_0.signed_user_token = g_user_0_path_test_token;
+    config_0.user_id = "user_0";
+    util::Optional<Session> session_0 = fixture.make_flx_session(1, 0, db_0, sub_0, "/test", std::move(config_0));
+    CHECK(session_0->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_0->wait_for_download_complete_or_client_stopped());
+    check_all_owned_by(db_0, "user_0", std::size_t(per_user));
+
+    Session::Config config_1;
+    config_1.signed_user_token = g_user_1_path_test_token;
+    config_1.user_id = "user_1";
+    util::Optional<Session> session_1 = fixture.make_flx_session(2, 0, db_1, sub_1, "/test", std::move(config_1));
+    CHECK(session_1->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_1->wait_for_download_complete_or_client_stopped());
+    check_all_owned_by(db_1, "user_1", std::size_t(per_user));
+
+    // The admin aggregates across every user.
+    Session::Config config_admin;
+    config_admin.signed_user_token = g_admin_path_test_token;
+    config_admin.user_id = "admin";
+    util::Optional<Session> session_admin =
+        fixture.make_flx_session(3, 0, db_admin, sub_admin, "/test", std::move(config_admin));
+    CHECK(session_admin->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_admin->wait_for_download_complete_or_client_stopped());
+
+    auto rt_admin = db_admin->start_read();
+    CHECK_EQUAL(rt_admin->get_table("class_Order")->size(), std::size_t(2 * per_user));
+    CHECK_EQUAL(rt_admin->get_table("class_Catalog")->size(), catalog_count);
+}
+
+TEST(Sync_FLXNonAdminCannotDropSchemaColumn)
+{
+    // A non-admin Flexible Sync client must not be able to destroy the shared
+    // schema: dropping a table or column can't be undone by the compensating-
+    // write pass, so the server rejects the upload before integrating it and the
+    // shared schema is left intact.
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+
+    auto sub_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+
+    std::mutex reject_mutex;
+    bool did_reject = false;
+    fixture.set_client_side_error_handler(1, [&](Status status, bool) {
+        std::lock_guard<std::mutex> lock(reject_mutex);
+        CHECK_NOT(status.is_ok());
+        did_reject = true;
+        fixture.get_client(1).shutdown();
+    });
+
+    fixture.start();
+    std::string server_real_path = fixture.map_virtual_to_real_path(0, "/test");
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    util::Optional<Session> session_a = fixture.make_flx_session(1, 0, db_a, sub_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    check_order_visibility(test_context, db_a, true, false);
+
+    // Drop a synced column locally, then try to upload the destructive change.
+    write_transaction(db_a, [&](WriteTransaction& wt) {
+        auto orders = wt.get_group().get_table("class_Order");
+        orders->remove_column(orders->get_column_key("item"));
+    });
+    CHECK_NOT(session_a->wait_for_upload_complete_or_client_stopped());
+    {
+        std::lock_guard<std::mutex> lock(reject_mutex);
+        CHECK(did_reject);
+    }
+
+    // The shared server schema is intact: the "item" column was NOT dropped.
+    TestServerHistoryContext context;
+    _impl::ServerHistory history{context};
+    DBRef server_db = DB::create(history, server_real_path);
+    auto rt = server_db->start_read();
+    auto orders = rt->get_table("class_Order");
+    CHECK(orders);
+    if (orders) {
+        CHECK(orders->get_column_key("item"));
+    }
+}
+
+TEST(Sync_FLXOwnerRuleNonStringFieldReturnsQueryErrorAndKeepsSessionAlive)
+{
+    // An owner rule whose column is not a string is a misconfiguration. The
+    // server must reject the subscription with a clear query error and keep the
+    // session alive -- it must never call Mixed::get<StringData>() on the
+    // non-string column (which would crash the network thread).
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db);
+
+    auto make_people_with_int_owner = [](DBRef d, bool add_row) {
+        write_transaction(d, [&](WriteTransaction& wt) {
+            auto people = wt.get_group().add_table_with_primary_key("class_Person", type_Int, "id");
+            people->add_column(type_Int, "age");
+            people->add_column(type_Int, "owner_id"); // non-string on purpose
+            if (add_row) {
+                auto p = people->create_object_with_primary_key(1);
+                p.set("age", int64_t(30));
+                p.set("owner_id", int64_t(7));
+            }
+        });
+    };
+    make_people_with_int_owner(seed_db, true);
+    make_people_with_int_owner(db, false);
+
+    auto sub_store = SubscriptionStore::create(db);
+    auto bad_sub_set = subscribe_to_adult_people(db, sub_store);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Person", FLXRule::Mode::Owner, "owner_id"});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    util::Optional<Session> session = fixture.make_flx_session(1, 0, db, sub_store, "/test", std::move(config));
+
+    CHECK(wait_for_subscription_state(bad_sub_set, SubscriptionSet::State::Error));
+    CHECK(bad_sub_set.error_str().contains("string owner field"));
+    CHECK(bad_sub_set.error_str().contains("Person"));
+
+    // The session survives the bad subscription: an empty subscription completes.
+    auto mut = sub_store->get_latest().make_mutable_copy();
+    mut.clear();
+    auto empty_sub_set = mut.commit();
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+    CHECK(wait_for_subscription_state(empty_sub_set, SubscriptionSet::State::Complete));
+}
+
+TEST(Sync_FLXOwnerColumnRetypedToNonStringDoesNotCrash)
+{
+    // The read-path owner guard's real job. The owner column passes validation as
+    // a string when the client subscribes, but is later re-typed to a non-string
+    // by a partition-sync writer (which is not subject to FLX schema rules). The
+    // next incremental download must not call Mixed::get<StringData>() on the
+    // now-integer column -- with the guard the row simply becomes invisible; on
+    // the network thread that would otherwise crash the whole server.
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+
+    auto sub_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    util::Optional<Session> session_a = fixture.make_flx_session(1, 0, db_a, sub_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    check_order_visibility(test_context, db_a, true, false); // visible while owner_id is a string
+
+    // A partition-sync writer re-types owner_id (string -> int) and touches the row
+    // so the change reaches db_a's subscription as an incremental download.
+    write_transaction(seed_db, [&](WriteTransaction& wt) {
+        auto orders = wt.get_group().get_table("class_Order");
+        orders->remove_column(orders->get_column_key("owner_id"));
+        orders->add_column(type_Int, "owner_id");
+        auto order = orders->get_object_with_primary_key(1);
+        order.set("item", "retyped");
+    });
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    // The server must survive building db_a's next download. Non-string owner ->
+    // default deny, so the order leaves the view and the session stays alive.
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    check_order_count(test_context, db_a, 0);
+}
+
+TEST(Sync_FLXDisabledRejectsQuerySyncClients)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(db);
+
+    create_flx_isolation_schema(db, 0, nullptr, false);
+    auto sub_store = SubscriptionStore::create(db);
+    subscribe_to_flx_isolation_tables(db, sub_store);
+
+    MultiClientServerFixture fixture(1, 1, dir, test_context);
+    bool did_reject = false;
+    fixture.set_client_side_error_handler(0, [&](Status status, bool) {
+        CHECK_NOT(status.is_ok());
+        did_reject = true;
+        fixture.get_client(0).shutdown();
+    });
+    fixture.start();
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    util::Optional<Session> session =
+        fixture.make_flx_session(0, 0, db, sub_store, "/test", std::move(config));
+    CHECK_NOT(session->wait_for_download_complete_or_client_stopped());
+    CHECK(did_reject);
+}
+
+TEST(Sync_FLXMissingTableSubscriptionReturnsEmpty)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(db);
+
+    create_flx_person_schema(db);
+    auto sub_store = SubscriptionStore::create(db);
+    auto sub_set = subscribe_to_adult_people(db, sub_store);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Person", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(1, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    util::Optional<Session> session = fixture.make_flx_session(0, 0, db, sub_store, "/test", std::move(config));
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+
+    sub_set.refresh();
+    CHECK_EQUAL(sub_set.state(), SubscriptionSet::State::Complete);
+    CHECK(sub_set.error_str().is_null());
+    check_person_count(test_context, db, 0);
+}
+
+TEST(Sync_FLXInvalidRQLReturnsQueryErrorAndKeepsSessionAlive)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db);
+
+    create_flx_person_schema(seed_db);
+    upsert_flx_person(seed_db, 1, 30);
+    create_flx_person_schema(db);
+
+    auto sub_store = SubscriptionStore::create(db);
+    auto bad_sub_set = subscribe_to_adult_people(db, sub_store);
+    replace_subscription_query(test_context, db, bad_sub_set.version(), "missing_property > 18");
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Person", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    util::Optional<Session> session = fixture.make_flx_session(1, 0, db, sub_store, "/test", std::move(config));
+
+    CHECK(wait_for_subscription_state(bad_sub_set, SubscriptionSet::State::Error));
+    CHECK(bad_sub_set.error_str().contains("Bad subscription query"));
+    CHECK(bad_sub_set.error_str().contains("Person"));
+
+    auto good_sub_set = subscribe_to_adult_people(db, sub_store);
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+    CHECK(wait_for_subscription_state(good_sub_set, SubscriptionSet::State::Complete));
+    CHECK(good_sub_set.error_str().is_null());
+    check_person_count(test_context, db, 1);
+}
+
+TEST(Sync_FLXOwnerRuleMissingOwnerFieldReturnsQueryErrorAndKeepsSessionAlive)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db);
+
+    create_flx_person_schema(seed_db);
+    upsert_flx_person(seed_db, 1, 30);
+    create_flx_person_schema(db);
+
+    auto sub_store = SubscriptionStore::create(db);
+    auto bad_sub_set = subscribe_to_adult_people(db, sub_store);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Person", FLXRule::Mode::Owner, "owner_id"});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    util::Optional<Session> session = fixture.make_flx_session(1, 0, db, sub_store, "/test", std::move(config));
+
+    CHECK(wait_for_subscription_state(bad_sub_set, SubscriptionSet::State::Error));
+    CHECK(bad_sub_set.error_str().contains("missing owner field"));
+    CHECK(bad_sub_set.error_str().contains("Person"));
+
+    auto mut = sub_store->get_latest().make_mutable_copy();
+    mut.clear();
+    auto empty_sub_set = mut.commit();
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+    CHECK(wait_for_subscription_state(empty_sub_set, SubscriptionSet::State::Complete));
+}
+
+TEST(Sync_FLXDefaultDenyReadReturnsEmptyForExistingTable)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db);
+
+    create_flx_isolation_schema(seed_db, 0, nullptr, false);
+    add_flx_private_schema(seed_db);
+    upsert_flx_private_object(seed_db, 1, "server-private");
+    create_flx_isolation_schema(db, 0, nullptr, false);
+    add_flx_private_schema(db);
+
+    auto sub_store = SubscriptionStore::create(db);
+    auto sub_set = subscribe_to_flx_private_table(db, sub_store);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    util::Optional<Session> session = fixture.make_flx_session(1, 0, db, sub_store, "/test", std::move(config));
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+
+    CHECK(wait_for_subscription_state(sub_set, SubscriptionSet::State::Complete));
+    sub_set.refresh();
+    CHECK(sub_set.error_str().is_null());
+    check_private_count(test_context, db, 0);
+}
+
+TEST(Sync_FLXBootstrapCanSpanMultipleBatches)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db);
+
+    constexpr int64_t order_count = 25;
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_orders(seed_db, 2, order_count, "user_0");
+    create_flx_isolation_schema(db, 0, nullptr, false);
+
+    auto sub_store = SubscriptionStore::create(db);
+    subscribe_to_flx_isolation_tables(db, sub_store);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    fixture_config.max_download_size = 96;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex batch_mutex;
+    int more_to_come_count = 0;
+    int last_in_batch_count = 0;
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    config.on_sync_client_event_hook = [&](const SyncClientHookData& data) {
+        if (data.event == SyncClientHookEvent::DownloadMessageReceived && data.query_version == 1) {
+            std::lock_guard<std::mutex> lock(batch_mutex);
+            if (data.batch_state == sync::DownloadBatchState::MoreToCome) {
+                ++more_to_come_count;
+            }
+            else if (data.batch_state == sync::DownloadBatchState::LastInBatch) {
+                ++last_in_batch_count;
+            }
+        }
+        return SyncClientHookAction::NoAction;
+    };
+
+    util::Optional<Session> session = fixture.make_flx_session(1, 0, db, sub_store, "/test", std::move(config));
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+
+    check_order_count(test_context, db, order_count);
+    check_catalog_visible(test_context, db);
+
+    {
+        std::lock_guard<std::mutex> lock(batch_mutex);
+        CHECK_GREATER(more_to_come_count, 0);
+        CHECK_EQUAL(last_in_batch_count, 1);
+    }
+}
+
+TEST(Sync_FLXBootstrapUsesSingleSnapshotAcrossBatches)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db);
+
+    constexpr int64_t order_count = 40;
+    constexpr int64_t target_order_id = order_count;
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_orders(seed_db, 2, order_count, "user_0");
+    create_flx_isolation_schema(db, 0, nullptr, false);
+
+    auto sub_store = SubscriptionStore::create(db);
+    subscribe_to_flx_isolation_tables(db, sub_store);
+
+    std::string server_real_path;
+    std::atomic<bool> mutated_server_snapshot_target{false};
+    std::atomic<bool> checked_bootstrap_snapshot{false};
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    fixture_config.max_download_size = 1;
+    fixture_config.server_flx_bootstrap_batch_callback =
+        [&](std::string_view virt_path, file_ident_type, sync::DownloadBatchState batch_state, std::size_t) {
+            if (virt_path != "/test" || batch_state != sync::DownloadBatchState::MoreToCome) {
+                return;
+            }
+            bool expected = false;
+            if (!mutated_server_snapshot_target.compare_exchange_strong(expected, true)) {
+                return;
+            }
+            set_server_order_owner_directly(server_real_path, target_order_id, "user_1");
+        };
+
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+    server_real_path = fixture.map_virtual_to_real_path(0, "/test");
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    config.on_sync_client_event_hook = [&](const SyncClientHookData& data) {
+        if (data.event == SyncClientHookEvent::BootstrapProcessed && data.query_version == 1) {
+            check_order_count(test_context, db, order_count);
+            check_order_owner(test_context, db, target_order_id, "user_0");
+            checked_bootstrap_snapshot.store(true);
+        }
+        return SyncClientHookAction::NoAction;
+    };
+    util::Optional<Session> session = fixture.make_flx_session(1, 0, db, sub_store, "/test", std::move(config));
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+
+    CHECK(mutated_server_snapshot_target.load());
+    CHECK(checked_bootstrap_snapshot.load());
+    check_order_count(test_context, db, order_count - 1);
+    check_order_exists(test_context, db, target_order_id, false);
+}
+
+TEST(Sync_FLXIncrementalCanSpanMultipleBatches)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db);
+
+    constexpr int64_t order_count = 25;
+    create_flx_isolation_schema(seed_db, 0, nullptr, true);
+    create_flx_isolation_schema(db, 0, nullptr, false);
+
+    auto sub_store = SubscriptionStore::create(db);
+    subscribe_to_flx_isolation_tables(db, sub_store);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    fixture_config.max_download_size = 96;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::atomic<bool> count_incremental{false};
+    std::mutex batch_mutex;
+    int more_to_come_count = 0;
+    int last_in_batch_count = 0;
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    config.on_sync_client_event_hook = [&](const SyncClientHookData& data) {
+        if (!count_incremental.load() || data.event != SyncClientHookEvent::DownloadMessageReceived ||
+            data.query_version != 1) {
+            return SyncClientHookAction::NoAction;
+        }
+
+        std::lock_guard<std::mutex> lock(batch_mutex);
+        if (data.batch_state == sync::DownloadBatchState::MoreToCome) {
+            ++more_to_come_count;
+        }
+        else if (data.batch_state == sync::DownloadBatchState::LastInBatch) {
+            ++last_in_batch_count;
+        }
+        return SyncClientHookAction::NoAction;
+    };
+
+    util::Optional<Session> session = fixture.make_flx_session(1, 0, db, sub_store, "/test", std::move(config));
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+    check_catalog_visible(test_context, db);
+    check_order_count(test_context, db, 0);
+
+    count_incremental.store(true);
+    add_flx_orders(seed_db, 1, order_count, "user_0");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+
+    check_order_count(test_context, db, order_count);
+    {
+        std::lock_guard<std::mutex> lock(batch_mutex);
+        CHECK_GREATER(more_to_come_count, 0);
+        CHECK_EQUAL(last_in_batch_count, 1);
+    }
+}
+
+TEST(Sync_FLXDeletedObjectsLeaveClientView)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    create_flx_isolation_schema(db, 0, nullptr, false);
+
+    auto sub_store = SubscriptionStore::create(db);
+    subscribe_to_flx_isolation_tables(db, sub_store);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    util::Optional<Session> session = fixture.make_flx_session(1, 0, db, sub_store, "/test", std::move(config));
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+    check_order_count(test_context, db, 1);
+    check_catalog_visible(test_context, db);
+
+    delete_flx_order(seed_db, 1);
+    delete_flx_catalog_item(seed_db, 10);
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+
+    check_order_count(test_context, db, 0);
+    check_catalog_count(test_context, db, 0);
+}
+
+TEST(Sync_FLXSubscriptionUpdateSendsDeltaAndRemovals)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db);
+
+    constexpr int64_t catalog_count = 25;
+    create_flx_isolation_schema(seed_db, 1, "user_0", false);
+    add_flx_catalog_items(seed_db, 1, catalog_count);
+    create_flx_isolation_schema(db, 0, nullptr, false);
+
+    auto sub_store = SubscriptionStore::create(db);
+    set_flx_isolation_subscriptions(db, sub_store, false, true);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    fixture_config.max_download_size = 96;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::atomic<bool> count_subscription_update{false};
+    std::mutex batch_mutex;
+    int more_to_come_count = 0;
+    int last_in_batch_count = 0;
+    int non_empty_download_count = 0;
+
+    auto reset_counters = [&] {
+        std::lock_guard<std::mutex> lock(batch_mutex);
+        more_to_come_count = 0;
+        last_in_batch_count = 0;
+        non_empty_download_count = 0;
+    };
+
+    auto check_single_update_batch = [&] {
+        std::lock_guard<std::mutex> lock(batch_mutex);
+        CHECK_EQUAL(more_to_come_count, 0);
+        CHECK_EQUAL(last_in_batch_count, 1);
+        CHECK_EQUAL(non_empty_download_count, 1);
+    };
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    config.on_sync_client_event_hook = [&](const SyncClientHookData& data) {
+        if (!count_subscription_update.load() || data.event != SyncClientHookEvent::DownloadMessageReceived ||
+            data.query_version <= 1) {
+            return SyncClientHookAction::NoAction;
+        }
+
+        std::lock_guard<std::mutex> lock(batch_mutex);
+        if (data.batch_state == sync::DownloadBatchState::MoreToCome) {
+            ++more_to_come_count;
+        }
+        else if (data.batch_state == sync::DownloadBatchState::LastInBatch) {
+            ++last_in_batch_count;
+        }
+        if (data.num_changesets > 0) {
+            ++non_empty_download_count;
+        }
+        return SyncClientHookAction::NoAction;
+    };
+
+    util::Optional<Session> session = fixture.make_flx_session(1, 0, db, sub_store, "/test", std::move(config));
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+    check_catalog_count(test_context, db, catalog_count);
+    check_order_count(test_context, db, 0);
+
+    count_subscription_update.store(true);
+    reset_counters();
+    set_flx_isolation_subscriptions(db, sub_store, true, true);
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+    check_catalog_count(test_context, db, catalog_count);
+    check_order_count(test_context, db, 1);
+    check_single_update_batch();
+
+    reset_counters();
+    set_flx_isolation_subscriptions(db, sub_store, false, true);
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+    check_catalog_count(test_context, db, catalog_count);
+    check_order_count(test_context, db, 0);
+    check_single_update_batch();
+}
+
+TEST(Sync_FLXDoesNotEchoOwnUploadAsSnapshot)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db);
+
+    create_flx_isolation_schema(seed_db, 0, nullptr, true);
+    create_flx_isolation_schema(db, 0, nullptr, false);
+
+    auto sub_store = SubscriptionStore::create(db);
+    subscribe_to_flx_isolation_tables(db, sub_store);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::atomic<bool> count_after_local_upload{false};
+    std::mutex download_mutex;
+    int non_empty_download_count = 0;
+
+    Session::Config config;
+    config.signed_user_token = g_user_0_path_test_token;
+    config.user_id = "user_0";
+    config.on_sync_client_event_hook = [&](const SyncClientHookData& data) {
+        if (count_after_local_upload.load() && data.event == SyncClientHookEvent::DownloadMessageReceived &&
+            data.query_version == 1 && data.num_changesets > 0) {
+            std::lock_guard<std::mutex> lock(download_mutex);
+            ++non_empty_download_count;
+        }
+        return SyncClientHookAction::NoAction;
+    };
+
+    util::Optional<Session> session = fixture.make_flx_session(1, 0, db, sub_store, "/test", std::move(config));
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+    check_catalog_visible(test_context, db);
+    check_order_count(test_context, db, 0);
+
+    count_after_local_upload.store(true);
+    upsert_order_owner(db, 1, "user_0");
+    CHECK(session->wait_for_upload_complete_or_client_stopped());
+    CHECK(session->wait_for_download_complete_or_client_stopped());
+
+    check_order_count(test_context, db, 1);
+    {
+        std::lock_guard<std::mutex> lock(download_mutex);
+        CHECK_EQUAL(non_empty_download_count, 0);
+    }
+}
+
+TEST(Sync_FLXUnauthorizedOwnerWriteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+    TEST_CLIENT_DB(db_b);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    upsert_order_owner(seed_db, 2, "user_1");
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    create_flx_isolation_schema(db_b, 0, nullptr, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    auto sub_store_b = SubscriptionStore::create(db_b);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+    subscribe_to_flx_isolation_tables(db_b, sub_store_b);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(3, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_NOT(error_info->is_fatal);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            const auto& rejected_update = error_info->compensating_writes.front();
+            CHECK_EQUAL(rejected_update.object_name, "Order");
+            CHECK_EQUAL(rejected_update.primary_key.get_int(), 1);
+            CHECK(StringData{rejected_update.reason}.contains("owner field"));
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    Session::Config config_b;
+    config_b.signed_user_token = g_user_1_path_test_token;
+    config_b.user_id = "user_1";
+    util::Optional<Session> session_b =
+        fixture.make_flx_session(2, 0, db_b, sub_store_b, "/test", std::move(config_b));
+    CHECK(session_b->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+
+    check_order_visibility(test_context, db_a, true, false);
+    check_order_visibility(test_context, db_b, false, true);
+
+    upsert_order_owner(db_a, 1, "user_1");
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_order_visibility(test_context, db_a, true, false);
+    check_order_owner(test_context, db_a, 1, "user_0");
+    check_order_visibility(test_context, db_b, false, true);
+}
+
+TEST(Sync_FLXCompensatingWriteKeepsAllowedObjectsFromSameUpload)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+    TEST_CLIENT_DB(db_b);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    create_flx_isolation_schema(db_b, 0, nullptr, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    auto sub_store_b = SubscriptionStore::create(db_b);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+    subscribe_to_flx_isolation_tables(db_b, sub_store_b);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(3, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_NOT(error_info->is_fatal);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            const auto& rejected_update = error_info->compensating_writes.front();
+            CHECK_EQUAL(rejected_update.object_name, "Order");
+            CHECK_EQUAL(rejected_update.primary_key.get_int(), 3);
+            CHECK(StringData{rejected_update.reason}.contains("owner field"));
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    Session::Config config_b;
+    config_b.signed_user_token = g_user_0_path_test_token;
+    config_b.user_id = "user_0";
+    util::Optional<Session> session_b =
+        fixture.make_flx_session(2, 0, db_b, sub_store_b, "/test", std::move(config_b));
+    CHECK(session_b->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+
+    check_order_count(test_context, db_a, 1);
+    check_order_count(test_context, db_b, 1);
+
+    update_order_item_and_create_order(db_a, 1, "allowed-edit", 3, "user_1");
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_order_count(test_context, db_a, 1);
+    check_order_count(test_context, db_b, 1);
+    check_order_item(test_context, db_a, 1, "allowed-edit");
+    check_order_item(test_context, db_b, 1, "allowed-edit");
+    check_order_exists(test_context, db_a, 3, false);
+    check_order_exists(test_context, db_b, 3, false);
+}
+
+TEST(Sync_FLXOwnerWriteCannotInjectIntoAnotherUsersView)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+    TEST_CLIENT_DB(db_b);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    upsert_order_owner(seed_db, 2, "user_1");
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    create_flx_isolation_schema(db_b, 0, nullptr, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    auto sub_store_b = SubscriptionStore::create(db_b);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+    subscribe_to_flx_isolation_tables(db_b, sub_store_b);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(3, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    Session::Config config_b;
+    config_b.signed_user_token = g_user_1_path_test_token;
+    config_b.user_id = "user_1";
+    util::Optional<Session> session_b =
+        fixture.make_flx_session(2, 0, db_b, sub_store_b, "/test", std::move(config_b));
+    CHECK(session_b->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+
+    check_order_visibility(test_context, db_a, true, false);
+    check_order_visibility(test_context, db_b, false, true);
+
+    upsert_order_owner(db_a, 3, "user_1");
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    CHECK(session_b->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_order_exists(test_context, db_a, 3, false);
+    check_order_exists(test_context, db_b, 3, false);
+    check_order_visibility(test_context, db_b, false, true);
+}
+
+TEST(Sync_FLXPublicReadOnlyWriteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+
+    set_flx_catalog_name(db_a, 10, "hacked");
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+}
+
+TEST(Sync_FLXPublicReadOnlyDeleteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+
+    delete_flx_catalog_item(db_a, 10);
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+}
+
+TEST(Sync_FLXPublicReadOnlyCreateCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+
+    set_flx_catalog_name(db_a, 11, "bad-create");
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_catalog_count(test_context, db_a, 1);
+    check_catalog_name(test_context, db_a, 10, "shared");
+}
+
+TEST(Sync_FLXPublicReadOnlyListWriteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_catalog_scores_schema(seed_db, {1, 2});
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    add_flx_catalog_scores_schema(db_a, {});
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+    check_catalog_scores(test_context, db_a, {1, 2});
+
+    set_flx_catalog_scores(db_a, {99});
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_catalog_scores(test_context, db_a, {1, 2});
+}
+
+TEST(Sync_FLXPublicReadOnlySetWriteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_catalog_score_set_schema(seed_db, {1, 2});
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    add_flx_catalog_score_set_schema(db_a, {});
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+    check_catalog_score_set(test_context, db_a, {1, 2});
+
+    set_flx_catalog_score_set(db_a, {99});
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_catalog_score_set(test_context, db_a, {1, 2});
+}
+
+TEST(Sync_FLXPublicReadOnlyDictionaryWriteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_catalog_note_dict_schema(seed_db, {{"first", "one"}, {"second", "two"}});
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    add_flx_catalog_note_dict_schema(db_a, {});
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+    check_catalog_note_dict(test_context, db_a, {{"first", "one"}, {"second", "two"}});
+
+    set_flx_catalog_note_dict(db_a, {{"first", "hacked"}});
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_catalog_note_dict(test_context, db_a, {{"first", "one"}, {"second", "two"}});
+}
+
+TEST(Sync_FLXPublicReadOnlyMixedWriteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_catalog_mixed_schema(seed_db, true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    add_flx_catalog_mixed_schema(db_a, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+    check_catalog_mixed_values(test_context, db_a);
+
+    set_flx_catalog_mixed_hacked(db_a);
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_catalog_mixed_values(test_context, db_a);
+}
+
+TEST(Sync_FLXPublicReadOnlyMixedLinksWriteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_catalog_mixed_link_schema(seed_db, true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    add_flx_catalog_mixed_link_schema(db_a, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables_with_category(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+    fixture_config.flx_rules.push_back({"Category", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+    check_catalog_mixed_links(test_context, db_a);
+
+    set_flx_catalog_mixed_links_to_second(db_a);
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_catalog_mixed_links(test_context, db_a);
+}
+
+TEST(Sync_FLXPublicReadOnlyLinkWriteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_catalog_category_schema(seed_db, true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    add_flx_catalog_category_schema(db_a, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables_with_category(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+    fixture_config.flx_rules.push_back({"Category", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+    check_catalog_category_label(test_context, db_a, "tools");
+
+    set_flx_catalog_category_null(db_a);
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_catalog_category_label(test_context, db_a, "tools");
+}
+
+TEST(Sync_FLXLinkTargetOutsideSubscriptionStaysUnresolvedUntilSubscribed)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_catalog_category_schema(seed_db, true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    add_flx_catalog_category_schema(db_a, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    set_flx_isolation_subscriptions(db_a, sub_store_a, false, true);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+    fixture_config.flx_rules.push_back({"Category", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+    check_catalog_category_unresolved(test_context, db_a);
+
+    subscribe_to_flx_isolation_tables_with_category(db_a, sub_store_a);
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_category_label(test_context, db_a, "tools");
+}
+
+TEST(Sync_FLXMixedLinkTargetsOutsideSubscriptionResolveWhenSubscribed)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_catalog_mixed_link_schema(seed_db, true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    add_flx_catalog_mixed_link_schema(db_a, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    set_flx_isolation_subscriptions(db_a, sub_store_a, false, true);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+    fixture_config.flx_rules.push_back({"Category", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+    check_catalog_mixed_links_pending(test_context, db_a);
+
+    subscribe_to_flx_isolation_tables_with_category(db_a, sub_store_a);
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_mixed_links(test_context, db_a);
+}
+
+TEST(Sync_FLXPublicReadOnlyLinkCollectionsWriteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_catalog_category_collections_schema(seed_db, true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    add_flx_catalog_category_collections_schema(db_a, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables_with_category(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+    fixture_config.flx_rules.push_back({"Category", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+    check_catalog_category_collections(test_context, db_a);
+
+    set_flx_catalog_category_collections_to_second(db_a);
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_catalog_category_collections(test_context, db_a);
+}
+
+TEST(Sync_FLXPublicReadOnlyEmbeddedObjectWriteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_catalog_detail_schema(seed_db, true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    add_flx_catalog_detail_schema(db_a, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+    check_catalog_detail(test_context, db_a, "seeded", 5);
+
+    set_flx_catalog_detail_summary(db_a, "hacked");
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_catalog_detail(test_context, db_a, "seeded", 5);
+}
+
+TEST(Sync_FLXPublicReadOnlyEmbeddedCollectionsWriteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_catalog_detail_collections_schema(seed_db, true);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    add_flx_catalog_detail_collections_schema(db_a, false);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    check_catalog_visible(test_context, db_a);
+    check_catalog_name(test_context, db_a, 10, "shared");
+    check_catalog_detail_collections(test_context, db_a);
+
+    set_flx_catalog_detail_collections_hacked(db_a);
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_catalog_detail_collections(test_context, db_a);
+}
+
+TEST(Sync_FLXAdminCanReadAndWriteConfiguredTables)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_admin);
+    TEST_CLIENT_DB(db_user_0);
+    TEST_CLIENT_DB(db_user_1);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    upsert_order_owner(seed_db, 2, "user_1");
+    create_flx_isolation_schema(db_admin, 0, nullptr, false);
+    create_flx_isolation_schema(db_user_0, 0, nullptr, false);
+    create_flx_isolation_schema(db_user_1, 0, nullptr, false);
+
+    auto sub_store_admin = SubscriptionStore::create(db_admin);
+    auto sub_store_user_0 = SubscriptionStore::create(db_user_0);
+    auto sub_store_user_1 = SubscriptionStore::create(db_user_1);
+    subscribe_to_flx_isolation_tables(db_admin, sub_store_admin);
+    subscribe_to_flx_isolation_tables(db_user_0, sub_store_user_0);
+    subscribe_to_flx_isolation_tables(db_user_1, sub_store_user_1);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(4, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config admin_config;
+    admin_config.signed_user_token = g_admin_path_test_token;
+    admin_config.user_id = "admin";
+    admin_config.connection_state_change_listener = [&](ConnectionState state,
+                                                        std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Admin disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> admin_session =
+        fixture.make_flx_session(1, 0, db_admin, sub_store_admin, "/test", std::move(admin_config));
+    CHECK(admin_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(admin_session->wait_for_download_complete_or_client_stopped());
+
+    check_order_visibility(test_context, db_admin, true, true);
+    check_catalog_name(test_context, db_admin, 10, "shared");
+
+    upsert_order_owner(db_admin, 1, "user_1");
+    set_flx_catalog_name(db_admin, 10, "admin-edit");
+    CHECK(admin_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(admin_session->wait_for_download_complete_or_client_stopped());
+
+    Session::Config user_0_config;
+    user_0_config.signed_user_token = g_user_0_path_test_token;
+    user_0_config.user_id = "user_0";
+    util::Optional<Session> user_0_session =
+        fixture.make_flx_session(2, 0, db_user_0, sub_store_user_0, "/test", std::move(user_0_config));
+
+    Session::Config user_1_config;
+    user_1_config.signed_user_token = g_user_1_path_test_token;
+    user_1_config.user_id = "user_1";
+    util::Optional<Session> user_1_session =
+        fixture.make_flx_session(3, 0, db_user_1, sub_store_user_1, "/test", std::move(user_1_config));
+
+    CHECK(user_0_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(user_1_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(user_0_session->wait_for_download_complete_or_client_stopped());
+    CHECK(user_1_session->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK_NOT(got_compensating_write);
+    }
+    check_order_visibility(test_context, db_user_0, false, false);
+    check_order_visibility(test_context, db_user_1, true, true);
+    check_catalog_name(test_context, db_user_0, 10, "admin-edit");
+    check_catalog_name(test_context, db_user_1, 10, "admin-edit");
+}
+
+TEST(Sync_FLXDefaultDenyWriteCreatesCompensatingWrite)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_a);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    add_flx_private_schema(seed_db);
+    create_flx_isolation_schema(db_a, 0, nullptr, false);
+    add_flx_private_schema(db_a);
+
+    auto sub_store_a = SubscriptionStore::create(db_a);
+    subscribe_to_flx_isolation_tables(db_a, sub_store_a);
+
+    MultiClientServerFixture::Config fixture_config;
+    fixture_config.enable_flx_sync = true;
+    using FLXRule = Server::Config::FLXRule;
+    fixture_config.flx_rules.push_back({"Order", FLXRule::Mode::Owner, "owner_id"});
+    fixture_config.flx_rules.push_back({"Catalog", FLXRule::Mode::PublicReadOnly, ""});
+
+    MultiClientServerFixture fixture(2, 1, dir, test_context, std::move(fixture_config));
+    fixture.start();
+
+    util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    std::mutex error_mutex;
+    bool got_compensating_write = false;
+
+    Session::Config config_a;
+    config_a.signed_user_token = g_user_0_path_test_token;
+    config_a.user_id = "user_0";
+    config_a.connection_state_change_listener = [&](ConnectionState state,
+                                                    std::optional<SessionErrorInfo> error_info) {
+        if (error_info && error_info->status == ErrorCodes::SyncCompensatingWrite) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            CHECK_EQUAL(state, ConnectionState::connected);
+            CHECK_EQUAL(error_info->compensating_writes.size(), 1);
+            got_compensating_write = true;
+            return;
+        }
+        if (state == ConnectionState::disconnected && error_info) {
+            test_context.logger->error("Client disconnect: %1 (is_fatal=%2)", error_info->status,
+                                       error_info->is_fatal);
+            bool client_error_occurred = true;
+            CHECK_NOT(client_error_occurred);
+            fixture.stop();
+        }
+    };
+
+    util::Optional<Session> session_a =
+        fixture.make_flx_session(1, 0, db_a, sub_store_a, "/test", std::move(config_a));
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+    check_private_count(test_context, db_a, 0);
+
+    upsert_flx_private_object(db_a, 42, "not allowed");
+    CHECK(session_a->wait_for_upload_complete_or_client_stopped());
+    CHECK(session_a->wait_for_download_complete_or_client_stopped());
+
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        CHECK(got_compensating_write);
+    }
+    check_private_count(test_context, db_a, 0);
 }
 
 TEST(Sync_TransformAgainstEmptyReciprocalChangeset)

@@ -50,6 +50,8 @@ struct Options {
     std::uintmax_t tenant_max_storage_bytes = 0;
     bool allow_unsigned_tokens = false;
     bool disable_sync_to_disk = false;
+    bool enable_flx_sync = false;
+    std::vector<sync::Server::Config::FLXRule> flx_rules;
 };
 
 void print_usage(std::ostream& out)
@@ -69,6 +71,11 @@ void print_usage(std::ostream& out)
         << "  --tenant-max-open-files N   Max open Barq files per tenant per server thread. 0 = unlimited.\n"
         << "  --tenant-max-storage-bytes N\n"
         << "                              Max current on-disk bytes per tenant. 0 = unlimited.\n"
+        << "  --enable-flx               Enable Flexible Sync websocket negotiation.\n"
+        << "  --flx-owner-rule TABLE:FIELD\n"
+        << "                              Allow owner rows where FIELD equals token identity.\n"
+        << "  --flx-public-readonly-rule TABLE\n"
+        << "                              Allow read-only public rows for TABLE.\n"
         << "  --allow-unsigned-tokens     Dev/test only. Do not verify token signatures.\n"
         << "  --tls-cert PEM              TLS certificate chain file.\n"
         << "  --tls-key PEM               TLS private key file.\n"
@@ -93,6 +100,18 @@ bool parse_log_level(const std::string& value, util::Logger::Level& level)
     std::istringstream in(value);
     in >> level;
     return !in.fail() && in.eof();
+}
+
+bool parse_flx_owner_rule(const std::string& value, sync::Server::Config::FLXRule& rule)
+{
+    std::size_t pos = value.find(':');
+    if (pos == std::string::npos || pos == 0 || pos + 1 == value.size())
+        return false;
+
+    rule.table = value.substr(0, pos);
+    rule.mode = sync::Server::Config::FLXRule::Mode::Owner;
+    rule.owner_field = value.substr(pos + 1);
+    return true;
 }
 
 template <class T>
@@ -177,6 +196,27 @@ bool parse_args(int argc, char* argv[], Options& options)
                 return false;
             }
         }
+        else if (arg == "--enable-flx") {
+            options.enable_flx_sync = true;
+        }
+        else if (arg == "--flx-owner-rule") {
+            std::string value;
+            if (!read_value(i, argc, argv, value, "--flx-owner-rule"))
+                return false;
+            sync::Server::Config::FLXRule rule;
+            if (!parse_flx_owner_rule(value, rule)) {
+                std::cerr << "Invalid --flx-owner-rule: " << value << " (expected TABLE:FIELD)\n";
+                return false;
+            }
+            options.flx_rules.push_back(std::move(rule));
+        }
+        else if (arg == "--flx-public-readonly-rule") {
+            sync::Server::Config::FLXRule rule;
+            if (!read_value(i, argc, argv, rule.table, "--flx-public-readonly-rule"))
+                return false;
+            rule.mode = sync::Server::Config::FLXRule::Mode::PublicReadOnly;
+            options.flx_rules.push_back(std::move(rule));
+        }
         else if (arg == "--tls-cert") {
             if (!read_value(i, argc, argv, options.tls_cert, "--tls-cert"))
                 return false;
@@ -241,6 +281,10 @@ bool parse_args(int argc, char* argv[], Options& options)
     }
     if (options.tls_cert.empty() != options.tls_key.empty()) {
         std::cerr << "--tls-cert and --tls-key must be passed together\n";
+        return false;
+    }
+    if (!options.flx_rules.empty() && !options.enable_flx_sync) {
+        std::cerr << "--flx-owner-rule and --flx-public-readonly-rule require --enable-flx\n";
         return false;
     }
 
@@ -343,6 +387,8 @@ int main(int argc, char* argv[])
         config.tenant_limits.max_files = options.tenant_max_files;
         config.tenant_limits.max_open_files = options.tenant_max_open_files;
         config.tenant_limits.max_storage_bytes = options.tenant_max_storage_bytes;
+        config.enable_flx_sync = options.enable_flx_sync;
+        config.flx_rules = std::move(options.flx_rules);
         if (!options.tenant_encryption_master_key.empty()) {
             auto secret = util::load_file(options.tenant_encryption_master_key); // Throws
             config.tenant_encryption_master_secret = std::vector<char>(secret.begin(), secret.end()); // Throws

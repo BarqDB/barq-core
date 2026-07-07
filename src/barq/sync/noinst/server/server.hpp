@@ -57,6 +57,8 @@ private:
 class Server {
 public:
     using SessionBootstrapCallback = void(std::string_view virt_path, file_ident_type client_file_ident);
+    using FLXBootstrapBatchCallback = void(std::string_view virt_path, file_ident_type client_file_ident,
+                                           sync::DownloadBatchState batch_state, std::size_t num_changesets);
 
     // FIXME: The default values for `http_request_timeout`,
     // `http_response_timeout`, `connection_reaper_timeout`, and
@@ -215,6 +217,25 @@ public:
         };
         TenantLimits tenant_limits;
 
+        /// Flexible Sync is opt-in. When false, query-sync websocket
+        /// negotiation is rejected.
+        bool enable_flx_sync = false;
+
+        /// Flexible Sync table rules. FLX uses the client-synced schema in the
+        /// shared server .barq file, but access intent is always configured
+        /// here. Tables not listed here are denied by default.
+        struct FLXRule {
+            enum class Mode {
+                PublicReadOnly,
+                Owner
+            };
+
+            std::string table;
+            Mode mode = Mode::Owner;
+            std::string owner_field;
+        };
+        std::vector<FLXRule> flx_rules;
+
         /// Sets a limit on the allowed accumulated size in bytes of buffered
         /// incoming changesets waiting to be processed. If left at zero, an
         /// implementation defined default value will be chosen.
@@ -264,6 +285,12 @@ public:
         ///
         /// This feature exists exclusively for testing purposes.
         std::function<SessionBootstrapCallback> session_bootstrap_callback;
+
+        /// If specified, this function will be called after each FLX bootstrap
+        /// download body is prepared.
+        ///
+        /// This feature exists exclusively for testing purposes.
+        std::function<FLXBootstrapBatchCallback> flx_bootstrap_batch_callback;
     };
 
     /// See Config::max_protocol_version.

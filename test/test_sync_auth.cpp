@@ -138,6 +138,50 @@ TEST(Sync_Auth_ServerConfigRejectsTenantLimitsWithoutTenantKeys)
     CHECK_THROW(Server("unused", util::none, std::move(config)), std::invalid_argument);
 }
 
+TEST(Sync_Auth_ServerConfigAcceptsFLXRules)
+{
+    Server::Config config;
+    config.logger = test_context.logger;
+    config.enable_flx_sync = true;
+    config.flx_rules.push_back({"class_Task", Server::Config::FLXRule::Mode::Owner, "owner_id"});
+    config.flx_rules.push_back({"class_PublicNote", Server::Config::FLXRule::Mode::PublicReadOnly, ""});
+
+    CHECK_NOTHROW(Server("unused", util::none, std::move(config)));
+}
+
+TEST(Sync_Auth_ServerConfigRejectsDuplicateFLXRuleTables)
+{
+    Server::Config config;
+    config.flx_rules.push_back({"class_Task", Server::Config::FLXRule::Mode::Owner, "owner_id"});
+    config.flx_rules.push_back({"class_Task", Server::Config::FLXRule::Mode::PublicReadOnly, ""});
+
+    CHECK_THROW(Server("unused", util::none, std::move(config)), std::invalid_argument);
+}
+
+TEST(Sync_Auth_ServerConfigRejectsOwnerFLXRuleWithoutOwnerField)
+{
+    Server::Config config;
+    config.flx_rules.push_back({"class_Task", Server::Config::FLXRule::Mode::Owner, ""});
+
+    CHECK_THROW(Server("unused", util::none, std::move(config)), std::invalid_argument);
+}
+
+TEST(Sync_Auth_ServerConfigRejectsPublicReadOnlyFLXRuleWithOwnerField)
+{
+    Server::Config config;
+    config.flx_rules.push_back({"class_PublicNote", Server::Config::FLXRule::Mode::PublicReadOnly, "owner_id"});
+
+    CHECK_THROW(Server("unused", util::none, std::move(config)), std::invalid_argument);
+}
+
+TEST(Sync_Auth_ServerConfigRejectsFLXRuleWithoutTable)
+{
+    Server::Config config;
+    config.flx_rules.push_back({"", Server::Config::FLXRule::Mode::PublicReadOnly, ""});
+
+    CHECK_THROW(Server("unused", util::none, std::move(config)), std::invalid_argument);
+}
+
 TEST(Sync_Auth_TenantOpenFileQuotaEvictsOnlyTenant)
 {
     SHARED_GROUP_TEST_PATH(path_a_1);

@@ -35,6 +35,141 @@ void compare_out_string(const A& expected, const B& out, TestContext& test_conte
     CHECK_EQUAL(std::string_view(expected.data(), expected.size()), std::string_view(out.data(), out.size()));
 }
 
+struct ClientProtocolTestConnection {
+    util::Logger& logger;
+    bool flx_sync = true;
+    bool got_download = false;
+    Status protocol_error = Status::OK();
+    _impl::ClientProtocol::session_ident_type download_session_ident = 0;
+    _impl::ClientProtocol::DownloadMessage download_message;
+
+    bool is_flx_sync_connection() const
+    {
+        return flx_sync;
+    }
+
+    void handle_protocol_error(Status status)
+    {
+        protocol_error = std::move(status);
+    }
+
+    void receive_download_message(_impl::ClientProtocol::session_ident_type session_ident,
+                                  _impl::ClientProtocol::DownloadMessage message)
+    {
+        got_download = true;
+        download_session_ident = session_ident;
+        download_message = std::move(message);
+    }
+
+    void receive_pong(_impl::ClientProtocol::milliseconds_type) {}
+    void receive_unbound_message(_impl::ClientProtocol::session_ident_type) {}
+    void receive_error_message(sync::ProtocolErrorInfo, _impl::ClientProtocol::session_ident_type) {}
+    void receive_query_error_message(int, std::string_view, int64_t, _impl::ClientProtocol::session_ident_type) {}
+    void receive_mark_message(_impl::ClientProtocol::session_ident_type, _impl::ClientProtocol::request_ident_type) {}
+    void receive_ident_message(_impl::ClientProtocol::session_ident_type, _impl::ClientProtocol::SaltedFileIdent) {}
+    void receive_test_command_response(_impl::ClientProtocol::session_ident_type,
+                                       _impl::ClientProtocol::request_ident_type, std::string_view)
+    {
+    }
+    void receive_barq_request_id(std::string_view) {}
+    void receive_server_log_message(_impl::ClientProtocol::session_ident_type, util::Logger::Level, std::string_view)
+    {
+    }
+};
+
+struct ServerProtocolTestConnection {
+    util::Logger& logger;
+    bool flx_sync = true;
+    Status protocol_error = Status::OK();
+
+    bool got_bind = false;
+    _impl::ServerProtocol::session_ident_type bind_session_ident = 0;
+    std::string bind_path;
+    std::string bind_signed_user_token;
+    bool bind_need_client_file_ident = false;
+    bool bind_is_subserver = false;
+
+    bool got_flx_ident = false;
+    _impl::ServerProtocol::session_ident_type ident_session_ident = 0;
+    _impl::ServerProtocol::file_ident_type ident_client_file_ident = 0;
+    _impl::ServerProtocol::salt_type ident_client_file_ident_salt = 0;
+    _impl::ServerProtocol::version_type ident_scan_server_version = 0;
+    _impl::ServerProtocol::version_type ident_scan_client_version = 0;
+    _impl::ServerProtocol::version_type ident_latest_server_version = 0;
+    _impl::ServerProtocol::salt_type ident_latest_server_version_salt = 0;
+    int64_t ident_query_version = 0;
+    std::string ident_query_body;
+
+    bool got_query = false;
+    _impl::ServerProtocol::session_ident_type query_session_ident = 0;
+    int64_t query_version = 0;
+    std::string query_body;
+
+    bool is_flx_sync_connection() const
+    {
+        return flx_sync;
+    }
+
+    void handle_protocol_error(Status status)
+    {
+        protocol_error = std::move(status);
+    }
+
+    void receive_upload_message(_impl::ServerProtocol::session_ident_type, _impl::ServerProtocol::version_type,
+                                _impl::ServerProtocol::version_type, _impl::ServerProtocol::version_type,
+                                const std::vector<_impl::ServerProtocol::UploadChangeset>&)
+    {
+    }
+    void receive_mark_message(_impl::ServerProtocol::session_ident_type, _impl::ServerProtocol::request_ident_type) {}
+    void receive_ping(_impl::ServerProtocol::milliseconds_type, _impl::ServerProtocol::milliseconds_type) {}
+    void receive_bind_message(_impl::ServerProtocol::session_ident_type session_ident, std::string path,
+                              std::string signed_user_token, bool need_client_file_ident, bool is_subserver)
+    {
+        got_bind = true;
+        bind_session_ident = session_ident;
+        bind_path = std::move(path);
+        bind_signed_user_token = std::move(signed_user_token);
+        bind_need_client_file_ident = need_client_file_ident;
+        bind_is_subserver = is_subserver;
+    }
+    void receive_ident_message(_impl::ServerProtocol::session_ident_type, _impl::ServerProtocol::file_ident_type,
+                               _impl::ServerProtocol::salt_type, _impl::ServerProtocol::version_type,
+                               _impl::ServerProtocol::version_type, _impl::ServerProtocol::version_type,
+                               _impl::ServerProtocol::salt_type)
+    {
+    }
+    void receive_ident_message(_impl::ServerProtocol::session_ident_type session_ident,
+                               _impl::ServerProtocol::file_ident_type client_file_ident,
+                               _impl::ServerProtocol::salt_type client_file_ident_salt,
+                               _impl::ServerProtocol::version_type scan_server_version,
+                               _impl::ServerProtocol::version_type scan_client_version,
+                               _impl::ServerProtocol::version_type latest_server_version,
+                               _impl::ServerProtocol::salt_type latest_server_version_salt, int64_t query_version,
+                               std::string query_body)
+    {
+        got_flx_ident = true;
+        ident_session_ident = session_ident;
+        ident_client_file_ident = client_file_ident;
+        ident_client_file_ident_salt = client_file_ident_salt;
+        ident_scan_server_version = scan_server_version;
+        ident_scan_client_version = scan_client_version;
+        ident_latest_server_version = latest_server_version;
+        ident_latest_server_version_salt = latest_server_version_salt;
+        ident_query_version = query_version;
+        ident_query_body = std::move(query_body);
+    }
+    void receive_query_message(_impl::ServerProtocol::session_ident_type session_ident, int64_t version,
+                               std::string body)
+    {
+        got_query = true;
+        query_session_ident = session_ident;
+        query_version = version;
+        query_body = std::move(body);
+    }
+    void receive_unbind_message(_impl::ServerProtocol::session_ident_type) {}
+    void receive_error_message(_impl::ServerProtocol::session_ident_type, int, std::string_view) {}
+};
+
 TEST(Protocol_Codec_Bind_PBS)
 {
     auto protocol = _impl::ClientProtocol();
@@ -109,6 +244,58 @@ TEST(Protocol_Codec_Query_Change)
     compare_out_string(expected_out_string, out, test_context);
 }
 
+TEST(Protocol_Codec_Server_Parse_FLX_BindIdentQuery)
+{
+    auto client_protocol = _impl::ClientProtocol();
+    auto server_protocol = _impl::ServerProtocol();
+    auto out = _impl::ClientProtocol::OutputBuffer();
+    ServerProtocolTestConnection connection{*test_context.logger};
+
+    auto bind_json = nlohmann::json();
+    bind_json["app_id"] = "barq-test";
+    bind_json["platform"] = "unit";
+    client_protocol.make_flx_bind_message(8, out, 456888, bind_json, "token21", false, true);
+    server_protocol.parse_message_received(connection, std::string_view(out.data(), out.size()));
+
+    CHECK(connection.protocol_error.is_ok());
+    CHECK(connection.got_bind);
+    CHECK_EQUAL(connection.bind_session_ident, 456888);
+    CHECK_EQUAL(connection.bind_path, bind_json.dump());
+    CHECK_EQUAL(connection.bind_signed_user_token, "token21");
+    CHECK_NOT(connection.bind_need_client_file_ident);
+    CHECK(connection.bind_is_subserver);
+
+    out.reset();
+    auto file_ident = _impl::ClientProtocol::SaltedFileIdent{999234, 234999};
+    auto progress = _impl::ClientProtocol::SyncProgress{{3, 4}, {5, 6}, {7, 8}};
+    std::string ident_query = "{\"Order\":\"TRUEPREDICATE\"}";
+    client_protocol.make_flx_ident_message(out, 888234, file_ident, progress, 3, ident_query);
+    server_protocol.parse_message_received(connection, std::string_view(out.data(), out.size()));
+
+    CHECK(connection.protocol_error.is_ok());
+    CHECK(connection.got_flx_ident);
+    CHECK_EQUAL(connection.ident_session_ident, 888234);
+    CHECK_EQUAL(connection.ident_client_file_ident, 999234);
+    CHECK_EQUAL(connection.ident_client_file_ident_salt, 234999);
+    CHECK_EQUAL(connection.ident_scan_server_version, 5);
+    CHECK_EQUAL(connection.ident_scan_client_version, 6);
+    CHECK_EQUAL(connection.ident_latest_server_version, 3);
+    CHECK_EQUAL(connection.ident_latest_server_version_salt, 4);
+    CHECK_EQUAL(connection.ident_query_version, 3);
+    CHECK_EQUAL(connection.ident_query_body, ident_query);
+
+    out.reset();
+    std::string query = "{\"Order\":\"owner_id == 'user_0'\"}";
+    client_protocol.make_query_change_message(out, 888234, 4, query);
+    server_protocol.parse_message_received(connection, std::string_view(out.data(), out.size()));
+
+    CHECK(connection.protocol_error.is_ok());
+    CHECK(connection.got_query);
+    CHECK_EQUAL(connection.query_session_ident, 888234);
+    CHECK_EQUAL(connection.query_version, 4);
+    CHECK_EQUAL(connection.query_body, query);
+}
+
 TEST(Protocol_Codec_JSON_Error)
 {
     auto protocol = _impl::ClientProtocol();
@@ -121,6 +308,67 @@ TEST(Protocol_Codec_JSON_Error)
 
     std::string expected_out_string = "json_error 9099 31 234888\n{\"valA\":123,\"valB\":\"something\"}";
     protocol.make_json_error_message(out, 234888, 9099, json_string);
+    compare_out_string(expected_out_string, out, test_context);
+}
+
+TEST(Protocol_Codec_Server_JSON_Error)
+{
+    auto protocol = _impl::ServerProtocol();
+    auto out = _impl::ServerProtocol::OutputBuffer();
+
+    std::string expected_out_string = "json_error 231 20 234888\n{\"message\":\"undone\"}";
+    protocol.make_json_error_message(out, 234888, 231, "{\"message\":\"undone\"}");
+    compare_out_string(expected_out_string, out, test_context);
+}
+
+TEST(Protocol_Codec_Server_Download_FLX)
+{
+    auto protocol = _impl::ServerProtocol();
+    auto out = _impl::ServerProtocol::OutputBuffer();
+    std::string body;
+
+    std::string expected_out_string = "download 234888 9 8 10 11 7 6 5 1 0.42 0 0 0\n";
+    protocol.make_download_message(14, out, 234888, 9, 8, 10, 11, 7, 6, 999, 0, body.data(), body.size(), 0, false,
+                                   *test_context.logger, true, 5, sync::DownloadBatchState::LastInBatch, 0.42);
+    compare_out_string(expected_out_string, out, test_context);
+
+    out.reset();
+    expected_out_string = "download 234888 9 8 10 11 7 6 5 0 0.25 0 0 0\n";
+    protocol.make_download_message(14, out, 234888, 9, 8, 10, 11, 7, 6, 999, 0, body.data(), body.size(), 0, false,
+                                   *test_context.logger, true, 5, sync::DownloadBatchState::MoreToCome, 0.25);
+    compare_out_string(expected_out_string, out, test_context);
+}
+
+TEST(Protocol_Codec_Client_Parse_Download_FLX)
+{
+    auto protocol = _impl::ClientProtocol();
+    ClientProtocolTestConnection connection{*test_context.logger};
+
+    protocol.parse_message_received(connection, "download 234888 9 8 10 11 7 6 5 1 0.42 0 0 0\n");
+
+    CHECK(connection.protocol_error.is_ok());
+    CHECK(connection.got_download);
+    CHECK_EQUAL(connection.download_session_ident, 234888);
+    CHECK_EQUAL(connection.download_message.progress.download.server_version, 9);
+    CHECK_EQUAL(connection.download_message.progress.download.last_integrated_client_version, 8);
+    CHECK_EQUAL(connection.download_message.progress.latest_server_version.version, 10);
+    CHECK_EQUAL(connection.download_message.progress.latest_server_version.salt, 11);
+    CHECK_EQUAL(connection.download_message.progress.upload.client_version, 7);
+    CHECK_EQUAL(connection.download_message.progress.upload.last_integrated_server_version, 6);
+    CHECK(connection.download_message.query_version);
+    CHECK_EQUAL(*connection.download_message.query_version, 5);
+    CHECK_EQUAL(connection.download_message.batch_state, sync::DownloadBatchState::LastInBatch);
+    CHECK_APPROXIMATELY_EQUAL(connection.download_message.downloadable.as_estimate(), 0.42, 0.0001);
+    CHECK(connection.download_message.changesets.empty());
+}
+
+TEST(Protocol_Codec_Server_Query_Error)
+{
+    auto protocol = _impl::ServerProtocol();
+    auto out = _impl::ServerProtocol::OutputBuffer();
+
+    std::string expected_out_string = "query_error 225 9 234888 5\nbad query";
+    protocol.make_query_error_message(out, 225, "bad query", 234888, 5);
     compare_out_string(expected_out_string, out, test_context);
 }
 
