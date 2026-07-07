@@ -698,6 +698,14 @@ public:
         //  connections, while BaaS does not.
         config.service_identifier = "/barq-sync";
         config.barq_identifier = std::move(barq_identifier);
+        // The fixture server enforces signed access tokens, so an unauthenticated
+        // session is rejected at BIND with permission_denied and then hangs on the
+        // test's progress/upload waits. Default to the standard signed test token
+        // when the caller did not provide one; make_bound_session and the auth
+        // tests set an explicit token, so this only affects otherwise-tokenless
+        // sessions.
+        if (config.signed_user_token.empty())
+            config.signed_user_token = g_signed_test_user_token;
         config.server_port = m_server_ports[server_index];
         config.server_address = "localhost";
         if (m_connection_state_change_listeners[client_index]) {
