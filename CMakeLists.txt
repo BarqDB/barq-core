@@ -302,7 +302,12 @@ if(BARQ_NEEDS_OPENSSL OR BARQ_FORCE_OPENSSL)
     option(BARQ_USE_SYSTEM_OPENSSL "Look for an external OpenSSL installation instead of using prebuilt one." OFF)
     set(_BARQ_USE_OPENSSL_DEFAULT_VERIFY_PATHS ON)
     if(NOT BARQ_USE_SYSTEM_OPENSSL AND (ANDROID OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
-        # Use our own prebuilt OpenSSL
+        # Use our own prebuilt OpenSSL. The version must match an asset name in the barq-core
+        # "dependencies" GitHub release (see tools/cmake/AcquireBarqDependency.cmake). Override
+        # with -DDEP_OPENSSL_VERSION=... if needed.
+        if(NOT DEP_OPENSSL_VERSION)
+            set(DEP_OPENSSL_VERSION "3.3.1")
+        endif()
         barq_acquire_dependency(openssl ${DEP_OPENSSL_VERSION} OPENSSL_CMAKE_INCLUDE_FILE)
 
         include(${OPENSSL_CMAKE_INCLUDE_FILE})
@@ -326,6 +331,9 @@ if(NOT APPLE AND NOT EMSCRIPTEN AND NOT TARGET ZLIB::ZLIB)
     if(WIN32 OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BARQ_LINUX_TOOLCHAIN))
         find_package(ZLIB)
         if (NOT ZLIB_FOUND)
+            if(NOT DEP_ZLIB_VERSION)
+                set(DEP_ZLIB_VERSION "1.2.13")
+            endif()
             barq_acquire_dependency(zlib ${DEP_ZLIB_VERSION} ZLIB_CMAKE_INCLUDE_FILE)
             include(${ZLIB_CMAKE_INCLUDE_FILE})
         endif()
