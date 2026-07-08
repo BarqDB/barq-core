@@ -1,8 +1,19 @@
-# Barq
+# Barq Core
+
+[![License](https://img.shields.io/github/license/BarqDB/barq-core)](./LICENSE)
+![Status](https://img.shields.io/badge/status-alpha-f7c948)
+![C++17](https://img.shields.io/badge/C%2B%2B-17-00599c)
 
 Barq is a local-first database core with sync support.
 
 This code base keeps the storage engine, object store, query system, and sync protocol foundation, then moves the project toward Barq-owned backend pieces.
+
+## At A Glance
+
+- Native storage engine and object store
+- Query parser and execution layer
+- Token-based sync client and server foundation
+- C API for SDK bindings
 
 ## What Is Here
 
@@ -94,6 +105,13 @@ Build and run the object-store tests:
 cmake --build cmake-build-debug --target barq-object-store-tests
 cmake-build-debug/test/object-store/barq-object-store-tests.app/Contents/MacOS/barq-object-store-tests
 ```
+
+## Roadmap
+
+- Stabilize the sync server surface
+- Keep the C API small and SDK-friendly
+- Improve release notes for native artifacts
+- Add more end-to-end sync coverage
 
 ## License And Attribution
 
