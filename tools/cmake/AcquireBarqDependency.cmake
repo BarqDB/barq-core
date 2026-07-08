@@ -29,13 +29,13 @@ function(barq_acquire_dependency dep_name dep_version out_dep_cmake)
     endif()
 
     if(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/${dep_name}/include.cmake)
-        set(DEP_URL "https://static.barq.io/downloads/dependencies/${dep_name}/${dep_version}/${dep_name}-${dep_version}-${_target_architecture_${CMAKE_SYSTEM_NAME}_${_target_architecture}}-${_target_platform_name_${CMAKE_SYSTEM_NAME}}.tar.gz")
+        set(DEP_URL "https://github.com/BarqDB/barq-core/releases/download/dependencies/${dep_name}-${dep_version}-${_target_architecture_${CMAKE_SYSTEM_NAME}_${_target_architecture}}-${_target_platform_name_${CMAKE_SYSTEM_NAME}}.tar.gz")
         message(STATUS "Getting ${DEP_URL}...")
         file(DOWNLOAD "${DEP_URL}" "${CMAKE_CURRENT_BINARY_DIR}/${dep_name}/${dep_name}.tar.gz" STATUS download_status)
 
         list(GET download_status 0 status_code)
         if (NOT "${status_code}" STREQUAL "0")
-            message(FATAL_ERROR "Downloading ${url}... Failed. Status: ${download_status}")
+            message(FATAL_ERROR "Downloading ${DEP_URL}... Failed. Status: ${download_status}")
         endif()
 
         message(STATUS "Uncompressing ${dep_name}...")
