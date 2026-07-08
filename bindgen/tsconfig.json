@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "es2020",
+    "module": "es2020",
+    "moduleResolution": "node",
+    "noEmit": true,
+    "esModuleInterop": true,
+    "baseUrl": "./",
+    "skipLibCheck": true,
+    "paths": {
+      "@barq/bindgen/*": [ "./src/*" ]
+    }
+  },
+  "include": [
+    "src/"
+  ]
+}
