@@ -19,8 +19,6 @@
 #ifndef BARQ_SORT_DESCRIPTOR_HPP
 #define BARQ_SORT_DESCRIPTOR_HPP
 
-#include <external/hnswlib/hnswlib.h>
-#include <external/hnswlib/space_ip.h>
 #include <vector>
 #include <unordered_set>
 #include <barq/cluster.hpp>
@@ -318,7 +316,6 @@ public:
         : m_query_data(query_data)
         , m_k(k)
         , m_column(column)
-        , m_sp(query_data.size())
     {
         if (!(column.get_type() == col_type_Float && column.is_list())) {
             throw InvalidArgument("Knn distance can only be calculated on lists of floats");
@@ -353,18 +350,11 @@ public:
     {
         return m_query_data;
     }
-    hnswlib::SpaceInterface<float>& get_sp() const
-    {
-        return m_sp;
-    }
 
 private:
     std::vector<float> m_query_data;
     size_t m_k;
     ColKey m_column;
-
-    // We are going to default to measure distance by Inner Product for now
-    mutable hnswlib::InnerProductSpace m_sp;
 };
 
 class DescriptorOrdering : public util::AtomicRefCountBase {

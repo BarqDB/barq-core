@@ -24,8 +24,30 @@
 #include <barq/list.hpp>
 #include <barq/dictionary.hpp>
 
-#include <limits>
-#include <optional>
+#include <algorithm>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <unordered_set>
+
+// hnswlib is vendored third-party (Apache 2.0); silence its internal warnings so
+// they do not leak into our build. Only this translation unit needs the full
+// algorithm header (HierarchicalNSW) — the public descriptor API stays hnswlib-free.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wshorten-64-to-32"
+#pragma clang diagnostic ignored "-Wsign-compare"
+#pragma clang diagnostic ignored "-Wreorder-ctor"
+#pragma clang diagnostic ignored "-Wconditional-uninitialized"
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#endif
+#include <external/hnswlib/hnswlib.h>
+#if defined(__clang__)
+#pragma clang diagnostic pop
+// The index cache below is guarded by a plain global std::mutex rather than a
+// capability-annotated one, so opt out of the thread-safety negative-capability check.
+#pragma clang diagnostic ignored "-Wthread-safety-negative"
+#endif
 
 using namespace barq;
 
@@ -682,6 +704,89 @@ void DescriptorOrdering::get_versions(const Group* group, TableVersions& version
     }
 }
 
+namespace {
+
+// ---------------------------------------------------------------------------
+// In-memory HNSW index backing SemanticSearchDescriptor.
+//
+// realm-core's prototype scanned every object linearly. Instead we build a real
+// hnswlib HNSW graph over the column's vectors and reuse it across queries.
+//
+// The graph lives in process memory, keyed by the live (table, column) identity
+// plus the table's content version, and is rebuilt lazily whenever the data
+// changes. It is not yet persisted to the database file, so the first query
+// after a write pays a one-off rebuild; later queries are served from the cache.
+// Access is serialized by a single mutex for now (correctness over concurrency).
+// ---------------------------------------------------------------------------
+struct HnswEntry {
+    TableKey table_key;
+    uint_fast64_t content_version = uint_fast64_t(-1);
+    size_t dim = 0;
+    size_t count = 0;
+    std::unique_ptr<hnswlib::InnerProductSpace> space;
+    std::unique_ptr<hnswlib::HierarchicalNSW<float>> index;
+};
+
+std::mutex g_hnsw_mutex;
+std::map<std::pair<const Table*, int64_t>, HnswEntry> g_hnsw_cache;
+
+// Build, or reuse a cached, HNSW graph over `column` for the objects in `table`.
+// Returns nullptr when there is nothing to index. Call with g_hnsw_mutex held.
+hnswlib::HierarchicalNSW<float>* get_or_build_index(const Table& table, ColKey column, size_t dim)
+{
+    HnswEntry& entry = g_hnsw_cache[std::make_pair(&table, column.value)];
+
+    const uint_fast64_t version = table.get_content_version();
+    const size_t count = table.size();
+
+    const bool fresh = entry.index && entry.table_key == table.get_key() &&
+                       entry.content_version == version && entry.dim == dim && entry.count == count;
+    if (fresh)
+        return entry.index->cur_element_count > 0 ? entry.index.get() : nullptr;
+
+    // Stale or missing: rebuild from scratch.
+    entry = HnswEntry{};
+    entry.table_key = table.get_key();
+    entry.content_version = version;
+    entry.dim = dim;
+    entry.count = count;
+    if (count == 0)
+        return nullptr;
+
+    entry.space = std::make_unique<hnswlib::InnerProductSpace>(dim);
+    entry.index = std::make_unique<hnswlib::HierarchicalNSW<float>>(entry.space.get(), count);
+
+    std::vector<float> buf(dim);
+    for (auto obj : table) {
+        Lst<float> lst = obj.get_list<float>(column);
+        if (lst.size() != dim)
+            continue; // only index vectors of the query's dimension
+        for (size_t i = 0; i < dim; ++i)
+            buf[i] = lst.get(i);
+        entry.index->addPoint(buf.data(), hnswlib::labeltype(obj.get_key().value));
+    }
+
+    return entry.index->cur_element_count > 0 ? entry.index.get() : nullptr;
+}
+
+// Restricts an HNSW search to the object keys that survived the preceding query.
+class CandidateFilter : public hnswlib::BaseFilterFunctor {
+public:
+    explicit CandidateFilter(const std::unordered_set<hnswlib::labeltype>& allowed)
+        : m_allowed(allowed)
+    {
+    }
+    bool operator()(hnswlib::labeltype id) override
+    {
+        return m_allowed.find(id) != m_allowed.end();
+    }
+
+private:
+    const std::unordered_set<hnswlib::labeltype>& m_allowed;
+};
+
+} // namespace
+
 std::string SemanticSearchDescriptor::get_description(ConstTableRef) const
 {
     return "KNN()";
@@ -689,80 +794,36 @@ std::string SemanticSearchDescriptor::get_description(ConstTableRef) const
 
 void SemanticSearchDescriptor::execute(const Table& table, KeyValues& key_values, const BaseDescriptor*) const
 {
-    using DistResult = std::pair<float, ObjKey>;
-    class PrioQueue : public std::vector<DistResult> {
-    public:
-        void insert(float dist, ObjKey key)
-        {
-            auto it = std::lower_bound(begin(), end(), dist, [](const DistResult& elem, float value) {
-                return elem.first < value;
-            });
-            emplace(it, dist, key);
-        }
-        auto top()
-        {
-            return back();
-        }
-        void pop()
-        {
-            pop_back();
-        }
-    };
+    const size_t dim = m_query_data.size();
+    const size_t candidates = key_values.size();
+    if (dim == 0 || candidates == 0) {
+        key_values.clear();
+        return;
+    }
 
-    PrioQueue top_results;
-    size_t dim = m_query_data.size();
-    hnswlib::DISTFUNC<float> fstdistfunc = m_sp.get_dist_func();
-    void* dist_func_param = m_sp.get_dist_func_param();
-    std::vector<float> buf(dim);
+    // Only objects that passed the preceding query are eligible neighbours.
+    std::unordered_set<hnswlib::labeltype> allowed;
+    allowed.reserve(candidates);
+    for (size_t i = 0; i < candidates; ++i)
+        allowed.insert(hnswlib::labeltype(key_values.get(i).value));
 
-    // Calculate the distance between the two vectors (embeddings)
-    auto dist_knn = [&](ObjKey obj_key) -> std::optional<float> {
-        if (Obj o = table.try_get_object(obj_key)) {
-            Lst<float> lst = o.get_list<float>(m_column);
-            if (lst.size() != dim)
-                throw IllegalOperation("Knn distance can only be calculated on lists of matching length");
-
-            // Create sequential buffer of list values
-            for (size_t i = 0; i < dim; i++) {
-                buf[i] = lst.get(i);
-            }
-
-            float dist = fstdistfunc(m_query_data.data(), buf.data(), dist_func_param);
-            return dist;
-        }
-        return {};
-    };
-
-    // Collect the k closest matches by distance
-    size_t n = std::min(m_k, key_values.size());
-    if (n > 0) {
-        for (size_t i = 0; i < n; i++) {
-            ObjKey r = key_values.get(i);
-            float dist = *dist_knn(r);
-            top_results.insert(dist, r);
-        }
-        float lastdist = top_results.empty() ? std::numeric_limits<float>::max() : top_results.top().first;
-        for (size_t i = m_k; i < key_values.size(); i++) {
-            ObjKey r = key_values.get(i);
-
-            if (auto opt_dist = dist_knn(r)) {
-                float dist = *opt_dist;
-                if (dist <= lastdist) {
-                    top_results.insert(dist, r);
-                    if (top_results.size() > m_k)
-                        top_results.pop();
-
-                    if (!top_results.empty()) {
-                        lastdist = top_results.top().first;
-                    }
-                }
-            }
+    std::vector<ObjKey> ordered;
+    {
+        std::lock_guard<std::mutex> lock(g_hnsw_mutex);
+        hnswlib::HierarchicalNSW<float>* index = get_or_build_index(table, m_column, dim);
+        if (index) {
+            const size_t k = std::min({m_k, allowed.size(), size_t(index->cur_element_count)});
+            // ef trades recall for speed; keep it above k (and above the element
+            // count for small data, which makes the graph search effectively exact).
+            index->setEf(std::max({k, allowed.size(), size_t(64)}));
+            CandidateFilter filter(allowed);
+            for (auto& hit : index->searchKnnCloserFirst(m_query_data.data(), k, &filter))
+                ordered.push_back(ObjKey(int64_t(hit.second)));
         }
     }
 
-    // set result to the matches, in order of closest match first
+    // Rewrite the result set to the neighbours, closest first.
     key_values.clear();
-    for (auto tr : top_results) {
-        key_values.add(tr.second);
-    }
+    for (ObjKey key : ordered)
+        key_values.add(key);
 }
