@@ -28,19 +28,16 @@ using namespace barq;
 
 namespace {
 
-// identity="test", access=["download","upload"], app_id="io.realm.Test".
+// identity="test", access=["download","upload"], app_id="io.barq.Test".
 // Signed with test/test_pubkey.pem's matching private key (same token the sync
 // test suite uses).
 const char g_signed_test_user_token[] =
-    "ewogICAgImlkZW50aXR5IjogInRlc3QiLAogICAgImFjY2VzcyI6IFsiZG93bmxvYWQiLCAidXBs"
-    "b2FkIl0sCiAgICAidGltZXN0YW1wIjogMTQ1NTUzMDYxNCwKICAgICJleHBpcmVzIjogbnVsbCwK"
-    "ICAgICJhcHBfaWQiOiAiaW8ucmVhbG0uVGVzdCIKfQo="
-    ":"
-    "kPQwXUUFFVoDkmw02ouA1g7OlXcZ/IJPpqwJs9lIi1azpyuakBWgQ8VhnInCXh90CQXYhnteZlMw"
-    "HYUZgt3/ED1jLu+nK2HlRKsmsOuAI20jMnHGGIZkql4/Ck9PEsvZ3huHGk5Jv9vpFp/dtnl1JXK2"
-    "9XjdO8+1hU4boeJuKpTMDTPwGI9dxa8sTtvMMN7AVoPkKb1uqHZVsb5uRGE86Cyv58cvuj/EvZ1A"
-    "yOCt5NGJwjTxydPgfX3QPcNMwDTHCRWYuoi2oTCINQHy8ebzXVLT1iy3adV4rM5bJukCnpLqHGlZ"
-    "MIslk07zKdoj3igMIT47W9QwIuCw8x5f5cRIAg==";
+    "ewogICAgImlkZW50aXR5IjogInRlc3QiLAogICAgImFjY2VzcyI6IFsiZG93bmxvYWQiLCAidXBsb2FkIl0sCiAgICAidGlt"
+    "ZXN0YW1wIjogMTQ1NTUzMDYxNCwKICAgICJleHBpcmVzIjogbnVsbCwKICAgICJhcHBfaWQiOiAiaW8uYmFycS5UZXN0Igp9"
+    "Cg==:gf2EBD/k2ZNQYFO07x2dRICigg/sWC//YODgq47tArdEW3wcalUImJQt6r7gnowKfehb63XYn6bM3aNUdQPGy4wqVTa"
+    "1Xa1g0Q897+XNK0DIe3Zb4bB/tfcdUbzmaHQDJ6n2Bns19KEdWSuOxz9JjYjTraKMbzXvfDV5xjiufZ57wYJs5Ba743ijnPY"
+    "En5RE2vY/B2G8mVMN+6aWUoBetnTOxKNylK5qNKdb1tFEZ7Be5199O9O10FKaFO7p8W0nQtGwkrjbTo8Y4IziGgs+2Lha60f"
+    "/n1NSoNa3i8lL5Hi+Z7tHeufFkSpnDDrzcq+TDCGaj3GI5LhK2nbU03SAcQ==";
 
 const char* g_server_path = "/e2e";
 
@@ -112,7 +109,7 @@ int main(int argc, char* argv[])
 
     // ---- Direction 1: writer -> server -> reader ----------------------------
     // Establish the session (a full server round-trip) BEFORE writing, so its
-    // upload baseline is the empty realm and the new object is tracked as a
+    // upload baseline is the empty file and the new object is tracked as a
     // change to upload -- not adopted as already-synced state.
     sync::Session writer_session(*writer.client, writer_db, nullptr, nullptr, make_session_config(port, logger));
     if (!writer_session.wait_for_download_complete_or_client_stopped()) {

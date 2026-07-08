@@ -33,7 +33,7 @@ namespace barq {
 struct SyncConfig;
 
 /// A concrete SyncUser identified by a tenant and a pre-supplied access token
-/// (a signed JWT), rather than by an Atlas App Services login.
+/// (a signed JWT), rather than by a hosted service login.
 ///
 /// Barq authenticates every sync session with a token minted out-of-band, so
 /// there is no `App` to produce a user. This is the one implementation of that

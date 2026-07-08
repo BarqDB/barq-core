@@ -16,7 +16,7 @@ race:adjtime
 # but ultimately needs to be fixed: #7083
 race:uv_async_init
 
-# We try to shut down the remote BaaSaaS instance from inside a signal handler,
+# We try to shut down the remote service instance from inside a signal handler,
 # which invovles a bunch of memory allocations. This is a pretty unsafe thing
 # to do, but we want to avoid leaking server resources.
 signal:barq::Baasaas::stop

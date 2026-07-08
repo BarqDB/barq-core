@@ -3990,21 +3990,21 @@ TEST(Shared_CompareGroups)
         embedded->add_column_dictionary(*embedded, "additional");
         wt->add_table("class_AnotherEmbedded", Table::Type::Embedded);
 
-        auto baas = wt->add_table_with_primary_key("class_Baa", type_Int, "_id");
+        auto baa_table = wt->add_table_with_primary_key("class_Baa", type_Int, "_id");
         auto foos = wt->add_table_with_primary_key("class_Foo", type_String, "_id");
 
-        baas->add_column(type_Bool, "bool");
-        baas->add_column_list(type_Int, "list");
-        baas->add_column_set(type_Int, "set");
-        baas->add_column_dictionary(type_Int, "dictionary");
-        baas->add_column(*embedded, "embedded");
-        baas->add_column(type_Mixed, "any", true);
-        baas->add_column(*foos, "link");
+        baa_table->add_column(type_Bool, "bool");
+        baa_table->add_column_list(type_Int, "list");
+        baa_table->add_column_set(type_Int, "set");
+        baa_table->add_column_dictionary(type_Int, "dictionary");
+        baa_table->add_column(*embedded, "embedded");
+        baa_table->add_column(type_Mixed, "any", true);
+        baa_table->add_column(*foos, "link");
 
         foos->add_column(type_String, "str");
         foos->add_column_list(*embedded, "list_of_embedded");
         foos->add_column_list(type_Mixed, "list_of_any", true);
-        foos->add_column_list(*baas, "link_list");
+        foos->add_column_list(*baa_table, "link_list");
         wt->commit();
     }
     {
@@ -4017,19 +4017,19 @@ TEST(Shared_CompareGroups)
         // Embedded in embedded
         embedded->add_column_dictionary(*embedded, "additional");
 
-        auto baas = wt->add_table_with_primary_key("class_Baa", type_Int, "_id");
+        auto baa_table = wt->add_table_with_primary_key("class_Baa", type_Int, "_id");
 
-        baas->add_column_set(type_Int, "set");
-        baas->add_column(type_Mixed, "any", true);
-        baas->add_column_dictionary(type_Int, "dictionary");
-        baas->add_column(*embedded, "embedded");
-        baas->add_column(type_Bool, "bool");
-        baas->add_column(*foos, "link");
-        baas->add_column_list(type_Int, "list");
+        baa_table->add_column_set(type_Int, "set");
+        baa_table->add_column(type_Mixed, "any", true);
+        baa_table->add_column_dictionary(type_Int, "dictionary");
+        baa_table->add_column(*embedded, "embedded");
+        baa_table->add_column(type_Bool, "bool");
+        baa_table->add_column(*foos, "link");
+        baa_table->add_column_list(type_Int, "list");
 
         foos->add_column_list(*embedded, "list_of_embedded");
         foos->add_column(type_String, "str");
-        foos->add_column_list(*baas, "link_list");
+        foos->add_column_list(*baa_table, "link_list");
         foos->add_column_list(type_Mixed, "list_of_any", true);
 
         wt->add_table("class_AnotherEmbedded", Table::Type::Embedded);
@@ -4039,17 +4039,17 @@ TEST(Shared_CompareGroups)
         auto wt = db->start_write();
 
         auto foos = wt->get_table("class_Foo");
-        auto baas = wt->get_table("class_Baa");
+        auto baa_table = wt->get_table("class_Baa");
 
         auto foo = foos->create_object_with_primary_key("123").set("str", "Hello");
         auto children = foo.get_linklist("list_of_embedded");
         children.create_and_insert_linked_object(0).set("float", 10.f);
         children.create_and_insert_linked_object(1).set("float", 20.f);
 
-        auto baa = baas->create_object_with_primary_key(999);
+        auto baa = baa_table->create_object_with_primary_key(999);
         baa.set("link", foo.get_key());
         baa.set("bool", true);
-        auto obj = baa.create_and_set_linked_object(baas->get_column_key("embedded"));
+        auto obj = baa.create_and_set_linked_object(baa_table->get_column_key("embedded"));
         obj.set("float", 42.f);
         auto additional = obj.get_dictionary("additional");
         additional.create_and_insert_linked_object("One").set("float", 1.f);
@@ -4079,8 +4079,8 @@ TEST(Shared_CompareGroups)
     CHECK(*db1->start_read() == *db2->start_read());
     {
         auto wt = db2->start_write();
-        auto baas = wt->get_table("class_Baa");
-        auto obj = baas->get_object_with_primary_key(999);
+        auto baa_table = wt->get_table("class_Baa");
+        auto obj = baa_table->get_object_with_primary_key(999);
         auto embedded = obj.get_linked_object("embedded");
         embedded.get_dictionary("additional").get_object("One").set("float", 555.f);
         wt->commit();
@@ -4109,21 +4109,21 @@ TEST(Shared_CopyReplication)
         embedded->add_column_dictionary(*embedded, "additional");
         tr->add_table("class_AnotherEmbedded", Table::Type::Embedded);
 
-        auto baas = tr->add_table_with_primary_key("class_Baa", type_Int, "_id");
+        auto baa_table = tr->add_table_with_primary_key("class_Baa", type_Int, "_id");
         auto foos = tr->add_table_with_primary_key("class_Foo", type_String, "_id");
 
-        baas->add_column(type_Bool, "bool");
-        baas->add_column_list(type_Int, "list");
-        baas->add_column_set(type_Int, "set");
-        baas->add_column_dictionary(type_Int, "dictionary");
-        baas->add_column(*embedded, "embedded");
-        baas->add_column(type_Mixed, "any", true);
-        baas->add_column(*foos, "link");
+        baa_table->add_column(type_Bool, "bool");
+        baa_table->add_column_list(type_Int, "list");
+        baa_table->add_column_set(type_Int, "set");
+        baa_table->add_column_dictionary(type_Int, "dictionary");
+        baa_table->add_column(*embedded, "embedded");
+        baa_table->add_column(type_Mixed, "any", true);
+        baa_table->add_column(*foos, "link");
 
         foos->add_column(type_String, "str");
         foos->add_column_list(*embedded, "list_of_embedded");
         foos->add_column_list(type_Mixed, "list_of_any", true);
-        foos->add_column_list(*baas, "link_list");
+        foos->add_column_list(*baa_table, "link_list");
 
 
         /* Create local objects */
@@ -4132,9 +4132,9 @@ TEST(Shared_CopyReplication)
         children.create_and_insert_linked_object(0).set("float", 10.f);
         children.create_and_insert_linked_object(1).set("float", 20.f);
 
-        auto baa = baas->create_object_with_primary_key(999);
+        auto baa = baa_table->create_object_with_primary_key(999);
         baa.set("link", foo.get_key());
-        auto obj = baa.create_and_set_linked_object(baas->get_column_key("embedded"));
+        auto obj = baa.create_and_set_linked_object(baa_table->get_column_key("embedded"));
         obj.set("float", 42.f);
         auto additional = obj.get_dictionary("additional");
 
@@ -4158,8 +4158,8 @@ TEST(Shared_CopyReplication)
         additional.create_and_insert_linked_object("Two").set("float", 2.f);
         auto embedded_obj = additional.create_and_insert_linked_object("Three");
 
-        auto baa1 = baas->create_object_with_primary_key(666).set("link", foo.get_key());
-        obj = baa1.create_and_set_linked_object(baas->get_column_key("embedded"));
+        auto baa1 = baa_table->create_object_with_primary_key(666).set("link", foo.get_key());
+        obj = baa1.create_and_set_linked_object(baa_table->get_column_key("embedded"));
         additional = obj.get_dictionary("additional");
         additional.create_and_insert_linked_object("Item").set("float", 100.f);
         obj.set("float", 35.f);
@@ -4196,26 +4196,26 @@ TEST(Shared_WriteTo)
         embedded->add_column_dictionary(*embedded, "additional");
         tr->add_table("class_AnotherEmbedded", Table::Type::Embedded);
 
-        auto baas = tr->add_table_with_primary_key("class_Baa", type_Int, "_id");
+        auto baa_table = tr->add_table_with_primary_key("class_Baa", type_Int, "_id");
         auto foos = tr->add_table_with_primary_key("class_Foo", type_String, "_id");
 
-        baas->add_column(type_Bool, "bool");
-        baas->add_column_list(type_Int, "list");
-        baas->add_column_set(type_Int, "set");
-        baas->add_column_dictionary(type_Int, "dictionary");
-        baas->add_column(*embedded, "embedded");
-        baas->add_column(type_Mixed, "any", true);
-        baas->add_column(*foos, "link");
+        baa_table->add_column(type_Bool, "bool");
+        baa_table->add_column_list(type_Int, "list");
+        baa_table->add_column_set(type_Int, "set");
+        baa_table->add_column_dictionary(type_Int, "dictionary");
+        baa_table->add_column(*embedded, "embedded");
+        baa_table->add_column(type_Mixed, "any", true);
+        baa_table->add_column(*foos, "link");
 
         // collections in mixed
-        baas->add_column(type_Mixed, "mixed_nested_list", true);
-        baas->add_column(type_Mixed, "mixed_nested_dictionary", true);
+        baa_table->add_column(type_Mixed, "mixed_nested_list", true);
+        baa_table->add_column(type_Mixed, "mixed_nested_dictionary", true);
 
         auto col_str = foos->add_column(type_String, "str");
         foos->add_search_index(col_str);
         foos->add_column_list(*embedded, "list_of_embedded");
         foos->add_column_list(type_Mixed, "list_of_any", true);
-        foos->add_column_list(*baas, "link_list");
+        foos->add_column_list(*baa_table, "link_list");
 
 
         /* Create local objects */
@@ -4224,9 +4224,9 @@ TEST(Shared_WriteTo)
         children.create_and_insert_linked_object(0).set("float", 10.f);
         children.create_and_insert_linked_object(1).set("float", 20.f);
 
-        auto baa = baas->create_object_with_primary_key(999);
+        auto baa = baa_table->create_object_with_primary_key(999);
         baa.set("link", foo.get_key());
-        auto obj = baa.create_and_set_linked_object(baas->get_column_key("embedded"));
+        auto obj = baa.create_and_set_linked_object(baa_table->get_column_key("embedded"));
         obj.set("float", 42.f);
         auto additional = obj.get_dictionary("additional");
         additional.create_and_insert_linked_object("One").set("float", 1.f);
@@ -4251,7 +4251,7 @@ TEST(Shared_WriteTo)
 
         // nested collections
         // nested list
-        auto col_key_mixed_list = baas->get_column_key("mixed_nested_list");
+        auto col_key_mixed_list = baa_table->get_column_key("mixed_nested_list");
         baa.set_collection(col_key_mixed_list, CollectionType::List);
         auto any_nested_list = baa.get_collection_ptr(col_key_mixed_list);
         any_nested_list->insert_collection(0, CollectionType::List);
@@ -4265,7 +4265,7 @@ TEST(Shared_WriteTo)
         nested_dict1->insert("test", "test");
 
         // nested dictionary
-        auto col_key_mixed_dict = baas->get_column_key("mixed_nested_dictionary");
+        auto col_key_mixed_dict = baa_table->get_column_key("mixed_nested_dictionary");
         baa.set_collection(col_key_mixed_dict, CollectionType::Dictionary);
         auto any_nested_dict = baa.get_collection_ptr(col_key_mixed_dict);
         any_nested_dict->insert_collection("List", CollectionType::List);
@@ -4278,8 +4278,8 @@ TEST(Shared_WriteTo)
         nested_dict2->insert("test", 10);
         nested_dict2->insert("test", "test");
 
-        auto baa1 = baas->create_object_with_primary_key(666).set("link", foo.get_key());
-        obj = baa1.create_and_set_linked_object(baas->get_column_key("embedded"));
+        auto baa1 = baa_table->create_object_with_primary_key(666).set("link", foo.get_key());
+        obj = baa1.create_and_set_linked_object(baa_table->get_column_key("embedded"));
         additional = obj.get_dictionary("additional");
         additional.create_and_insert_linked_object("Item").set("float", 100.f);
         obj.set("float", 35.f);
@@ -4306,15 +4306,15 @@ TEST(Shared_WriteTo)
         // Embedded in embedded
         embedded->add_column_dictionary(*embedded, "additional");
 
-        auto baas = wt->add_table_with_primary_key("class_Baa", type_Int, "_id");
-        baas->add_column(*embedded, "embedded");
+        auto baa_table = wt->add_table_with_primary_key("class_Baa", type_Int, "_id");
+        baa_table->add_column(*embedded, "embedded");
 
         auto foos = wt->add_table_with_primary_key("class_Foo", type_String, "_id");
         foos->add_column_list(type_Mixed, "list_of_any", true);
 
-        baas->create_object_with_primary_key(333);
-        auto baa = baas->create_object_with_primary_key(666);
-        auto obj = baa.create_and_set_linked_object(baas->get_column_key("embedded"));
+        baa_table->create_object_with_primary_key(333);
+        auto baa = baa_table->create_object_with_primary_key(666);
+        auto obj = baa.create_and_set_linked_object(baa_table->get_column_key("embedded"));
         obj.set("float", 99.f);
         auto additional = obj.get_dictionary("additional");
         additional.create_and_insert_linked_object("Item").set("float", 200.f);

@@ -5,6 +5,24 @@
 
 namespace barq::c_api {
 
+BARQ_API bool barq_decimal128_from_string(const char* value, barq_decimal128_t* out_decimal)
+{
+    return wrap_err([&]() {
+        if (!value || !out_decimal) {
+            return false;
+        }
+        *out_decimal = to_capi(Decimal128(std::string(value)));
+        return true;
+    });
+}
+
+BARQ_API char* barq_decimal128_to_string(barq_decimal128_t value)
+{
+    return wrap_err([&]() {
+        return duplicate_string(from_capi(value).to_string());
+    });
+}
+
 BARQ_API bool barq_get_num_objects(const barq_t* barq, barq_class_key_t key, size_t* out_count)
 {
     return wrap_err([&]() {
