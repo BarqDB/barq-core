@@ -6584,25 +6584,25 @@ TEST(Sync_UpgradeToClientHistory)
         auto col_float = embedded->add_column(type_Float, "float");
         auto col_additional = embedded->add_column_dictionary(*embedded, "additional");
 
-        auto baas = tr->add_table_with_primary_key("class_Baa", type_Int, "_id");
-        auto col_list = baas->add_column_list(type_Int, "list");
-        auto col_set = baas->add_column_set(type_Int, "set");
-        auto col_dict = baas->add_column_dictionary(type_Int, "dictionary");
-        auto col_child = baas->add_column(*embedded, "child");
+        auto baa_table = tr->add_table_with_primary_key("class_Baa", type_Int, "_id");
+        auto col_list = baa_table->add_column_list(type_Int, "list");
+        auto col_set = baa_table->add_column_set(type_Int, "set");
+        auto col_dict = baa_table->add_column_dictionary(type_Int, "dictionary");
+        auto col_child = baa_table->add_column(*embedded, "child");
 
         auto foos = tr->add_table_with_primary_key("class_Foo", type_String, "_id");
         auto col_str = foos->add_column(type_String, "str");
         auto col_children = foos->add_column_list(*embedded, "children");
 
-        auto foobaas = tr->add_table_with_primary_key("class_FooBaa", type_ObjectId, "_id");
-        auto col_time = foobaas->add_column(type_Timestamp, "time");
+        auto foobaa_table = tr->add_table_with_primary_key("class_FooBaa", type_ObjectId, "_id");
+        auto col_time = foobaa_table->add_column(type_Timestamp, "time");
 
-        auto col_link = baas->add_column(*foos, "link");
+        auto col_link = baa_table->add_column(*foos, "link");
 
         auto foo = foos->create_object_with_primary_key("123").set(col_str, "Hello");
         auto children = foo.get_linklist(col_children);
         children.create_and_insert_linked_object(0);
-        auto baa = baas->create_object_with_primary_key(999).set(col_link, foo.get_key());
+        auto baa = baa_table->create_object_with_primary_key(999).set(col_link, foo.get_key());
         auto obj = baa.create_and_set_linked_object(col_child);
         obj.set(col_float, 42.f);
         auto additional = obj.get_dictionary(col_additional);
@@ -6631,20 +6631,20 @@ TEST(Sync_UpgradeToClientHistory)
         dict.erase("key6");
 
         for (int i = 0; i < 100; i++) {
-            foobaas->create_object_with_primary_key(ObjectId::gen()).set(col_time, Timestamp(::time(nullptr), i));
+            foobaa_table->create_object_with_primary_key(ObjectId::gen()).set(col_time, Timestamp(::time(nullptr), i));
         }
 
         tr->commit();
     }
     {
         auto tr = db_2->start_write();
-        auto baas = tr->add_table_with_primary_key("class_Baa", type_Int, "_id");
+        auto baa_table = tr->add_table_with_primary_key("class_Baa", type_Int, "_id");
         auto foos = tr->add_table_with_primary_key("class_Foo", type_String, "_id");
         auto col_str = foos->add_column(type_String, "str");
-        auto col_link = baas->add_column(*foos, "link");
+        auto col_link = baa_table->add_column(*foos, "link");
 
         auto foo = foos->create_object_with_primary_key("123").set(col_str, "Goodbye");
-        baas->create_object_with_primary_key(888).set(col_link, foo.get_key());
+        baa_table->create_object_with_primary_key(888).set(col_link, foo.get_key());
 
         tr->commit();
     }

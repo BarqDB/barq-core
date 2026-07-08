@@ -18,11 +18,11 @@
 
 // Standalone proof that Barq DB at-rest encryption works.
 //
-// 1. Control: write a known marker into an UNencrypted realm and confirm the
+// 1. Control: write a known marker into an unencrypted Barq file and confirm the
 //    marker is readable in the raw file bytes (proves the byte scan works).
-// 2. Write the same marker into an ENCRYPTED realm and confirm the marker is
+// 2. Write the same marker into an encrypted Barq file and confirm the marker is
 //    NOT present in the raw bytes (on-disk data is ciphertext).
-// 3. Reopen the encrypted realm with the correct key and read the marker back.
+// 3. Reopen the encrypted Barq file with the correct key and read the marker back.
 // 4. Confirm opening with a WRONG key fails.
 // 5. Confirm opening with NO key fails.
 //
@@ -86,7 +86,7 @@ int main(int argc, char* argv[])
     std::array<char, 64> wrong_key = key;
     wrong_key[0] = static_cast<char>(wrong_key[0] ^ 0xFF);
 
-    // 1. Control: unencrypted realm -- marker MUST be visible in raw bytes.
+    // 1. Control: unencrypted Barq file -- marker MUST be visible in raw bytes.
     write_marker(plain_path, nullptr);
     bool plain_has_marker = file_contains(plain_path, MARKER);
     std::cout << "[1] control (unencrypted): marker found in raw bytes = "
@@ -96,13 +96,13 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    // 2. Encrypted realm -- marker MUST NOT appear in raw bytes.
+    // 2. Encrypted Barq file -- marker MUST NOT appear in raw bytes.
     write_marker(enc_path, key.data());
     bool enc_has_marker = file_contains(enc_path, MARKER);
     std::cout << "[2] encrypted: marker found in raw bytes = "
               << (enc_has_marker ? "YES (LEAK!)" : "NO (ciphertext)") << "\n";
     if (enc_has_marker) {
-        std::cerr << "FAIL: plaintext leaked to disk in encrypted realm\n";
+        std::cerr << "FAIL: plaintext leaked to disk in encrypted Barq file\n";
         return 1;
     }
 
@@ -133,7 +133,7 @@ int main(int argc, char* argv[])
         std::cout << "[4] wrong key rejected: " << e.what() << "\n";
     }
     if (!wrong_rejected) {
-        std::cerr << "FAIL: a wrong key opened the encrypted realm\n";
+        std::cerr << "FAIL: a wrong key opened the encrypted Barq file\n";
         return 1;
     }
 
@@ -147,7 +147,7 @@ int main(int argc, char* argv[])
         std::cout << "[5] no key rejected: " << e.what() << "\n";
     }
     if (!nokey_rejected) {
-        std::cerr << "FAIL: encrypted realm opened with no key\n";
+        std::cerr << "FAIL: encrypted Barq file opened with no key\n";
         return 1;
     }
 

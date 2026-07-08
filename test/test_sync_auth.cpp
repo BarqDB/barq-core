@@ -26,16 +26,14 @@ namespace {
 
 const char* example_jwt()
 {
-    return "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9."
-           "eyJhcHBJZCI6ImlvLnJlYWxtLkF1dGgiLCJhY2Nlc3MiOlsiZG93bmxvYWQiLCJ1cGxvYWQiXSwic3ViIjoiZGYyZjE4NjBjMTk1MjFiYjk0"
-           "NjM0OTRjOTI1MTYyZjciLCJwYXRoIjoiL2RlZmF1bHQvX19wYXJ0aWFsL2RmMmYxODYwYzE5NTIxYmI5NDYzNDk0YzkyNTE2MmY3LzBlYzNj"
-           "NjdlMTFjNzFkYmU1ZTgzYmZiNDE3MTViZmJlMGQ5ODNmODYiLCJzeW5jX2xhYmVsIjoiZGVmYXVsdCIsInNhbHQiOiIyY2FmZjhlMCIsImlh"
-           "dCI6MTU2NDczNzY1NiwiZXhwIjo0NzIwNDExNjE1LCJhdWQiOiJyZWFsbSIsImlzcyI6InJlYWxtIiwianRpIjoiYmM3MTlkY2ItOTA2Ny00"
-           "ZTQ4LWI1NmItYTQ3MzMxZDNmZDgxIn0.SGFUR8A-"
-           "XXn2i7LFGcWuUlrfcPgUYRj58ZClZrjsW7NSiE1tI5zZSbrEL7vyTPtwbMbMe1qMgdoB1ZdSzt-HAB9RCIrRk40XlHw7flb8jk_"
-           "q0hdqPnKbxEMz9wWzzUGOshXj2Yso1NVEX0q04k-ndpAODtuMDiU5T_3vF1czUFA-WXOMDr9dpX_Wn8KeEO0uOvb4_1AvDM_"
-           "wK3RF5D9IsJGuvE2Sqbq5j2DPGCgTkBsTcKJPQPcgEDC270nSb9SfitzLEzxoQbhF9M82MQJqhfj4ZThImG6ed7hjUIqdgBFuyBQ4WaMQgPD"
-           "vA5KRPYymC5owAHBmGht9wpUFzAbnBg";
+    return "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhcHBJZCI6ImlvLmJhcnEuQXV0aCIsImFjY2VzcyI6WyJkb3dubG9hZCIsInVwbG9hZCJdLCJzdWIiO"
+           "iJkZjJmMTg2MGMxOTUyMWJiOTQ2MzQ5NGM5MjUxNjJmNyIsInBhdGgiOiIvZGVmYXVsdC9fX3BhcnRpYWwvZGYyZjE4NjBjMTk1MjFiYjk0NjM0OTRjOTI"
+           "1MTYyZjcvMGVjM2M2N2UxMWM3MWRiZTVlODNiZmI0MTcxNWJmYmUwZDk4M2Y4NiIsInN5bmNfbGFiZWwiOiJkZWZhdWx0Iiwic2FsdCI6IjJjYWZmOGUwI"
+           "iwiaWF0IjoxNTY0NzM3NjU2LCJleHAiOjQ3MjA0MTE2MTUsImF1ZCI6ImJhcnEiLCJpc3MiOiJiYXJxIiwianRpIjoiYmM3MTlkY2ItOTA2Ny00ZTQ4LWI"
+           "1NmItYTQ3MzMxZDNmZDgxIn0.uCtBD0QRdoH2E9FFHhQD24TFHyGisnA7Tm_x-W7t8sQtFSplJG7UcoNOWL0jgvGF_H1Bhad_RI7TAegQ1M-FlNqij6QiX"
+           "McX6GMg70IaimOwOOW-zesA6pBTDCEOl1EPoTkzQnwDoKDRTziy_uS8uMHjhefkSJtGym1ky2HpPTCwl0r27o_rvGq02UNd_Cdohv5QgXiTJu8z5FAls7y"
+           "xYQWxov1OOaCPvmwtMINW2giyoUA3qF9MSNCU1Vccjpisds-U1JxSi3izAizpn8V33rWpEwxgCRpcBbjI0OL2qYmmeLl426vYx-vMPebd9fPcR69rVAwx4"
+           "OvIs-fCDb5XsA";
 }
 
 class TestServerHistoryContext : public _impl::ServerHistory::Context {
@@ -54,7 +52,7 @@ TEST(Sync_Auth_JWTAccessToken)
     AccessToken tok;
     AccessToken::ParseError error = AccessToken::ParseError::none;
 
-    PKey pk1 = PKey::load_public(test_util::get_test_resource_path() + "test_pubkey2.pem");
+    PKey pk1 = PKey::load_public(test_util::get_test_resource_path() + "test_pubkey.pem");
     AccessControl ctrl(std::move(pk1));
 
     AccessToken::Verifier& verifier = ctrl.verifier();
@@ -70,7 +68,7 @@ TEST(Sync_Auth_JWTAccessToken)
 TEST(Sync_Auth_TenantKeyStoreAcceptsClaimedTenant)
 {
     auto keys = std::make_shared<AccessControl::PublicKeyStore>();
-    keys->keys["io.realm.Auth"].push_back(PKey::load_public(test_util::get_test_resource_path() + "test_pubkey2.pem"));
+    keys->keys["io.barq.Auth"].push_back(PKey::load_public(test_util::get_test_resource_path() + "test_pubkey.pem"));
     AccessControl ctrl(util::none, keys);
 
     AccessToken::ParseError error = AccessToken::ParseError::none;
@@ -78,14 +76,14 @@ TEST(Sync_Auth_TenantKeyStoreAcceptsClaimedTenant)
 
     CHECK(token);
     CHECK(error == AccessToken::ParseError::none);
-    CHECK_EQUAL(token->app_id, "io.realm.Auth");
+    CHECK_EQUAL(token->app_id, "io.barq.Auth");
 }
 
 TEST(Sync_Auth_TenantKeyStoreAcceptsRotatedTenantKey)
 {
     auto keys = std::make_shared<AccessControl::PublicKeyStore>();
-    keys->keys["io.realm.Auth"].push_back(PKey::load_public(test_util::get_test_resource_path() + "test_pubkey.pem"));
-    keys->keys["io.realm.Auth"].push_back(PKey::load_public(test_util::get_test_resource_path() + "test_pubkey2.pem"));
+    keys->keys["io.barq.Auth"].push_back(PKey::load_public(test_util::get_test_resource_path() + "test_pubkey2.pem"));
+    keys->keys["io.barq.Auth"].push_back(PKey::load_public(test_util::get_test_resource_path() + "test_pubkey.pem"));
     AccessControl ctrl(util::none, keys);
 
     AccessToken::ParseError error = AccessToken::ParseError::none;
@@ -93,7 +91,7 @@ TEST(Sync_Auth_TenantKeyStoreAcceptsRotatedTenantKey)
 
     CHECK(token);
     CHECK(error == AccessToken::ParseError::none);
-    CHECK_EQUAL(token->app_id, "io.realm.Auth");
+    CHECK_EQUAL(token->app_id, "io.barq.Auth");
 }
 
 TEST(Sync_Auth_TenantKeyStoreRejectsUnknownTenant)
@@ -112,7 +110,7 @@ TEST(Sync_Auth_TenantKeyStoreRejectsUnknownTenant)
 TEST(Sync_Auth_TenantKeyStoreRejectsWrongTenantKey)
 {
     auto keys = std::make_shared<AccessControl::PublicKeyStore>();
-    keys->keys["io.realm.Auth"].push_back(PKey::load_public(test_util::get_test_resource_path() + "test_pubkey.pem"));
+    keys->keys["io.barq.Auth"].push_back(PKey::load_public(test_util::get_test_resource_path() + "test_pubkey2.pem"));
     AccessControl ctrl(util::none, keys);
 
     AccessToken::ParseError error = AccessToken::ParseError::none;

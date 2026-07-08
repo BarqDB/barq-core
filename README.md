@@ -2,9 +2,7 @@
 
 Barq is a local-first database core with sync support.
 
-This code base is derived from Realm Core. It keeps the storage engine, object store, query system, and sync protocol foundation, then moves the project toward Barq-owned backend pieces instead of MongoDB Atlas/App Services glue.
-
-Barq is not affiliated with, sponsored by, or endorsed by Realm, MongoDB, or MongoDB Atlas.
+This code base keeps the storage engine, object store, query system, and sync protocol foundation, then moves the project toward Barq-owned backend pieces.
 
 ## What Is Here
 

@@ -200,6 +200,9 @@ typedef struct barq_uuid {
     uint8_t bytes[16];
 } barq_uuid_t;
 
+BARQ_API bool barq_decimal128_from_string(const char* value, barq_decimal128_t* out_decimal);
+BARQ_API char* barq_decimal128_to_string(barq_decimal128_t value);
+
 typedef struct barq_value {
     union {
         int64_t integer;
@@ -3167,7 +3170,7 @@ BARQ_API void barq_sync_client_config_set_default_binding_thread_observer(
 
 /**
  * Create a sync user identified by a tenant and a pre-supplied access token (a
- * signed JWT), for use with self-hosted Barq sync (no Atlas App Services login).
+ * signed JWT), for use with self-hosted Barq sync.
  * All three arguments must be non-empty. Set a route with
  * barq_sync_user_set_route() before creating a sync config from this user.
  *
