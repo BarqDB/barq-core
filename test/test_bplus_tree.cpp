@@ -103,6 +103,66 @@ TEST(BPlusTree_Integer)
     tree.destroy();
 }
 
+TEST(BPlusTree_AddRange)
+{
+    // Sizes crossing every structural boundary: empty, single leaf, exactly one
+    // full leaf, one past it, several leaves, and multiple inner levels.
+    for (size_t count : {size_t(0), size_t(1), size_t(999), size_t(1000), size_t(1001), size_t(5000),
+                         size_t(1'000'003)}) {
+        BPlusTree<Int> tree(Allocator::get_default());
+        tree.create();
+        std::vector<Int> values(count);
+        for (size_t i = 0; i < count; ++i)
+            values[i] = Int(i * 7 + 1);
+        tree.add_range(values.data(), values.size());
+        CHECK_EQUAL(tree.size(), count);
+        tree.verify();
+        std::vector<Int> back(count);
+        if (count)
+            tree.get_range(0, count, back.data());
+        CHECK(back == values);
+        // Plain appends keep working after a bulk build.
+        tree.add(42);
+        CHECK_EQUAL(tree.get(count), 42);
+        CHECK_EQUAL(tree.size(), count + 1);
+        tree.verify();
+        tree.destroy();
+    }
+
+    // Bulk append into a non-empty tree takes the per-element fallback.
+    {
+        BPlusTree<Int> tree(Allocator::get_default());
+        tree.create();
+        tree.add(-1);
+        std::vector<Int> values(2500);
+        for (size_t i = 0; i < values.size(); ++i)
+            values[i] = Int(i);
+        tree.add_range(values.data(), values.size());
+        CHECK_EQUAL(tree.size(), 2501);
+        CHECK_EQUAL(tree.get(0), -1);
+        CHECK_EQUAL(tree.get(1), 0);
+        CHECK_EQUAL(tree.get(2500), 2499);
+        tree.verify();
+        tree.destroy();
+    }
+
+    // Floats too (the vector store is a BPlusTree<float>).
+    {
+        BPlusTree<float> tree(Allocator::get_default());
+        tree.create();
+        std::vector<float> values(3000);
+        for (size_t i = 0; i < values.size(); ++i)
+            values[i] = float(i) * 0.5f;
+        tree.add_range(values.data(), values.size());
+        CHECK_EQUAL(tree.size(), 3000);
+        std::vector<float> back(3000);
+        tree.get_range(0, 3000, back.data());
+        CHECK(back == values);
+        tree.verify();
+        tree.destroy();
+    }
+}
+
 TEST(BPlusTree_Timestamp)
 {
     BPlusTree<Timestamp> tree(Allocator::get_default());

@@ -262,6 +262,12 @@ protected:
     virtual BPlusTreeLeaf* cache_leaf(MemRef mem) = 0;
     virtual void replace_root(std::unique_ptr<BPlusTreeNode> new_root);
     std::unique_ptr<BPlusTreeNode> create_root_from_ref(ref_type ref);
+
+    // Adopt `leaf_refs` as the entire content of this (empty) tree: build the
+    // compact inner levels bottom-up and install the root. Every leaf must be
+    // full (BARQ_MAX_BPNODE_SIZE) except possibly the last; `total_size` is the
+    // overall element count. `leaf_refs` is consumed (used as level scratch).
+    void bulk_adopt_leaves(std::vector<ref_type>& leaf_refs, size_t total_size);
 };
 
 template <>
@@ -405,6 +411,49 @@ public:
         m_root->bptree_traverse(func);
 
         return all_values;
+    }
+
+    // Append `count` values pulled chunk-wise from `fill(offset, n, out)`. An
+    // empty tree is assembled bottom-up — whole leaves, then the inner levels in
+    // one pass — costing orders of magnitude fewer tree descents than add() per
+    // element; a non-empty tree falls back to plain appends.
+    template <typename Filler>
+    void add_from(size_t count, Filler&& fill)
+    {
+        if (count == 0)
+            return;
+        std::vector<T> buf(std::min(count, size_t(BARQ_MAX_BPNODE_SIZE)));
+        if (m_size != 0) {
+            for (size_t offset = 0; offset < count;) {
+                size_t n = std::min(count - offset, size_t(BARQ_MAX_BPNODE_SIZE));
+                fill(offset, n, buf.data());
+                for (size_t j = 0; j < n; ++j)
+                    add(buf[j]);
+                offset += n;
+            }
+            return;
+        }
+        std::vector<ref_type> leaves;
+        leaves.reserve((count + BARQ_MAX_BPNODE_SIZE - 1) / BARQ_MAX_BPNODE_SIZE);
+        for (size_t offset = 0; offset < count;) {
+            size_t n = std::min(count - offset, size_t(BARQ_MAX_BPNODE_SIZE));
+            fill(offset, n, buf.data());
+            LeafNode leaf(this);
+            leaf.create();
+            for (size_t j = 0; j < n; ++j)
+                leaf.LeafArray::add(buf[j]);
+            leaves.push_back(leaf.get_ref());
+            offset += n;
+        }
+        bulk_adopt_leaves(leaves, count);
+    }
+
+    // Append values [0, count) — the write-side twin of get_range.
+    void add_range(const T* values, size_t count)
+    {
+        add_from(count, [values](size_t offset, size_t n, T* out) {
+            std::copy(values + offset, values + offset + n, out);
+        });
     }
 
     // Copy values [n, n + count) into out — one tree descent per touched leaf

@@ -678,22 +678,31 @@ public:
     }
 
     // Append the finished graph to the (empty) persisted trees and set the
-    // graph-shape header fields. One sequential pass per array.
-    void write(VectorIndex::Trees& t) const
+    // graph-shape header fields. One bulk pass per array (whole leaves at a
+    // time), releasing each source buffer as soon as it has landed — so peak
+    // transient memory overlaps the persisted copy with only one buffer, not
+    // the whole builder. Consumes the builder except m_keys (the caller still
+    // reads keys to rebuild its key map).
+    void write(VectorIndex::Trees& t)
     {
         size_t n = m_keys.size();
-        for (size_t id = 0; id < n; ++id)
-            t.keys.add(m_keys[id]);
-        for (size_t id = 0; id < n; ++id)
-            t.levels.add(m_levels[id]);
-        for (int32_t v : m_links0)
-            t.links0.add(v);
-        for (size_t id = 0; id < n; ++id)
-            t.upper_ofs.add(m_upper_ofs[id]);
-        for (int32_t v : m_links_upper)
-            t.links_upper.add(v);
-        for (float x : m_vecs)
-            t.vectors.add(x);
+        auto widen = [](std::vector<int32_t>& src) {
+            return [&src](size_t offset, size_t count, int64_t* out) {
+                for (size_t i = 0; i < count; ++i)
+                    out[i] = src[offset + i];
+            };
+        };
+        t.vectors.add_range(m_vecs.data(), m_vecs.size());
+        std::vector<float>().swap(m_vecs); // the largest buffer goes first
+        t.links0.add_from(m_links0.size(), widen(m_links0));
+        std::vector<int32_t>().swap(m_links0);
+        t.links_upper.add_from(m_links_upper.size(), widen(m_links_upper));
+        std::vector<int32_t>().swap(m_links_upper);
+        t.levels.add_from(m_levels.size(), widen(m_levels));
+        std::vector<int32_t>().swap(m_levels);
+        t.upper_ofs.add_range(m_upper_ofs.data(), n);
+        std::vector<int64_t>().swap(m_upper_ofs);
+        t.keys.add_range(m_keys.data(), n);
         t.set_hdr(h_entry, m_entry + 1);
         t.set_hdr(h_maxlevel, (m_entry < 0 ? 0 : m_entry_level + 1));
         t.set_hdr(h_total, int64_t(n));
