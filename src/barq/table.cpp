@@ -2249,6 +2249,43 @@ void Table::add_vector_index(ColKey col_key)
     m_spec.set_column_attr(spec_ndx, attr); // Throws
 }
 
+void Table::remove_vector_index(ColKey col_key)
+{
+    check_column(col_key);
+    auto column_ndx = col_key.get_index();
+
+    // Early-out if non-indexed
+    if (column_ndx.val >= m_vector_index_accessors.size() || !m_vector_index_accessors[column_ndx.val])
+        return;
+
+    // Destroy the persisted graph and drop the accessor
+    auto& index = m_vector_index_accessors[column_ndx.val];
+    index->destroy();
+    index.reset();
+
+    m_index_refs.set(column_ndx.val, 0);
+
+    // update spec
+    auto spec_ndx = leaf_ndx2spec_ndx(column_ndx);
+    auto attr = m_spec.get_column_attr(spec_ndx);
+    attr.reset(col_attr_Vector_Indexed);
+    m_spec.set_column_attr(spec_ndx, attr); // Throws
+}
+
+void Table::rebuild_vector_index(ColKey col_key)
+{
+    check_column(col_key);
+    auto column_ndx = col_key.get_index();
+
+    if (column_ndx.val >= m_vector_index_accessors.size() || !m_vector_index_accessors[column_ndx.val])
+        throw IllegalOperation(
+            util::format("Column has no vector index to rebuild: %1", get_column_name(col_key)));
+
+    auto& index = m_vector_index_accessors[column_ndx.val];
+    index->rebuild(*this);
+    m_index_refs.set(column_ndx.val, index->get_ref());
+}
+
 bool Table::has_vector_index(ColKey col_key) const noexcept
 {
     size_t col_ndx = col_key.get_index().val;

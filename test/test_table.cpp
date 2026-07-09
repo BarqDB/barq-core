@@ -5519,4 +5519,131 @@ TEST(Table_VectorIndexIncremental)
     }
 }
 
+// remove_vector_index drops the index (queries fall back to brute force);
+// rebuild_vector_index re-indexes from current data, picking up in-place edits
+// that incremental (key-based) maintenance cannot see.
+TEST(Table_VectorIndexRemoveRebuild)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 300;
+    const int victim = 77;    // its vector will be edited in place
+    const int newpos = 1500;  // the edited vector's new (unique) position
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec);
+        CHECK(t->has_vector_index(col_vec));
+        wt.commit();
+    }
+
+    // Remove: index gone, search still works (brute-force fallback), remove is idempotent.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        t->remove_vector_index(col_vec);
+        CHECK_NOT(t->has_vector_index(col_vec));
+        t->remove_vector_index(col_vec); // no-op
+        wt.commit();
+    }
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        CHECK_NOT(t->has_vector_index(col_vec));
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(50), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(50, v[0].get<Int>(col_id));
+    }
+
+    // Re-add, then edit `victim`'s vector in place.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        t->add_vector_index(col_vec);
+        CHECK(t->has_vector_index(col_vec));
+        wt.commit();
+    }
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        for (Obj o : *t) {
+            if (o.get<Int>(col_id) == victim) {
+                Lst<float> lst = o.get_list<float>(col_vec);
+                auto nv = knn_test_vec(newpos);
+                for (size_t i = 0; i < nv.size(); ++i)
+                    lst.set(i, nv[i]);
+                break;
+            }
+        }
+        wt.commit();
+    }
+
+    // Stale: key-based maintenance did not see the edit — the graph still holds the
+    // old vector, so a query for the old position still returns the victim.
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(victim), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(victim, v[0].get<Int>(col_id));
+    }
+
+    // Rebuild: the index now reflects the edited vector.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        t->rebuild_vector_index(col_vec);
+        wt.commit();
+    }
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(newpos), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(victim, v[0].get<Int>(col_id));
+
+        TableView v2 = t->where().find_all();
+        v2.knnsearch(col_vec, knn_test_vec(victim), 1);
+        CHECK_EQUAL(1, v2.size());
+        CHECK_NOT_EQUAL(victim, v2[0].get<Int>(col_id));
+    }
+
+    // The rebuilt graph persists across a reopen.
+    {
+        DBRef sg2 = DB::create(path);
+        ReadTransaction rt(sg2);
+        ConstTableRef t = rt.get_table("vectors");
+        auto cid = t->get_column_key("id");
+        auto cvec = t->get_column_key("embedding");
+        CHECK(t->has_vector_index(cvec));
+        TableView v = t->where().find_all();
+        v.knnsearch(cvec, knn_test_vec(newpos), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(victim, v[0].get<Int>(cid));
+    }
+
+    // Rebuild without an index is an error.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        t->remove_vector_index(col_vec);
+        CHECK_THROW(t->rebuild_vector_index(col_vec), IllegalOperation);
+        wt.commit();
+    }
+}
+
 #endif // TEST_TABLE

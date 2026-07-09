@@ -252,6 +252,10 @@ public:
     /// Vector (HNSW) search index over a list-of-floats column. Persisted in the
     /// database file and purely local (never written to sync changesets).
     void add_vector_index(ColKey col_key);
+    void remove_vector_index(ColKey col_key);
+    /// Re-index from the current data. Use after editing vector values in place —
+    /// incremental maintenance tracks objects by key, not content.
+    void rebuild_vector_index(ColKey col_key);
     bool has_vector_index(ColKey col_key) const noexcept;
     VectorIndex* get_vector_index(ColKey col_key) const noexcept;
 
