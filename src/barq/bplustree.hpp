@@ -456,6 +456,36 @@ public:
         });
     }
 
+    // Copy values [n, n + count) into out as signed 8-bit values — a straight
+    // byte copy per leaf while the leaf stores width-8 data (the caller
+    // guarantees every value fits int8; narrower leaves fall back to
+    // per-element reads). Integer trees only.
+    void get_range_i8(size_t n, size_t count, int8_t* out) const
+    {
+        static_assert(std::is_same_v<T, int64_t>, "byte reads are for integer trees");
+        BARQ_ASSERT_DEBUG(n + count <= size());
+        while (count > 0) {
+            size_t copied = 0;
+            auto func = [&](BPlusTreeNode* node, size_t ndx) {
+                LeafNode* leaf = static_cast<LeafNode*>(node);
+                size_t avail = leaf->size() - ndx;
+                copied = std::min(count, avail);
+                if (leaf->get_width() == 8) {
+                    const int8_t* src = reinterpret_cast<const int8_t*>(leaf->m_data) + ndx;
+                    std::copy(src, src + copied, out);
+                }
+                else {
+                    for (size_t i = 0; i < copied; i++)
+                        out[i] = int8_t(leaf->get(ndx + i));
+                }
+            };
+            m_root->bptree_access(n, func);
+            n += copied;
+            out += copied;
+            count -= copied;
+        }
+    }
+
     // Copy values [n, n + count) into out — one tree descent per touched leaf
     // instead of one per element.
     void get_range(size_t n, size_t count, T* out) const

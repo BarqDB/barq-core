@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <mutex>
 #include <queue>
 #include <random>
@@ -62,6 +63,11 @@ namespace {
 //   [7] pending      BPlusTree<int64>  ObjKeys edited in place, absorbed lazily
 //   [8] added        BPlusTree<int64>  ObjKeys created since the last absorb (format >= 4)
 //   [9] removed      BPlusTree<int64>  ObjKeys erased since the last absorb (format >= 4)
+//   [10] qparams     BPlusTree<float>  SQ8 dequantization params: [ofs_0.., scl_0..]
+//
+// With the SQ8 encoding, slot 6 holds a BPlusTree<int64> of centered codes
+// (one value in [-128, 127] per dimension — 8-bit array leaves on disk) and
+// element i decodes to qparams[i] + qparams[dim + i] * code.
 
 constexpr size_t t_header = 0;
 constexpr size_t t_keys = 1;
@@ -73,7 +79,8 @@ constexpr size_t t_vectors = 6;
 constexpr size_t t_pending = 7;
 constexpr size_t t_added = 8;
 constexpr size_t t_removed = 9;
-constexpr size_t t_count = 10;
+constexpr size_t t_qparams = 10;
+constexpr size_t t_count = 11;
 constexpr size_t t_count_legacy = 8; // format-3 layout: no event lists
 
 constexpr size_t h_format = 0;
@@ -87,8 +94,9 @@ constexpr size_t h_maxlevel = 7; // level + 1, 0 = none
 constexpr size_t h_total = 8;    // ids allocated, including tombstones
 constexpr size_t h_deleted = 9;
 constexpr size_t h_salt = 10;
-constexpr size_t h_flags = 11; // format >= 4
-constexpr size_t h_count = 12;
+constexpr size_t h_flags = 11;    // format >= 4
+constexpr size_t h_encoding = 12; // VectorEncoding; headers written before it read as Float32
+constexpr size_t h_count = 13;
 
 constexpr int64_t s_format_legacy = 3;  // native graph, synced by table diff
 constexpr int64_t s_format = 4;         // + event lists: synced in O(changes)
@@ -120,6 +128,83 @@ void normalize_vec(float* v, size_t dim)
         for (size_t i = 0; i < dim; ++i)
             v[i] *= inv;
     }
+}
+
+// ---- SQ8 scalar quantization ----------------------------------------------------
+//
+// Per-dimension linear codes, centered so they store as 8-bit array leaves:
+// code_i in [-128, 127], value_i = ofs_i + scl_i * code_i. The params are learned
+// from the data at build time (min/max per dimension, ofs folded to the center)
+// and fixed until the next full rebuild; vectors arriving in between clamp.
+
+void sq8_encode(const float* v, size_t dim, const float* ofs, const float* scl, int8_t* out)
+{
+    for (size_t i = 0; i < dim; ++i) {
+        float s = scl[i];
+        float x = v[i];
+        int64_t c = 0;
+        if (s > 0 && std::isfinite(x)) {
+            float centered = (x - ofs[i]) / s;
+            c = std::llround(centered);
+            if (c < -128)
+                c = -128;
+            else if (c > 127)
+                c = 127;
+        }
+        out[i] = int8_t(c);
+    }
+}
+
+// Turn per-dim [mn, mx] into decode params (in place: mn becomes ofs, mx becomes
+// scl). A constant dimension gets scale 0 — every code decodes to its value.
+void sq8_finalize_params(std::vector<float>& mn, std::vector<float>& mx)
+{
+    for (size_t i = 0; i < mn.size(); ++i) {
+        if (std::isfinite(mn[i]) && std::isfinite(mx[i]) && mx[i] > mn[i]) {
+            float scale = (mx[i] - mn[i]) / 255.0f;
+            mn[i] = mn[i] + 128.0f * scale; // fold the centering into the offset
+            mx[i] = scale;
+        }
+        else {
+            mn[i] = std::isfinite(mn[i]) ? mn[i] : 0.0f;
+            mx[i] = 0.0f;
+        }
+    }
+}
+
+// Decode kernel (out_i = ofs_i + scl_i * code_i) — SIMD where available; the
+// scalar tail mirrors the distance kernels' style. Codes arrive as int8 both
+// from B+-tree leaf reads (get_range_i8) and the bulk builder's flat buffer.
+
+void sq8_decode8(const int8_t* c, const float* ofs, const float* scl, size_t dim, float* out)
+{
+#if BARQ_VECTOR_SIMD_NEON
+    size_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        int16x8_t w = vmovl_s8(vld1_s8(c + i));
+        float32x4_t lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w)));
+        float32x4_t hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w)));
+        vst1q_f32(out + i, vfmaq_f32(vld1q_f32(ofs + i), vld1q_f32(scl + i), lo));
+        vst1q_f32(out + i + 4, vfmaq_f32(vld1q_f32(ofs + i + 4), vld1q_f32(scl + i + 4), hi));
+    }
+    for (; i < dim; ++i)
+        out[i] = ofs[i] + scl[i] * float(c[i]);
+#elif BARQ_VECTOR_SIMD_SSE
+    size_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        __m128i w = _mm_cvtsi32_si128(*reinterpret_cast<const int32_t*>(c + i)); // 4 codes
+        __m128i w16 = _mm_srai_epi16(_mm_unpacklo_epi8(w, w), 8);                // sign-extend to 16
+        __m128i w32 = _mm_srai_epi32(_mm_unpacklo_epi16(w16, w16), 16);          // ... and to 32
+        __m128 cf = _mm_cvtepi32_ps(w32);
+        __m128 r = _mm_add_ps(_mm_loadu_ps(ofs + i), _mm_mul_ps(_mm_loadu_ps(scl + i), cf));
+        _mm_storeu_ps(out + i, r);
+    }
+    for (; i < dim; ++i)
+        out[i] = ofs[i] + scl[i] * float(c[i]);
+#else
+    for (size_t i = 0; i < dim; ++i)
+        out[i] = ofs[i] + scl[i] * float(c[i]);
+#endif
 }
 
 // SIMD distance kernels (float accumulation, as hnswlib). Four independent
@@ -318,9 +403,11 @@ struct VectorIndex::Trees {
         , upper_ofs(alloc)
         , links_upper(alloc)
         , vectors(alloc)
+        , codes(alloc)
         , pending(alloc)
         , added(alloc)
         , removed(alloc)
+        , qparams(alloc)
     {
     }
 
@@ -330,10 +417,12 @@ struct VectorIndex::Trees {
     BPlusTree<int64_t> links0;
     BPlusTree<int64_t> upper_ofs;
     BPlusTree<int64_t> links_upper;
-    BPlusTree<float> vectors;
+    BPlusTree<float> vectors;   // slot t_vectors when encoding == Float32
+    BPlusTree<int64_t> codes;   // slot t_vectors when encoding == SQ8
     BPlusTree<int64_t> pending;
     BPlusTree<int64_t> added;   // attached on format >= 4 only
     BPlusTree<int64_t> removed; // attached on format >= 4 only
+    BPlusTree<float> qparams;   // attached when the slot exists (SQ8-capable layouts)
 
     int64_t hdr(size_t field) const
     {
@@ -361,6 +450,10 @@ struct VectorIndex::Cache {
     // writes (one touch per lst.add) from rescanning it.
     std::unordered_set<int64_t> pending_seen;
 
+    // SQ8 dequantization params ([ofs..., scl...], 2*dim floats), loaded lazily
+    // from the persisted qparams tree.
+    std::vector<float> qparams;
+
     // Scratch for graph traversal (searches serialize on the mutex below, so one
     // instance per accessor suffices). Survives across queries: clearing is an
     // epoch bump, not a wipe.
@@ -377,6 +470,7 @@ struct VectorIndex::Cache {
         stale.clear();
         synced_version = uint64_t(-1);
         pending_seen.clear();
+        qparams.clear();
     }
 };
 
@@ -392,6 +486,11 @@ struct GraphOps {
     const VectorIndexConfig& cfg;
     VectorMetric metric;
     size_t dim;
+    // SQ8 state: decode params (from Cache::qparams) and a staging buffer for
+    // raw codes. GraphOps lives on the stack of one search/insert, so the
+    // buffer is private to that operation.
+    const float* sq8_params = nullptr; // [ofs..., scl...] or null for Float32
+    mutable std::vector<int8_t> code_buf;
 
     size_t stride0() const
     {
@@ -417,7 +516,13 @@ struct GraphOps {
 
     void read_vec(int64_t id, float* out) const
     {
-        t.vectors.get_range(size_t(id) * dim, dim, out);
+        if (!sq8_params) {
+            t.vectors.get_range(size_t(id) * dim, dim, out);
+            return;
+        }
+        code_buf.resize(dim);
+        t.codes.get_range_i8(size_t(id) * dim, dim, code_buf.data());
+        sq8_decode8(code_buf.data(), sq8_params, sq8_params + dim, dim, out);
     }
 
     float dist_to(const float* q, int64_t id, std::vector<float>& scratch) const
@@ -569,6 +674,20 @@ struct GraphOps {
     }
 };
 
+// Point a GraphOps at the decode params for an SQ8 graph (loaded through the
+// cache on first use). No-op for Float32.
+void arm_graph_ops(GraphOps& ops, const VectorIndexConfig& cfg, VectorIndex::Trees& t, VectorIndex::Cache& cache)
+{
+    if (cfg.encoding != VectorEncoding::SQ8)
+        return;
+    if (cache.qparams.size() != 2 * ops.dim) {
+        BARQ_ASSERT(t.qparams.is_attached() && t.qparams.size() == 2 * ops.dim);
+        cache.qparams.resize(2 * ops.dim);
+        t.qparams.get_range(0, 2 * ops.dim, cache.qparams.data());
+    }
+    ops.sq8_params = cache.qparams.data();
+}
+
 // ---- bulk (in-RAM) graph builder -------------------------------------------------
 //
 // Rebuilds and first-time builds run here: the graph is assembled in flat memory
@@ -581,11 +700,18 @@ struct GraphOps {
 // ever held at once (hnswlib's locking scheme).
 class BulkBuilder {
 public:
-    BulkBuilder(const VectorIndexConfig& cfg, size_t dim, uint64_t salt)
+    // For SQ8 the decode params ([ofs..., scl...], 2*dim floats) must be known
+    // up front — vectors are quantized as they are added; callers compute the
+    // params in a first pass over the data.
+    BulkBuilder(const VectorIndexConfig& cfg, size_t dim, uint64_t salt,
+                VectorEncoding encoding = VectorEncoding::Float32, const float* sq8_params = nullptr)
         : m_cfg(cfg)
         , m_dim(dim)
         , m_salt(salt)
+        , m_enc(encoding)
     {
+        if (m_enc == VectorEncoding::SQ8)
+            m_qparams.assign(sq8_params, sq8_params + 2 * dim);
     }
 
     size_t size() const
@@ -596,15 +722,20 @@ public:
     {
         return m_keys[id];
     }
+    // Raw float storage — Float32 collections only (the incremental delta path).
     const float* vec(size_t id) const
     {
+        BARQ_ASSERT_DEBUG(m_enc == VectorEncoding::Float32);
         return m_vecs.data() + id * m_dim;
     }
 
     void reserve(size_t n)
     {
         m_keys.reserve(n);
-        m_vecs.reserve(n * m_dim);
+        if (m_enc == VectorEncoding::SQ8)
+            m_codes.reserve(n * m_dim);
+        else
+            m_vecs.reserve(n * m_dim);
         m_levels.reserve(n);
         m_upper_ofs.reserve(n);
     }
@@ -614,7 +745,14 @@ public:
     {
         int64_t id = int64_t(m_keys.size());
         m_keys.push_back(key);
-        m_vecs.insert(m_vecs.end(), v, v + m_dim);
+        if (m_enc == VectorEncoding::SQ8) {
+            size_t at = m_codes.size();
+            m_codes.resize(at + m_dim);
+            sq8_encode(v, m_dim, m_qparams.data(), m_qparams.data() + m_dim, m_codes.data() + at);
+        }
+        else {
+            m_vecs.insert(m_vecs.end(), v, v + m_dim);
+        }
         int level = hnsw_level_for(id, m_salt, m_cfg.m);
         m_levels.push_back(level);
         if (level > 0) {
@@ -692,8 +830,17 @@ public:
                     out[i] = src[offset + i];
             };
         };
-        t.vectors.add_range(m_vecs.data(), m_vecs.size());
-        std::vector<float>().swap(m_vecs); // the largest buffer goes first
+        if (m_enc == VectorEncoding::SQ8) {
+            t.codes.add_from(m_codes.size(), [this](size_t offset, size_t count, int64_t* out) {
+                for (size_t i = 0; i < count; ++i)
+                    out[i] = m_codes[offset + i];
+            });
+            std::vector<int8_t>().swap(m_codes);
+        }
+        else {
+            t.vectors.add_range(m_vecs.data(), m_vecs.size());
+            std::vector<float>().swap(m_vecs); // the largest buffer goes first
+        }
         t.links0.add_from(m_links0.size(), widen(m_links0));
         std::vector<int32_t>().swap(m_links0);
         t.links_upper.add_from(m_links_upper.size(), widen(m_links_upper));
@@ -716,6 +863,8 @@ private:
         VisitedTags visited;
         std::vector<int64_t> nbrs;
         std::vector<int64_t> selected;
+        // SQ8 decode staging: query side, distance side, candidate side.
+        std::vector<float> qvec, dvec, cvec;
     };
 
     size_t stride0() const
@@ -730,6 +879,19 @@ private:
     float dist(const float* a, const float* b) const
     {
         return metric_dist(m_cfg.metric, a, b, m_dim);
+    }
+
+    // The stored element `id` as floats: a direct pointer for Float32, a decode
+    // into `buf` for SQ8. Distances during an SQ8 build run on the quantized
+    // values — the same values queries will see.
+    const float* elem(int64_t id, std::vector<float>& buf) const
+    {
+        if (m_enc == VectorEncoding::Float32)
+            return m_vecs.data() + size_t(id) * m_dim;
+        buf.resize(m_dim);
+        sq8_decode8(m_codes.data() + size_t(id) * m_dim, m_qparams.data(), m_qparams.data() + m_dim, m_dim,
+                    buf.data());
+        return buf.data();
     }
 
     std::mutex& stripe(int64_t id)
@@ -761,13 +923,13 @@ private:
 
     int64_t greedy(const float* q, int64_t curr, int layer, Scratch& scr)
     {
-        float best = dist(q, vec(size_t(curr)));
+        float best = dist(q, elem(curr, scr.dvec));
         bool changed = true;
         while (changed) {
             changed = false;
             copy_links(curr, layer, scr.nbrs);
             for (int64_t n : scr.nbrs) {
-                float d = dist(q, vec(size_t(n)));
+                float d = dist(q, elem(n, scr.dvec));
                 if (d < best) {
                     best = d;
                     curr = n;
@@ -784,7 +946,7 @@ private:
         std::priority_queue<Hit, std::vector<Hit>, std::greater<>> cands;
         scr.visited.begin(m_keys.size());
 
-        float d0 = dist(q, vec(size_t(entry_point)));
+        float d0 = dist(q, elem(entry_point, scr.dvec));
         cands.emplace(d0, entry_point);
         scr.visited.test_and_set(entry_point);
         results.emplace(d0, entry_point);
@@ -799,7 +961,7 @@ private:
             for (int64_t n : scr.nbrs) {
                 if (scr.visited.test_and_set(n))
                     continue;
-                float d = dist(q, vec(size_t(n)));
+                float d = dist(q, elem(n, scr.dvec));
                 if (results.size() < ef || d < results.top().first) {
                     cands.emplace(d, n);
                     results.emplace(d, n);
@@ -818,7 +980,8 @@ private:
     }
 
     // Same spread-out heuristic as GraphOps::select_neighbors, on flat memory.
-    void select_neighbors(const std::vector<Hit>& cands_sorted, size_t m, std::vector<int64_t>& result) const
+    void select_neighbors(const std::vector<Hit>& cands_sorted, size_t m, std::vector<int64_t>& result,
+                          Scratch& scr) const
     {
         result.clear();
         if (cands_sorted.size() <= m) {
@@ -829,10 +992,10 @@ private:
         for (auto& c : cands_sorted) {
             if (result.size() >= m)
                 break;
-            const float* cv = vec(size_t(c.second));
+            const float* cv = elem(c.second, scr.cvec);
             bool good = true;
             for (int64_t r : result) {
-                if (dist(cv, vec(size_t(r))) < c.first) {
+                if (dist(cv, elem(r, scr.dvec)) < c.first) {
                     good = false;
                     break;
                 }
@@ -918,7 +1081,7 @@ private:
     // is itself reachable.
     bool anchor(int64_t x, std::vector<int32_t>& indeg, Scratch& scr, bool allow_evict)
     {
-        auto anchors = search_layer(vec(size_t(x)), m_entry, m_cfg.ef_construction, 0, scr);
+        auto anchors = search_layer(elem(x, scr.qvec), m_entry, m_cfg.ef_construction, 0, scr);
         size_t max_m0 = 2 * m_cfg.m;
         for (auto& a : anchors) { // nearest first
             if (a.second == x)
@@ -939,11 +1102,11 @@ private:
             if (a.second == x)
                 continue;
             int32_t* p = links(a.second, 0);
-            const float* av = vec(size_t(a.second));
+            const float* av = elem(a.second, scr.cvec);
             int best = -1, fallback = -1;
             float best_d = -1, fallback_d = -1;
             for (int32_t i = 0; i < p[0]; ++i) {
-                float dd = dist(av, vec(size_t(p[1 + i])));
+                float dd = dist(av, elem(p[1 + i], scr.dvec));
                 if (dd > fallback_d) {
                     fallback_d = dd;
                     fallback = i;
@@ -976,7 +1139,7 @@ private:
     // are final and never overwritten, so no concurrent append can be lost.
     void insert_one(int64_t id, Scratch& scr)
     {
-        const float* q = vec(size_t(id));
+        const float* q = elem(id, scr.qvec);
         int level = m_levels[size_t(id)];
 
         std::unique_lock<std::mutex> entry_lock(m_entry_mutex);
@@ -1000,7 +1163,7 @@ private:
         std::vector<std::vector<int64_t>> selected_per_layer(size_t(top) + 1);
         for (int lc = top; lc >= 0; --lc) {
             auto cands = search_layer(q, curr, m_cfg.ef_construction, lc, scr);
-            select_neighbors(cands, m_cfg.m, scr.selected);
+            select_neighbors(cands, m_cfg.m, scr.selected, scr);
             {
                 std::lock_guard<std::mutex> lock(stripe(id));
                 store_links(links(id, lc), scr.selected);
@@ -1013,6 +1176,7 @@ private:
         // Pass 2: publish — connect the selected neighbours back to the node.
         std::vector<int64_t> keep;
         std::vector<Hit> merged;
+        std::vector<float> nvec;
         for (int lc = top; lc >= 0; --lc) {
             size_t max_m = (lc == 0) ? 2 * m_cfg.m : m_cfg.m;
             for (int64_t n : selected_per_layer[size_t(lc)]) {
@@ -1025,13 +1189,13 @@ private:
                 else {
                     // Overflow: re-select the neighbour's links with the heuristic,
                     // considering the new element too (as hnswlib does).
-                    const float* nv = vec(size_t(n));
+                    const float* nv = elem(n, nvec);
                     merged.clear();
                     merged.emplace_back(dist(nv, q), id);
                     for (int32_t i = 0; i < p[0]; ++i)
-                        merged.emplace_back(dist(nv, vec(size_t(p[1 + i]))), int64_t(p[1 + i]));
+                        merged.emplace_back(dist(nv, elem(p[1 + i], scr.dvec)), int64_t(p[1 + i]));
                     std::sort(merged.begin(), merged.end());
-                    select_neighbors(merged, max_m, keep);
+                    select_neighbors(merged, max_m, keep, scr);
                     store_links(p, keep);
                 }
             }
@@ -1048,9 +1212,12 @@ private:
     VectorIndexConfig m_cfg;
     size_t m_dim;
     uint64_t m_salt;
+    VectorEncoding m_enc;
+    std::vector<float> m_qparams; // SQ8: [ofs..., scl...], 2*dim
 
     std::vector<int64_t> m_keys;
-    std::vector<float> m_vecs;
+    std::vector<float> m_vecs;   // Float32 storage
+    std::vector<int8_t> m_codes; // SQ8 storage (centered codes)
     std::vector<int32_t> m_levels;
     std::vector<int64_t> m_upper_ofs;
     size_t m_upper_blocks = 0;
@@ -1087,12 +1254,14 @@ void VectorIndex::create_persisted_state(Allocator& alloc)
     header.set(h_m, int64_t(m_config.m));
     header.set(h_efc, int64_t(m_config.ef_construction));
     header.set(h_efs, int64_t(m_config.ef_search));
+    header.set(h_encoding, int64_t(m_config.encoding));
     std::random_device rd;
     header.set(h_salt, int64_t((uint64_t(rd()) << 32) ^ rd()));
     m_top.add(from_ref(header.get_ref()));
 
     for (size_t slot = t_keys; slot < t_count; ++slot) {
-        if (slot == t_vectors) {
+        bool float_slot = slot == t_qparams || (slot == t_vectors && m_config.encoding == VectorEncoding::Float32);
+        if (float_slot) {
             BPlusTree<float> tree(alloc);
             tree.create();
             m_top.add(from_ref(tree.get_ref()));
@@ -1123,8 +1292,26 @@ void VectorIndex::attach_trees()
     m_trees->upper_ofs.init_from_parent();
     m_trees->links_upper.set_parent(&m_top, t_links_upper);
     m_trees->links_upper.init_from_parent();
-    m_trees->vectors.set_parent(&m_top, t_vectors);
-    m_trees->vectors.init_from_parent();
+
+    // Slot t_vectors holds float data or SQ8 codes depending on the persisted
+    // encoding (fixed at creation) — attach the accessor that matches.
+    auto detach_if = [](auto& tree) {
+        if (tree.is_attached())
+            tree.detach();
+    };
+    bool sq8 = m_trees->header.size() > h_encoding &&
+               VectorEncoding(uint8_t(m_trees->header.get(h_encoding))) == VectorEncoding::SQ8;
+    if (sq8) {
+        detach_if(m_trees->vectors);
+        m_trees->codes.set_parent(&m_top, t_vectors);
+        m_trees->codes.init_from_parent();
+    }
+    else {
+        detach_if(m_trees->codes);
+        m_trees->vectors.set_parent(&m_top, t_vectors);
+        m_trees->vectors.init_from_parent();
+    }
+
     m_trees->pending.set_parent(&m_top, t_pending);
     m_trees->pending.init_from_parent();
 
@@ -1138,10 +1325,18 @@ void VectorIndex::attach_trees()
         m_trees->removed.init_from_parent();
     }
     else {
-        if (m_trees->added.is_attached())
-            m_trees->added.detach();
-        if (m_trees->removed.is_attached())
-            m_trees->removed.detach();
+        detach_if(m_trees->added);
+        detach_if(m_trees->removed);
+    }
+
+    // The qparams slot exists on SQ8-capable layouts (indexes created since the
+    // encoding landed); older format-4 files without it are Float32 by definition.
+    if (m_top.size() > t_qparams) {
+        m_trees->qparams.set_parent(&m_top, t_qparams);
+        m_trees->qparams.init_from_parent();
+    }
+    else {
+        detach_if(m_trees->qparams);
     }
 }
 
@@ -1223,7 +1418,8 @@ ref_type VectorIndex::get_ref() const noexcept
 
 uint64_t VectorIndex::header_field(size_t index) const
 {
-    if (!m_trees || !m_trees->header.is_attached())
+    // Fields appended by newer formats read as 0 on files that predate them.
+    if (!m_trees || !m_trees->header.is_attached() || index >= m_trees->header.size())
         return 0;
     return uint64_t(m_trees->header.get(index));
 }
@@ -1234,6 +1430,7 @@ void VectorIndex::load_config_from_header()
     if (format != s_format && format != s_format_legacy)
         return;
     m_config.metric = VectorMetric(uint8_t(header_field(h_metric)));
+    m_config.encoding = VectorEncoding(uint8_t(header_field(h_encoding)));
     m_config.m = size_t(header_field(h_m));
     m_config.ef_construction = size_t(header_field(h_efc));
     m_config.ef_search = size_t(header_field(h_efs));
@@ -1343,9 +1540,16 @@ void VectorIndex::make_tracked()
         BARQ_ASSERT(m_top.size() == t_count_legacy);
         Allocator& alloc = m_top.get_alloc();
         for (size_t slot = t_added; slot < t_count; ++slot) {
-            BPlusTree<int64_t> tree(alloc);
-            tree.create();
-            m_top.add(from_ref(tree.get_ref()));
+            if (slot == t_qparams) { // float-typed (unused until an SQ8 rebuild)
+                BPlusTree<float> tree(alloc);
+                tree.create();
+                m_top.add(from_ref(tree.get_ref()));
+            }
+            else {
+                BPlusTree<int64_t> tree(alloc);
+                tree.create();
+                m_top.add(from_ref(tree.get_ref()));
+            }
         }
         t.set_hdr(h_format, s_format);
         attach_trees();
@@ -1381,14 +1585,25 @@ void VectorIndex::insert_element(int64_t key, const float* vec, size_t d)
 {
     Trees& t = *m_trees;
     GraphOps ops{t, m_config, m_config.metric, d};
+    arm_graph_ops(ops, m_config, t, *m_cache);
 
     int64_t id = t.hdr(h_total);
     int level = ops.level_for(id);
 
     t.keys.add(key);
     t.levels.add(level);
-    for (size_t i = 0; i < d; ++i)
-        t.vectors.add(vec[i]);
+    if (m_config.encoding == VectorEncoding::SQ8) {
+        // Quantize with the persisted params (values outside the learned range
+        // clamp; the next full rebuild re-learns).
+        std::vector<int8_t> codes(d);
+        sq8_encode(vec, d, ops.sq8_params, ops.sq8_params + d, codes.data());
+        for (size_t i = 0; i < d; ++i)
+            t.codes.add(codes[i]);
+    }
+    else {
+        for (size_t i = 0; i < d; ++i)
+            t.vectors.add(vec[i]);
+    }
     for (size_t i = 0; i < ops.stride0(); ++i)
         t.links0.add(0);
     if (level > 0) {
@@ -1480,7 +1695,10 @@ void clear_graph_arrays(VectorIndex::Trees& t)
     t.links0.clear();
     t.upper_ofs.clear();
     t.links_upper.clear();
-    t.vectors.clear();
+    if (t.vectors.is_attached())
+        t.vectors.clear();
+    if (t.codes.is_attached())
+        t.codes.clear();
     t.pending.clear();
     if (t.added.is_attached()) {
         t.added.clear();
@@ -1649,9 +1867,16 @@ void VectorIndex::event_absorb(const Table& table)
     }
 
     if (delta.size() > 0 && t.hdr(h_total) - t.hdr(h_deleted) == 0) {
-        // Nothing live in the graph: build it fresh in RAM from the delta —
-        // orders of magnitude faster than one-at-a-time inserts. Clears the
-        // event lists along with the old graph arrays.
+        // Nothing live in the graph: build it fresh in RAM. SQ8 must learn its
+        // quantization params from the full data first — do_rebuild owns that
+        // (the delta covers the same rows, so nothing extra gets scanned that
+        // wouldn't be anyway). Float32 builds straight from the delta.
+        if (m_config.encoding == VectorEncoding::SQ8) {
+            do_rebuild(table);
+            done();
+            return;
+        }
+        // Clears the event lists along with the old graph arrays.
         bulk_rebuild(t, *m_cache, m_config.build_threads, delta);
         done();
         return;
@@ -1744,8 +1969,12 @@ void VectorIndex::scan_absorb(const Table& table)
     int64_t live = t.hdr(h_total) - t.hdr(h_deleted);
     if (delta.size() > 0 && live == 0) {
         // Nothing live in the graph: build it fresh in RAM from the collected
-        // delta — orders of magnitude faster than one-at-a-time inserts.
-        bulk_rebuild(t, *m_cache, m_config.build_threads, delta);
+        // delta — orders of magnitude faster than one-at-a-time inserts. SQ8
+        // learns its quantization params in do_rebuild instead.
+        if (m_config.encoding == VectorEncoding::SQ8)
+            do_rebuild(table);
+        else
+            bulk_rebuild(t, *m_cache, m_config.build_threads, delta);
         return;
     }
     if (int64_t(delta.size()) > live) {
@@ -1810,9 +2039,40 @@ void VectorIndex::do_rebuild(const Table& table)
         return;
     t.set_hdr(h_dim, int64_t(d));
 
-    BulkBuilder builder(m_config, d, uint64_t(t.hdr(h_salt)));
-    builder.reserve(table.size());
+    const bool sq8 = m_config.encoding == VectorEncoding::SQ8;
     std::vector<float> buf(d);
+    if (sq8) {
+        // Learn the quantization range from the data (one extra pass — cheap
+        // next to graph construction) and persist the decode params.
+        std::vector<float> mn(d, std::numeric_limits<float>::infinity());
+        std::vector<float> mx(d, -std::numeric_limits<float>::infinity());
+        for (auto obj : table) {
+            auto lst = obj.get_list<float>(m_column);
+            if (lst.size() != d)
+                continue;
+            lst.get_tree().get_range(0, d, buf.data());
+            if (m_config.metric == VectorMetric::Cosine)
+                normalize_vec(buf.data(), d);
+            for (size_t i = 0; i < d; ++i) {
+                float x = buf[i];
+                if (!std::isfinite(x))
+                    continue;
+                if (x < mn[i])
+                    mn[i] = x;
+                if (x > mx[i])
+                    mx[i] = x;
+            }
+        }
+        sq8_finalize_params(mn, mx); // mn becomes ofs, mx becomes scl
+        mn.insert(mn.end(), mx.begin(), mx.end());
+        t.qparams.clear();
+        t.qparams.add_range(mn.data(), mn.size());
+        m_cache->qparams = std::move(mn);
+    }
+
+    BulkBuilder builder(m_config, d, uint64_t(t.hdr(h_salt)), m_config.encoding,
+                        sq8 ? m_cache->qparams.data() : nullptr);
+    builder.reserve(table.size());
     for (auto obj : table) {
         auto lst = obj.get_list<float>(m_column);
         if (lst.size() != d)
@@ -1952,6 +2212,7 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
     int64_t entry = t.hdr(h_entry) - 1;
     if (d != 0 && entry >= 0) {
         GraphOps ops{t, m_config, m_config.metric, d};
+        arm_graph_ops(ops, m_config, t, *m_cache);
         std::vector<float> scratch(d);
 
         int64_t curr = entry;
@@ -1983,6 +2244,34 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
         size_t fetch = candidates ? ef : std::max(ef, k + 16);
         for (auto& h : ops.search_layer(q, curr, fetch, 0, admit, scratch, m_cache->visited))
             hits.emplace_back(h.first, t.keys.get(size_t(h.second)));
+
+        if (m_config.encoding == VectorEncoding::SQ8 && !hits.empty()) {
+            // The beam ranked by quantized distances; re-rank its best hits
+            // against the exact vectors in the table (the source of truth — the
+            // index stores only codes). This is what keeps SQ8 recall close to
+            // full precision, and it makes the ordering consistent with the
+            // overlay's exact distances below.
+            std::sort(hits.begin(), hits.end());
+            size_t rerank = std::min(hits.size(), std::max(3 * k, k + 32));
+            hits.resize(rerank);
+            std::vector<float> exact(d);
+            for (auto& h : hits) {
+                ObjKey key(h.second);
+                if (!table.is_valid(key)) { // deleted but not absorbed yet
+                    h.first = std::numeric_limits<float>::infinity();
+                    continue;
+                }
+                auto lst = table.get_object(key).get_list<float>(m_column);
+                if (lst.size() != d) {
+                    h.first = std::numeric_limits<float>::infinity();
+                    continue;
+                }
+                lst.get_tree().get_range(0, d, exact.data());
+                if (m_config.metric == VectorMetric::Cosine)
+                    normalize_vec(exact.data(), d);
+                h.first = metric_dist(m_config.metric, q, exact.data(), d);
+            }
+        }
     }
 
     // Brute-force the overlay (small: keys not yet absorbed) with live table data.

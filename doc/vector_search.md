@@ -12,6 +12,7 @@ table->add_vector_index(col);
 // Or pick the metric and graph shape:
 VectorIndexConfig cfg;
 cfg.metric = VectorMetric::Cosine;   // InnerProduct | L2 | Cosine
+cfg.encoding = VectorEncoding::SQ8;  // Float32 (default) | SQ8 — see below
 cfg.m = 32;                          // graph out-degree
 cfg.ef_construction = 400;           // build-time beam width
 cfg.ef_search = 128;                 // query-time beam width floor. 0 (default) = auto:
@@ -55,7 +56,25 @@ graph in place; a write that adds more vectors than the graph holds switches to
 the bulk path automatically.
 
 The transient build memory is roughly `N * (4*dim + 8*m + 30)` bytes — about
-0.5 GB per million 96-dim vectors at m=16.
+0.5 GB per million 96-dim vectors at m=16 — and each buffer is released as it
+is persisted, so the peak never holds the whole builder plus its file copy.
+
+## SQ8: quarter-size vectors
+
+`cfg.encoding = VectorEncoding::SQ8` stores the index's copy of each vector as
+one byte per dimension instead of four: a per-dimension linear code, with the
+scale learned from the data at build time. The graph is walked on quantized
+distances and the best candidates are re-ranked against the exact vectors in
+the table (which the index no longer duplicates), so recall stays at full
+precision — measured on Deep1B at 100k, recall@10 matches Float32 at every
+beam width while the index's vector store shrinks 4x (whole index: 52 MB ->
+24 MB per 100k), builds run ~20% faster on ~30% less transient RAM, and
+queries cost ~20% extra (the decode plus the re-rank).
+
+The encoding is fixed when the index is created; params re-learn on every full
+rebuild, and vectors added in between clamp to the learned range (drift far
+outside it degrades those vectors' ranking until the next rebuild — re-index
+after bulk-loading a differently-distributed corpus).
 
 ## How it is stored
 

@@ -38,11 +38,21 @@ enum class VectorMetric : uint8_t {
     Cosine = 2,       // inner product on vectors normalized at insert/query time
 };
 
+/// How the index stores its copy of the vectors.
+enum class VectorEncoding : uint8_t {
+    Float32 = 0, // full precision, 4 bytes per dimension
+    SQ8 = 1,     // scalar-quantized to 1 byte per dimension (per-dimension linear scale,
+                 // learned at build time). ~4x smaller and less build RAM; searches walk
+                 // the graph on quantized distances and re-rank the top candidates
+                 // exactly against the table data, so recall stays near full precision.
+};
+
 /// Build/search parameters for a vector index. Persisted with the index (except
 /// build_threads), so a reopened index keeps the metric and graph shape it was
 /// built with.
 struct VectorIndexConfig {
     VectorMetric metric = VectorMetric::InnerProduct;
+    VectorEncoding encoding = VectorEncoding::Float32; // vector storage; fixed at creation
     size_t m = 16;                // HNSW out-degree (graph connectivity)
     size_t ef_construction = 200; // build-time beam width (higher = better graph, slower build)
     size_t ef_search = 0;         // query-time beam width floor (higher = better recall, slower query).

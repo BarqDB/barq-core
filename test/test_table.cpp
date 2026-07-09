@@ -6382,6 +6382,145 @@ TEST(Table_VectorIndexAutoBeam)
     CHECK_EQUAL(31, v[0].get<Int>(col_id));
 }
 
+// SQ8 encoding: the index stores 1-byte quantized codes and re-ranks the best
+// beam hits against the exact table data. The test vectors use two distinct
+// values per dimension, which the quantizer represents exactly — so winners
+// must match full precision across build, reopen, incremental maintenance and
+// in-place edits (the event-tracking machinery runs underneath as usual).
+TEST(Table_VectorIndexSQ8)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 300;
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    auto expect_hit = [&](ConstTableRef t, int probe, int want) {
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(probe), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(want, v[0].get<Int>(col_id));
+    };
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        VectorIndexConfig cfg = exact_cfg(2 * N);
+        cfg.encoding = VectorEncoding::SQ8;
+        t->add_vector_index(col_vec, cfg);
+        CHECK(t->get_vector_index(col_vec)->config().encoding == VectorEncoding::SQ8);
+        for (int probe : {0, 42, 123, N - 1})
+            expect_hit(t, probe, probe);
+        wt.commit();
+    }
+
+    // Reopen from disk: codes and decode params reload with the graph.
+    {
+        DBRef sg2 = DB::create(path);
+        ReadTransaction rt(sg2);
+        ConstTableRef t = rt.get_table("vectors");
+        CHECK(t->get_vector_index(col_vec)->config().encoding == VectorEncoding::SQ8);
+        for (int probe : {7, 250})
+            expect_hit(t, probe, probe);
+    }
+
+    // Incremental maintenance on a quantized graph: insert, erase, edit; search
+    // in the same write txn (event absorb encodes with the persisted params).
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        Obj o = t->create_object();
+        o.set(col_id, 1000);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(1000))
+            lst.add(x);
+        for (Obj obj : *t) {
+            if (obj.get<Int>(col_id) == 13) {
+                t->remove_object(obj.get_key());
+                break;
+            }
+        }
+        for (Obj obj : *t) {
+            if (obj.get<Int>(col_id) == 20) {
+                Lst<float> l = obj.get_list<float>(col_vec);
+                auto nv = knn_test_vec(2000);
+                for (size_t j = 0; j < nv.size(); ++j)
+                    l.set(j, nv[j]);
+                obj.set(col_id, 2000);
+                break;
+            }
+        }
+        expect_hit(t, 1000, 1000);
+        expect_hit(t, 2000, 2000);
+        TableView gone = t->where().find_all();
+        gone.knnsearch(col_vec, knn_test_vec(13), 3);
+        for (size_t i = 0; i < gone.size(); ++i)
+            CHECK_NOT_EQUAL(13, gone[i].get<Int>(col_id));
+        wt.commit();
+    }
+
+    // Un-absorbed changes answer through the overlay from a read transaction.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        Obj o = t->create_object();
+        o.set(col_id, 3000);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(3000))
+            lst.add(x);
+        wt.commit(); // no search: stays queued
+    }
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        expect_hit(t, 3000, 3000);
+    }
+}
+
+// SQ8 with the cosine metric: quantization params are learned over the
+// normalized vectors and queries normalize before ranking.
+TEST(Table_VectorIndexSQ8Cosine)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 120;
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(3.0f * x); // arbitrary magnitude; cosine ignores it
+        }
+        VectorIndexConfig cfg = exact_cfg(2 * N);
+        cfg.metric = VectorMetric::Cosine;
+        cfg.encoding = VectorEncoding::SQ8;
+        t->add_vector_index(col_vec, cfg);
+        wt.commit();
+    }
+    ReadTransaction rt(sg);
+    ConstTableRef t = rt.get_table("vectors");
+    for (int probe : {3, 77, 119}) {
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(probe), 1); // unscaled query, same direction
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(probe, v[0].get<Int>(col_id));
+    }
+}
+
 // Event-driven maintenance: inserts, erases and in-place edits are recorded as
 // they happen and folded in without ever scanning the table. Searches in write
 // transactions (absorb) and read transactions (overlay) must both stay exact

@@ -177,7 +177,7 @@ int main(int argc, char** argv)
 {
     if (argc < 3) {
         std::fprintf(stderr,
-                     "usage: %s <deep1b.db> <n_vectors> [n_queries=500] [k=10] [barq_path=./bench_vec.barq]\n",
+                     "usage: %s <deep1b.db> <n_vectors> [n_queries=500] [k=10] [barq_path=./bench_vec.barq] [sq8]\n",
                      argv[0]);
         return 1;
     }
@@ -187,6 +187,7 @@ int main(int argc, char** argv)
     const size_t Q = argc > 3 ? size_t(std::atoll(argv[3])) : 500;
     const size_t K = argc > 4 ? size_t(std::atoll(argv[4])) : 10;
     const std::string barq_path = argc > 5 ? argv[5] : "./bench_vec.barq";
+    const bool use_sq8 = argc > 6 && std::string(argv[6]) == "sq8";
 
     std::printf("== barq vector-search benchmark ==\n");
     std::printf("dataset: %s | N=%zu Q=%zu k=%zu dim=%zu metric=L2\n\n", sqlite_path, N, Q, K, DIM);
@@ -218,8 +219,9 @@ int main(int argc, char** argv)
         ConstTableRef t = rt.get_table("vectors");
         col_id = t->get_column_key("id");
         col_vec = t->get_column_key("embedding");
-        std::printf("[probe]   existing file, %zu objects, index=%d\n", t->size(),
-                    int(t->has_vector_index(col_vec)));
+        int enc = t->has_vector_index(col_vec) ? int(t->get_vector_index(col_vec)->config().encoding) : -1;
+        std::printf("[probe]   existing file, %zu objects, index=%d, encoding=%d\n", t->size(),
+                    int(t->has_vector_index(col_vec)), enc);
     }
     t0 = Clock::now();
     if (!probe) {
@@ -268,6 +270,8 @@ int main(int argc, char** argv)
         cfg.m = 16;
         cfg.ef_construction = 200;
         cfg.ef_search = 64;
+        if (use_sq8)
+            cfg.encoding = VectorEncoding::SQ8;
         t->add_vector_index(col_vec, cfg);
         wt.commit();
     }
