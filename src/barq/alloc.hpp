@@ -124,6 +124,12 @@ public:
     {
         m_is_read_only = ro;
     }
+    /// Whether this allocator is currently read-only, i.e. attached to a read
+    /// transaction. Distinct from the per-ref is_read_only(ref_type) overload.
+    bool is_read_only() const noexcept
+    {
+        return m_is_read_only;
+    }
     /// Returns a simple allocator that can be used with free-standing
     /// Barq objects (such as a free-standing table). A
     /// free-standing object is one that is not part of a Group, and

@@ -5754,4 +5754,157 @@ TEST(Table_VectorIndexConfig)
     }
 }
 
+// Stage 3 MVCC: the graph lives in copy-on-write arrays, so a reader pinned to an
+// older snapshot keeps searching the graph exactly as it was, while a writer absorbs
+// new data into its own version.
+TEST(Table_VectorIndexMVCC)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 200;
+    const int doomed = 42;   // deleted by the writer
+    const int newid = 5000;  // inserted by the writer
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec);
+        wt.commit();
+    }
+
+    // Pin a reader to the current snapshot.
+    ReadTransaction rt_old(sg);
+
+    // Writer: delete `doomed`, insert `newid`, and search inside the write
+    // transaction — this absorbs the changes into the writer's graph version.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        for (Obj o : *t) {
+            if (o.get<Int>(col_id) == doomed) {
+                t->remove_object(o.get_key());
+                break;
+            }
+        }
+        Obj o = t->create_object();
+        o.set(col_id, newid);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(newid))
+            lst.add(x);
+
+        // Fresh inside the writer, before commit:
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(newid), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(newid, v[0].get<Int>(col_id));
+        wt.commit();
+    }
+
+    // The pinned reader still sees its snapshot: `doomed` present, `newid` absent.
+    {
+        ConstTableRef t = rt_old.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(doomed), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(doomed, v[0].get<Int>(col_id));
+
+        TableView v2 = t->where().find_all();
+        v2.knnsearch(col_vec, knn_test_vec(newid), 1);
+        CHECK_EQUAL(1, v2.size());
+        CHECK_NOT_EQUAL(newid, v2[0].get<Int>(col_id));
+    }
+
+    // A fresh reader sees the new world: `newid` present, `doomed` gone.
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(newid), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(newid, v[0].get<Int>(col_id));
+
+        TableView v2 = t->where().find_all();
+        v2.knnsearch(col_vec, knn_test_vec(doomed), 5);
+        for (size_t i = 0; i < v2.size(); ++i)
+            CHECK_NOT_EQUAL(doomed, v2[i].get<Int>(col_id));
+    }
+}
+
+// Stage 3 compaction: once tombstones dominate, the next write-transaction search
+// rebuilds the graph from live data; results stay exact throughout.
+TEST(Table_VectorIndexCompaction)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 200;
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec);
+        wt.commit();
+    }
+
+    // Delete 3/4 of the objects (ids not divisible by 4), then search inside the
+    // write transaction: absorb tombstones them and triggers the compaction rebuild.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        std::vector<ObjKey> gone;
+        for (Obj o : *t) {
+            if (o.get<Int>(col_id) % 4 != 0)
+                gone.push_back(o.get_key());
+        }
+        for (ObjKey k : gone)
+            t->remove_object(k);
+
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(100), 3); // id 100 survives (100 % 4 == 0)
+        CHECK_EQUAL(3, v.size());
+        CHECK_EQUAL(100, v[0].get<Int>(col_id));
+        for (size_t i = 0; i < v.size(); ++i)
+            CHECK_EQUAL(0, v[i].get<Int>(col_id) % 4);
+
+        // Compacted: only live elements remain in the graph.
+        VectorIndex* vindex = t->get_vector_index(col_vec);
+        CHECK(vindex);
+        CHECK_EQUAL(size_t(N / 4), vindex->count());
+        wt.commit();
+    }
+
+    // Still exact after commit and reopen.
+    {
+        DBRef sg2 = DB::create(path);
+        ReadTransaction rt(sg2);
+        ConstTableRef t = rt.get_table("vectors");
+        auto cid = t->get_column_key("id");
+        auto cvec = t->get_column_key("embedding");
+        CHECK_EQUAL(size_t(N / 4), t->get_vector_index(cvec)->count());
+        TableView v = t->where().find_all();
+        v.knnsearch(cvec, knn_test_vec(64), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(64, v[0].get<Int>(cid));
+    }
+}
+
 #endif // TEST_TABLE
