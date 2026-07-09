@@ -2,7 +2,7 @@ if(NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_HOST_SYSTEM_PROCESSO
     message(FATAL_ERROR "This toolchain can only be used on x86_64 Linux.")
 endif()
 
-file(DOWNLOAD https://static.barq.io/toolchains/v3/${_TRIPLET}.tar.zst ${CMAKE_BINARY_DIR}/${_TRIPLET}.tar.zst
+file(DOWNLOAD https://static.barqdb.space/toolchains/v3/${_TRIPLET}.tar.zst ${CMAKE_BINARY_DIR}/${_TRIPLET}.tar.zst
      EXPECTED_HASH MD5=${_TOOLCHAIN_MD5} STATUS _DOWNLOAD_STATUS)
 list(GET _DOWNLOAD_STATUS 0 _DOWNLOAD_STATUS_CODE)
 if(NOT ${_DOWNLOAD_STATUS_CODE} EQUAL 0)
