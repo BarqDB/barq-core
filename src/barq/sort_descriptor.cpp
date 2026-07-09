@@ -805,11 +805,19 @@ void SemanticSearchDescriptor::execute(const Table& table, KeyValues& key_values
     // If a persisted vector index exists on this column, use it — it survives reopen
     // without a rebuild and is maintained through the table.
     if (VectorIndex* vindex = table.get_vector_index(m_column)) {
-        std::unordered_set<uint64_t> cand;
-        cand.reserve(candidates);
-        for (size_t i = 0; i < candidates; ++i)
-            cand.insert(uint64_t(key_values.get(i).value));
-        std::vector<ObjKey> ordered = vindex->search(table, m_query_data, m_k, cand);
+        std::vector<ObjKey> ordered;
+        if (candidates == table.size()) {
+            // The view covers the whole table: skip building a candidate set (it
+            // costs O(table) per query); the index validates results instead.
+            ordered = vindex->search(table, m_query_data, m_k, nullptr, m_ef);
+        }
+        else {
+            std::unordered_set<uint64_t> cand;
+            cand.reserve(candidates);
+            for (size_t i = 0; i < candidates; ++i)
+                cand.insert(uint64_t(key_values.get(i).value));
+            ordered = vindex->search(table, m_query_data, m_k, &cand, m_ef);
+        }
         key_values.clear();
         for (ObjKey key : ordered)
             key_values.add(key);

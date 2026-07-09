@@ -372,7 +372,7 @@ public:
     void filter(FilterDescriptor filter);
 
     // Vector search. Semantic nearest-neighbour search over a list-of-floats property (vector embeddings)
-    void knnsearch(ColKey column, const std::vector<float>& query_data, size_t k);
+    void knnsearch(ColKey column, const std::vector<float>& query_data, size_t k, size_t ef = 0);
     void knnsearch(SemanticSearchDescriptor knn);
 
     // Replace the order of sort and distinct operations, bypassing manually

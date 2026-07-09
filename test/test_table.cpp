@@ -5390,6 +5390,15 @@ static std::vector<float> knn_test_vec(int i)
     return v;
 }
 
+// These tests assert exact winners, so they build the index with a search beam wide
+// enough to explore everything. Real workloads use the (approximate) default.
+static VectorIndexConfig exact_cfg(int n)
+{
+    VectorIndexConfig cfg;
+    cfg.ef_search = size_t(2 * n + 16);
+    return cfg;
+}
+
 // Stage 1 persistence: a vector index built in one session must survive a reopen and
 // answer queries by loading the persisted graph — no rebuild from the raw vectors.
 TEST(Table_VectorIndexPersistence)
@@ -5412,7 +5421,7 @@ TEST(Table_VectorIndexPersistence)
             for (float x : knn_test_vec(i))
                 lst.add(x);
         }
-        t->add_vector_index(col_vec);
+        t->add_vector_index(col_vec, exact_cfg(N));
         CHECK(t->has_vector_index(col_vec));
         wt.commit();
     }
@@ -5463,7 +5472,7 @@ TEST(Table_VectorIndexIncremental)
             for (float x : knn_test_vec(i))
                 lst.add(x);
         }
-        t->add_vector_index(col_vec);
+        t->add_vector_index(col_vec, exact_cfg(N));
         wt.commit();
     }
 
@@ -5545,7 +5554,7 @@ TEST(Table_VectorIndexRemoveRebuild)
             for (float x : knn_test_vec(i))
                 lst.add(x);
         }
-        t->add_vector_index(col_vec);
+        t->add_vector_index(col_vec, exact_cfg(N));
         CHECK(t->has_vector_index(col_vec));
         wt.commit();
     }
@@ -5573,7 +5582,7 @@ TEST(Table_VectorIndexRemoveRebuild)
     {
         WriteTransaction wt(sg);
         TableRef t = wt.get_table("vectors");
-        t->add_vector_index(col_vec);
+        t->add_vector_index(col_vec, exact_cfg(N));
         CHECK(t->has_vector_index(col_vec));
         wt.commit();
     }
@@ -5681,7 +5690,7 @@ TEST(Table_VectorIndexConfig)
             for (float x : data[i])
                 lst.add(x);
         }
-        t->add_vector_index(col_vec); // defaults: inner product
+        t->add_vector_index(col_vec, VectorIndexConfig{}); // defaults: inner product
         wt.commit();
     }
 
@@ -5779,7 +5788,7 @@ TEST(Table_VectorIndexInPlaceEdit)
             for (float x : knn_test_vec(i))
                 lst.add(x);
         }
-        t->add_vector_index(col_vec);
+        t->add_vector_index(col_vec, exact_cfg(N));
         wt.commit();
     }
 
@@ -5895,7 +5904,7 @@ TEST(Table_VectorIndexLocalOnly)
             for (float x : knn_test_vec(i))
                 lst.add(x);
         }
-        t->add_vector_index(col_vec);
+        t->add_vector_index(col_vec, exact_cfg(N));
         wt.commit();
     }
     rt->advance_read();
@@ -5977,7 +5986,7 @@ TEST(Table_VectorIndexParallelSearch)
             for (float x : knn_test_vec(i))
                 lst.add(x);
         }
-        t->add_vector_index(col_vec);
+        t->add_vector_index(col_vec, exact_cfg(N));
         wt.commit();
     }
 
@@ -6030,7 +6039,7 @@ TEST(Table_VectorIndexMVCC)
             for (float x : knn_test_vec(i))
                 lst.add(x);
         }
-        t->add_vector_index(col_vec);
+        t->add_vector_index(col_vec, exact_cfg(N));
         wt.commit();
     }
 
@@ -6113,7 +6122,7 @@ TEST(Table_VectorIndexCompaction)
             for (float x : knn_test_vec(i))
                 lst.add(x);
         }
-        t->add_vector_index(col_vec);
+        t->add_vector_index(col_vec, exact_cfg(N));
         wt.commit();
     }
 

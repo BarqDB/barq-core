@@ -589,7 +589,7 @@ bool TableView::is_in_table_order() const
     }
 }
 
-void TableView::knnsearch(ColKey column, const std::vector<float>& query_data, size_t k)
+void TableView::knnsearch(ColKey column, const std::vector<float>& query_data, size_t k, size_t ef)
 {
-    knnsearch(SemanticSearchDescriptor(column, query_data, k));
+    knnsearch(SemanticSearchDescriptor(column, query_data, k, ef));
 }

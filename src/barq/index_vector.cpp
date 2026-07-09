@@ -830,10 +830,10 @@ void VectorIndex::ensure_synced(const Table& table)
 }
 
 std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<float>& query, size_t k,
-                                        const std::unordered_set<uint64_t>& candidates)
+                                        const std::unordered_set<uint64_t>* candidates, size_t ef_override)
 {
     std::vector<ObjKey> out;
-    if (query.empty() || candidates.empty() || k == 0)
+    if (query.empty() || k == 0 || (candidates && candidates->empty()))
         return out;
 
     std::lock_guard<std::mutex> lock(m_cache->mutex);
@@ -863,10 +863,12 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
         for (int lc = ops.max_level(); lc > 0; --lc)
             curr = ops.greedy(q, curr, lc, scratch);
 
-        // Preserved from the blob engine: scale the beam to the candidate set so
-        // filtered searches stay exact in practice.
-        size_t total = size_t(ops.total());
-        size_t ef = std::max({k, m_config.ef_search, std::min(candidates.size(), total)});
+        // Standard HNSW semantics: the beam is ef_search (bounded below by k),
+        // overridable per query. Results are approximate; raise the beam for
+        // better recall. Heavily filtered searches self-correct: while fewer than
+        // ef admissible nodes have been found the beam keeps expanding, so tiny
+        // candidate sets are explored near-exhaustively.
+        size_t ef = std::max(k, ef_override ? ef_override : m_config.ef_search);
 
         auto admit = [&](int64_t id) {
             int64_t key = t.keys.get(size_t(id));
@@ -874,9 +876,12 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
                 return false; // tombstone
             if (m_cache->stale.count(key))
                 return false; // outdated copy; the overlay answers for this key
-            return candidates.count(uint64_t(key)) != 0;
+            return !candidates || candidates->count(uint64_t(key)) != 0;
         };
-        for (auto& h : ops.search_layer(q, curr, ef, 0, admit, scratch))
+        // Unfiltered: over-fetch a little so hits dropped by the validity check
+        // below (objects deleted but not absorbed yet) still leave k results.
+        size_t fetch = candidates ? ef : std::max(ef, k + 16);
+        for (auto& h : ops.search_layer(q, curr, fetch, 0, admit, scratch))
             hits.emplace_back(h.first, t.keys.get(size_t(h.second)));
     }
 
@@ -884,7 +889,7 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
     if (!m_cache->overlay.empty()) {
         std::vector<float> buf(query.size());
         for (int64_t key : m_cache->overlay) {
-            if (!candidates.count(uint64_t(key)))
+            if (candidates && !candidates->count(uint64_t(key)))
                 continue;
             Obj obj = table.get_object(ObjKey(key));
             auto lst = obj.get_list<float>(m_column);
@@ -899,9 +904,15 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
     }
 
     std::sort(hits.begin(), hits.end());
-    size_t kk = std::min(k, hits.size());
-    out.reserve(kk);
-    for (size_t i = 0; i < kk; ++i)
-        out.push_back(ObjKey(hits[i].second));
+    out.reserve(std::min(k, hits.size()));
+    for (auto& h : hits) {
+        if (out.size() >= k)
+            break;
+        // Without a candidate filter, the graph may still hold objects deleted
+        // from the table but not absorbed yet — validate before returning.
+        if (!candidates && !table.is_valid(ObjKey(h.second)))
+            continue;
+        out.push_back(ObjKey(h.second));
+    }
     return out;
 }

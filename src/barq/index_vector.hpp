@@ -97,11 +97,19 @@ public:
     // pending list; searches re-rank it from live data until the graph absorbs it.
     void mark_dirty(ObjKey key);
 
-    // Query the index. Returns up to `k` object keys closest to `query`, restricted
-    // to `candidates`, closest first. In a write transaction this first absorbs any
-    // unindexed data changes into the graph.
+    // Query the index. Returns up to `k` object keys closest to `query`, closest
+    // first, restricted to `candidates` when given (pass nullptr for an unfiltered
+    // search — cheaper: no candidate set to build; results are validated against
+    // the table instead). In a write transaction this first absorbs any unindexed
+    // data changes into the graph. `ef` overrides the configured search beam for
+    // this query (0 = use config).
     std::vector<ObjKey> search(const Table& table, const std::vector<float>& query, size_t k,
-                               const std::unordered_set<uint64_t>& candidates);
+                               const std::unordered_set<uint64_t>* candidates, size_t ef = 0);
+    std::vector<ObjKey> search(const Table& table, const std::vector<float>& query, size_t k,
+                               const std::unordered_set<uint64_t>& candidates, size_t ef = 0)
+    {
+        return search(table, query, k, &candidates, ef);
+    }
 
     // Metadata read from the persisted header.
     size_t dim() const;

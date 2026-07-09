@@ -312,9 +312,12 @@ private:
 // This is a linear (brute-force) scan; distance defaults to Inner Product but is pluggable.
 class SemanticSearchDescriptor : public BaseDescriptor {
 public:
-    SemanticSearchDescriptor(ColKey column, const std::vector<float>& query_data, size_t k)
+    // `ef` overrides the index's persisted ef_search beam for this query only
+    // (0 = use the index config). Larger = better recall, slower.
+    SemanticSearchDescriptor(ColKey column, const std::vector<float>& query_data, size_t k, size_t ef = 0)
         : m_query_data(query_data)
         , m_k(k)
+        , m_ef(ef)
         , m_column(column)
     {
         if (!(column.get_type() == col_type_Float && column.is_list())) {
@@ -350,10 +353,15 @@ public:
     {
         return m_query_data;
     }
+    size_t get_ef() const
+    {
+        return m_ef;
+    }
 
 private:
     std::vector<float> m_query_data;
     size_t m_k;
+    size_t m_ef = 0;
     ColKey m_column;
 };
 
