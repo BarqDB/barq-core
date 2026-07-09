@@ -13,6 +13,10 @@ on:
       version:
         description: 'Core version tag to build, e.g. v20.1.5'
         required: true
+      macos_only:
+        description: 'Build macOS only (fast pipeline validation)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -41,15 +45,27 @@ jobs:
           echo "VERSION=$version" >> "$GITHUB_OUTPUT"
 
       - name: Select Xcode
-        run: sudo xcode-select -switch /Applications/Xcode.app
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
 
-      - name: Build all Apple slices + assemble xcframework
+      - name: Pin CMake 3.x (the Xcode toolchain build is incompatible with CMake 4)
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.31.6'
+
+      - name: Build Apple slices + assemble xcframework
         env:
           VERSION: ${{ steps.v.outputs.VERSION }}
-        # -b builds from source; drop it and pre-stage cpack tarballs to reuse a build.
-        # OpenSSL/zlib for the CMake build come from Barq hosting via
-        # tools/cmake/AcquireBarqDependency.cmake; Apple sync uses SecureTransport.
-        run: sh tools/build-cocoa.sh -b -v "$VERSION"
+          MACOS_ONLY: ${{ github.event.inputs.macos_only }}
+        # -b builds from source; -m limits to macOS. OpenSSL/zlib for the CMake
+        # build come from Barq hosting via tools/cmake/AcquireBarqDependency.cmake;
+        # Apple sync uses SecureTransport.
+        run: |
+          cmake --version
+          flags="-b -v $VERSION"
+          [ "$MACOS_ONLY" = "true" ] && flags="$flags -m"
+          sh tools/build-cocoa.sh $flags
 
       - name: Verify artifact
         env:
