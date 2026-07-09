@@ -407,6 +407,27 @@ public:
         return all_values;
     }
 
+    // Copy values [n, n + count) into out — one tree descent per touched leaf
+    // instead of one per element.
+    void get_range(size_t n, size_t count, T* out) const
+    {
+        BARQ_ASSERT_DEBUG(n + count <= size());
+        while (count > 0) {
+            size_t copied = 0;
+            auto func = [&](BPlusTreeNode* node, size_t ndx) {
+                LeafNode* leaf = static_cast<LeafNode*>(node);
+                size_t avail = leaf->size() - ndx;
+                copied = std::min(count, avail);
+                for (size_t i = 0; i < copied; i++)
+                    out[i] = leaf->get(ndx + i);
+            };
+            m_root->bptree_access(n, func);
+            n += copied;
+            out += copied;
+            count -= copied;
+        }
+    }
+
     void set(size_t n, T value)
     {
         auto func = [value](BPlusTreeNode* node, size_t ndx) {

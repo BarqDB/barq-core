@@ -254,6 +254,10 @@ int main(int argc, char** argv)
         std::printf("[load]    %zu objects in %.1fs (%.0f obj/s), file %.1f MB\n", ds.n, load_time,
                     double(ds.n) / load_time, double(file_after_load) / 1e6);
 
+    // The raw copy is no longer referenced (ground truth is done, the data lives
+    // in barq now). Freeing it makes room for the build's in-RAM graph at 10M.
+    std::vector<float>().swap(ds.base);
+
     // 4. Build the index
     t0 = Clock::now();
     if (!probe) {
@@ -294,11 +298,12 @@ int main(int argc, char** argv)
             fail("index missing after build");
 
         std::printf("%-12s %9s %9s %9s %9s %10s\n", "beam", "recall@k", "p50 ms", "p95 ms", "avg ms", "QPS");
-        auto run_sweep = [&](size_t ef, const char* label) {
+        auto run_sweep = [&](size_t ef, const char* label, size_t n_queries = size_t(-1)) {
+            size_t nq = std::min(ds.q, n_queries);
             std::vector<double> ms;
-            ms.reserve(ds.q);
+            ms.reserve(nq);
             double hits = 0, denom = 0;
-            for (size_t qi = 0; qi < ds.q; ++qi) {
+            for (size_t qi = 0; qi < nq; ++qi) {
                 std::vector<float> qv(ds.queries.data() + qi * DIM, ds.queries.data() + (qi + 1) * DIM);
                 auto q0 = Clock::now();
                 std::vector<ObjKey> res = vindex->search(*t, qv, K, all_keys, ef);
@@ -318,7 +323,9 @@ int main(int argc, char** argv)
         run_sweep(64, "ef=64");
         run_sweep(128, "ef=128");
         run_sweep(256, "ef=256");
-        run_sweep(ds.n, "exhaustive");
+        // The exhaustive beam costs ~n distance evaluations per query; cap the
+        // query count at large n so this sanity row stays a few minutes.
+        run_sweep(ds.n, "exhaustive", ds.n > 2'000'000 ? 20 : ds.q);
 
         // 6. e2e through the public API (find_all + knnsearch per query, default beam)
         {

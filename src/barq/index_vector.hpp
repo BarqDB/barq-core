@@ -38,13 +38,17 @@ enum class VectorMetric : uint8_t {
     Cosine = 2,       // inner product on vectors normalized at insert/query time
 };
 
-/// Build/search parameters for a vector index. Persisted with the index, so a
-/// reopened index keeps the metric and graph shape it was built with.
+/// Build/search parameters for a vector index. Persisted with the index (except
+/// build_threads), so a reopened index keeps the metric and graph shape it was
+/// built with.
 struct VectorIndexConfig {
     VectorMetric metric = VectorMetric::InnerProduct;
     size_t m = 16;                // HNSW out-degree (graph connectivity)
     size_t ef_construction = 200; // build-time beam width (higher = better graph, slower build)
-    size_t ef_search = 64;        // query-time beam width floor (higher = better recall, slower query)
+    size_t ef_search = 0;         // query-time beam width floor (higher = better recall, slower query).
+                                  // 0 = auto: widens with index size (64 up to 100k vectors, 128 up to
+                                  // 1M, 192 up to 10M, 256 beyond) so recall holds steady as data grows.
+    size_t build_threads = 0;     // worker threads for full (re)builds; 0 = one per core. Not persisted.
 };
 
 /// A persisted approximate-nearest-neighbour (HNSW) index over a list-of-floats
@@ -125,10 +129,13 @@ private:
     void load_config_from_header();
     uint64_t header_field(size_t index) const;
 
-    // Maintenance (write transactions only):
+    // Maintenance (write transactions only). Full builds (do_rebuild, and absorb
+    // when the graph is empty or the unindexed delta dominates it) assemble the
+    // graph in flat RAM on all cores and persist it in one sequential pass;
+    // small deltas go through one-at-a-time inserts into the persisted arrays.
     void absorb(const Table& table);   // fold outstanding data changes into the graph
     void do_rebuild(const Table& table);
-    void insert_element(int64_t key, const std::vector<float>& vec);
+    void insert_element(int64_t key, const float* vec, size_t dim);
     void tombstone(int64_t id);
 
     void ensure_synced(const Table& table); // absorb (writable) or compute the overlay (read-only)

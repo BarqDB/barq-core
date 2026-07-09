@@ -5702,7 +5702,7 @@ TEST(Table_VectorIndexConfig)
         return v.size() == 1 ? v[0].get<Int>(t->get_column_key("id")) : -1;
     };
 
-    // Default metric: inner product.
+    // Default metric: inner product. Default beam: 0 = auto (scales with size).
     {
         ReadTransaction rt(sg);
         ConstTableRef t = rt.get_table("vectors");
@@ -5710,7 +5710,7 @@ TEST(Table_VectorIndexConfig)
         CHECK(c.metric == VectorMetric::InnerProduct);
         CHECK_EQUAL(16, c.m);
         CHECK_EQUAL(200, c.ef_construction);
-        CHECK_EQUAL(64, c.ef_search);
+        CHECK_EQUAL(0, c.ef_search);
     }
     CHECK_EQUAL(0, top1(sg));
 
@@ -6166,6 +6166,220 @@ TEST(Table_VectorIndexCompaction)
         CHECK_EQUAL(1, v.size());
         CHECK_EQUAL(64, v[0].get<Int>(cid));
     }
+}
+
+// An index created on an empty table absorbs later data through the bulk (in-RAM,
+// parallel) build path: the first write-transaction search finds the graph empty
+// with a large unindexed delta and builds it in one shot.
+TEST(Table_VectorIndexBulkAbsorb)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 300;
+    const int target = 123;
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        t->add_vector_index(col_vec, exact_cfg(N)); // nothing to index yet
+        CHECK(t->has_vector_index(col_vec));
+        wt.commit();
+    }
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        // Search inside the write transaction: absorb sees an empty graph and a
+        // delta of N vectors and takes the bulk path.
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(target), 3);
+        CHECK_EQUAL(3, v.size());
+        CHECK_EQUAL(target, v[0].get<Int>(col_id));
+        CHECK_EQUAL(size_t(N), t->get_vector_index(col_vec)->count());
+        wt.commit();
+    }
+    // The bulk-built graph persists and answers from disk.
+    {
+        DBRef sg2 = DB::create(path);
+        ReadTransaction rt(sg2);
+        ConstTableRef t = rt.get_table("vectors");
+        auto cid = t->get_column_key("id");
+        auto cvec = t->get_column_key("embedding");
+        CHECK_EQUAL(size_t(N), t->get_vector_index(cvec)->count());
+        TableView v = t->where().find_all();
+        v.knnsearch(cvec, knn_test_vec(target), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(target, v[0].get<Int>(cid));
+    }
+}
+
+// When one write adds more vectors than the graph holds, absorb rebuilds the whole
+// index through the bulk path instead of growing it one insert at a time. Both
+// generations of data must be searchable afterwards.
+TEST(Table_VectorIndexDeltaDominatesRebuild)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int n_old = 40;
+    const int n_new = 400; // delta > live: triggers the in-RAM rebuild
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < n_old; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec, exact_cfg(n_old + n_new));
+        wt.commit();
+    }
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        for (int i = n_old; i < n_old + n_new; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(200), 1); // a key from the new generation
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(200, v[0].get<Int>(col_id));
+        CHECK_EQUAL(size_t(n_old + n_new), t->get_vector_index(col_vec)->count());
+        wt.commit();
+    }
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(7), 1); // a key from the old generation
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(7, v[0].get<Int>(col_id));
+    }
+}
+
+// Two in-place edits of the same object within one write transaction, separated
+// by a search: the search absorbs the first edit (consuming the pending list),
+// and the second edit must be recorded again — not swallowed by the absorbed
+// entry's leftover dedupe state.
+TEST(Table_VectorIndexEditAbsorbEditAgain)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 80;
+    const int victim = 7;
+    const int probe_a = 900;  // first rewrite target
+    const int probe_b = 1800; // second rewrite target
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec, exact_cfg(N));
+        wt.commit();
+    }
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        Obj o = *std::find_if(t->begin(), t->end(), [&](const Obj& x) {
+            return x.get<Int>(col_id) == victim;
+        });
+
+        auto rewrite = [&](int probe) {
+            Lst<float> lst = o.get_list<float>(col_vec);
+            std::vector<float> v = knn_test_vec(probe);
+            for (size_t i = 0; i < v.size(); ++i)
+                lst.set(i, v[i]);
+        };
+
+        rewrite(probe_a);
+        // Search inside the write transaction: absorbs the first edit.
+        TableView va = t->where().find_all();
+        va.knnsearch(col_vec, knn_test_vec(probe_a), 1);
+        CHECK_EQUAL(1, va.size());
+        CHECK_EQUAL(victim, va[0].get<Int>(col_id));
+
+        rewrite(probe_b);
+        wt.commit();
+    }
+    // The second edit made it into the index: the object ranks first for its
+    // new vector, and no longer matches the first rewrite.
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView vb = t->where().find_all();
+        vb.knnsearch(col_vec, knn_test_vec(probe_b), 1);
+        CHECK_EQUAL(1, vb.size());
+        CHECK_EQUAL(victim, vb[0].get<Int>(col_id));
+    }
+}
+
+// The default config (ef_search = 0) picks the beam from the index size. For small
+// tables the auto beam (64) covers the whole graph, so results are exact; a
+// per-query ef still overrides it.
+TEST(Table_VectorIndexAutoBeam)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 48; // below the auto floor of 64: the auto beam is exhaustive
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec); // all defaults: auto beam
+        wt.commit();
+    }
+    ReadTransaction rt(sg);
+    ConstTableRef t = rt.get_table("vectors");
+    CHECK_EQUAL(0, t->get_vector_index(col_vec)->config().ef_search);
+
+    for (int probe : {0, 17, 47}) {
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(probe), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(probe, v[0].get<Int>(col_id));
+    }
+    // Per-query override still applies on top of an auto config.
+    TableView v = t->where().find_all();
+    v.knnsearch(col_vec, knn_test_vec(31), 1, /*ef=*/256);
+    CHECK_EQUAL(1, v.size());
+    CHECK_EQUAL(31, v[0].get<Int>(col_id));
 }
 
 #endif // TEST_TABLE
