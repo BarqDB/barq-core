@@ -752,6 +752,8 @@ private:
     // Vector indexes reuse the per-column search-index ref slot (m_index_refs); a column
     // is either general/fulltext (StringIndex) or vector (VectorIndex), never both.
     std::vector<std::unique_ptr<VectorIndex>> m_vector_index_accessors;
+    // Fast gate for the per-object insert/erase vector-index notifications.
+    bool m_has_any_vector_index = false;
     ColKey m_primary_key_col;
     Replication* const* m_repl;
     static Replication* g_dummy_replication;

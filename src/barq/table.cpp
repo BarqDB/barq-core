@@ -774,6 +774,12 @@ void Table::erase_from_search_indexes(ObjKey key)
                 index->erase(key);
             }
         }
+        if (m_has_any_vector_index) {
+            for (auto&& index : m_vector_index_accessors) {
+                if (index)
+                    index->object_erased(key);
+            }
+        }
     }
 }
 
@@ -782,6 +788,13 @@ void Table::update_indexes(ObjKey key, const FieldValues& values)
     // Tombstones do not use index - will crash if we try to insert values
     if (key.is_unresolved()) {
         return;
+    }
+
+    if (m_has_any_vector_index) {
+        for (auto&& index : m_vector_index_accessors) {
+            if (index)
+                index->object_inserted(key);
+        }
     }
 
     auto sz = m_index_accessors.size();
@@ -868,6 +881,12 @@ void Table::clear_indexes()
     for (auto&& index : m_index_accessors) {
         if (index) {
             index->clear();
+        }
+    }
+    if (m_has_any_vector_index) {
+        for (auto&& index : m_vector_index_accessors) {
+            if (index)
+                index->table_cleared();
         }
     }
 }
@@ -2195,6 +2214,7 @@ void Table::refresh_vector_index_accessors()
 {
     size_t col_ndx_end = m_leaf_ndx2colkey.size();
     m_vector_index_accessors.resize(col_ndx_end);
+    m_has_any_vector_index = false;
     for (size_t col_ndx = 0; col_ndx < col_ndx_end; ++col_ndx) {
         ref_type ref = (col_ndx < m_index_refs.size()) ? m_index_refs.get_as_ref(col_ndx) : 0;
         // Only indexed columns (ref != 0) have a meaningful spec attribute; reading the
@@ -2204,10 +2224,12 @@ void Table::refresh_vector_index_accessors()
         }
         else if (m_vector_index_accessors[col_ndx]) {
             m_vector_index_accessors[col_ndx]->refresh_accessor_tree();
+            m_has_any_vector_index = true;
         }
         else {
             m_vector_index_accessors[col_ndx] =
                 std::make_unique<VectorIndex>(ref, &m_index_refs, col_ndx, m_leaf_ndx2colkey[col_ndx], get_alloc());
+            m_has_any_vector_index = true;
         }
     }
 }
@@ -2228,6 +2250,7 @@ void Table::do_add_vector_index(ColKey col_key, const VectorIndexConfig& config)
     index->rebuild(*this); // build the graph from the current data and persist it
     m_index_refs.set(column_ndx, index->get_ref());
     m_vector_index_accessors[column_ndx] = std::move(index);
+    m_has_any_vector_index = true;
 }
 
 void Table::add_vector_index(ColKey col_key, const VectorIndexConfig& config)
@@ -2267,6 +2290,10 @@ void Table::remove_vector_index(ColKey col_key)
     auto& index = m_vector_index_accessors[column_ndx.val];
     index->destroy();
     index.reset();
+    m_has_any_vector_index =
+        std::any_of(m_vector_index_accessors.begin(), m_vector_index_accessors.end(), [](auto& ptr) {
+            return bool(ptr);
+        });
 
     m_index_refs.set(column_ndx.val, 0);
 

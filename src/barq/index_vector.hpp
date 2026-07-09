@@ -64,6 +64,13 @@ struct VectorIndexConfig {
 /// in read transactions stay correct in the meantime by brute-forcing the not yet
 /// absorbed keys and merging them into the result.
 ///
+/// Data changes are tracked as they happen: the table notifies the index of every
+/// object insert/erase (object_inserted/object_erased) and of every in-place vector
+/// edit (mark_dirty), and the keys queue up in small persisted event lists. Both
+/// absorbing and the read-only overlay consume those lists, so syncing costs
+/// O(changes), never a table scan. Legacy (pre-tracking) indexes fall back to a
+/// one-off full-table diff and upgrade to event tracking on their next absorb.
+///
 /// The index is a derived, local structure — never written to sync changesets.
 class VectorIndex {
 public:
@@ -101,6 +108,14 @@ public:
     // pending list; searches re-rank it from live data until the graph absorbs it.
     void mark_dirty(ObjKey key);
 
+    // Change notifications from the owning table (write transactions only).
+    // The keys queue up in persisted event lists consumed by the next absorb;
+    // read transactions answer for them via the overlay. No-ops on a legacy
+    // (pre-tracking) index, which reconciles by table diff instead.
+    void object_inserted(ObjKey key); // called for every object created
+    void object_erased(ObjKey key);   // called for every object removed
+    void table_cleared();             // all objects removed at once: empty the graph
+
     // Query the index. Returns up to `k` object keys closest to `query`, closest
     // first, restricted to `candidates` when given (pass nullptr for an unfiltered
     // search — cheaper: no candidate set to build; results are validated against
@@ -119,6 +134,12 @@ public:
     size_t dim() const;
     size_t count() const; // live (non-tombstoned) elements
 
+    // Strip the event lists and downgrade the persisted format to the legacy
+    // (pre-tracking) layout. Exercises the lazy upgrade path in tests.
+    void _downgrade_to_legacy_format_for_testing();
+    // Override the event-list cap (0 = default). Exercises the overflow path in tests.
+    static size_t _max_events_for_testing;
+
     struct Trees; // PIMPL: accessors for the persisted graph arrays
     struct Cache; // PIMPL: in-memory lookaside (key->id map, overlay, scratch)
 
@@ -133,10 +154,22 @@ private:
     // when the graph is empty or the unindexed delta dominates it) assemble the
     // graph in flat RAM on all cores and persist it in one sequential pass;
     // small deltas go through one-at-a-time inserts into the persisted arrays.
-    void absorb(const Table& table);   // fold outstanding data changes into the graph
+    void absorb(const Table& table);       // fold outstanding data changes into the graph
+    void event_absorb(const Table& table); // consume the event lists: O(changes)
+    void scan_absorb(const Table& table);  // legacy/overflow fallback: diff by table scan
     void do_rebuild(const Table& table);
     void insert_element(int64_t key, const float* vec, size_t dim);
     void tombstone(int64_t id);
+
+    // Event-tracking plumbing.
+    bool tracked() const noexcept
+    {
+        return m_tracked;
+    }
+    bool events_overflowed() const;         // recording gave up; next absorb diffs by scan
+    void make_tracked();                    // upgrade a just-reconciled index to event tracking
+    void record_event(size_t slot, ObjKey key);
+    void verify_matches_table(const Table& table); // debug-only cross-check after an absorb
 
     void ensure_synced(const Table& table); // absorb (writable) or compute the overlay (read-only)
     void ensure_key_map();
@@ -146,6 +179,7 @@ private:
     VectorIndexConfig m_config;
     std::unique_ptr<Trees> m_trees;
     std::unique_ptr<Cache> m_cache;
+    bool m_tracked = false; // persisted layout has event lists (set by attach_trees)
 };
 
 } // namespace barq

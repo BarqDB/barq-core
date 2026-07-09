@@ -278,6 +278,66 @@ int main(int argc, char** argv)
                     double(ds.n) / build_time, double(file_after_index) / 1e6,
                     double(file_after_index - file_after_load) / 1e6);
 
+    // 4b. Maintenance latency: the FIRST search after a small write must fold the
+    // change in. A legacy (pre-event-tracking) file pays one table diff on the
+    // first round and upgrades itself; the second round shows the steady state
+    // (O(changes) event absorb). The read-txn round times the overlay path.
+    {
+        std::vector<float> qv(ds.queries.data(), ds.queries.data() + DIM);
+        auto contains = [](const std::vector<ObjKey>& res, ObjKey k) {
+            return std::find(res.begin(), res.end(), k) != res.end();
+        };
+        auto timed_insert_search = [&](const char* label) {
+            WriteTransaction wt(sg);
+            TableRef t = wt.get_table("vectors");
+            Obj o = t->create_object();
+            o.set(col_id, int64_t(2'000'000'000));
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (size_t d = 0; d < DIM; ++d)
+                lst.add(qv[d]);
+            auto r0 = Clock::now();
+            std::vector<ObjKey> res = t->get_vector_index(col_vec)->search(*t, qv, K, nullptr);
+            double ms = sec_since(r0) * 1000.0;
+            if (!contains(res, o.get_key()))
+                std::printf("[resync]  WARNING: inserted object missing from its own result set\n");
+            t->remove_object(o.get_key()); // leave the data unchanged...
+            wt.commit();                   // ...but keep the (possibly upgraded) index
+            std::printf("[resync]  %s: %.2f ms\n", label, ms);
+        };
+        timed_insert_search("write-txn first search after 1 insert (round 1, may scan+upgrade)");
+        timed_insert_search("write-txn first search after 1 insert (round 2, event-tracked)");
+
+        ObjKey extra;
+        {
+            WriteTransaction wt(sg);
+            TableRef t = wt.get_table("vectors");
+            Obj o = t->create_object();
+            o.set(col_id, int64_t(2'000'000'001));
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (size_t d = 0; d < DIM; ++d)
+                lst.add(qv[d]);
+            extra = o.get_key();
+            wt.commit(); // no search: change stays queued in the event lists
+        }
+        {
+            ReadTransaction rt(sg);
+            ConstTableRef t = rt.get_table("vectors");
+            auto r0 = Clock::now();
+            std::vector<ObjKey> res = t->get_vector_index(col_vec)->search(*t, qv, K, nullptr);
+            double ms = sec_since(r0) * 1000.0;
+            if (!contains(res, extra))
+                std::printf("[resync]  WARNING: committed object missing from read-txn result set\n");
+            std::printf("[resync]  read-txn first search after 1 committed insert (overlay): %.2f ms\n", ms);
+        }
+        {
+            WriteTransaction wt(sg);
+            TableRef t = wt.get_table("vectors");
+            t->remove_object(extra);
+            wt.commit();
+        }
+        std::printf("\n");
+    }
+
     // 5. Query sweep
     {
         ReadTransaction rt(sg);

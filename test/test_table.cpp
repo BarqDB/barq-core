@@ -6382,4 +6382,433 @@ TEST(Table_VectorIndexAutoBeam)
     CHECK_EQUAL(31, v[0].get<Int>(col_id));
 }
 
+// Event-driven maintenance: inserts, erases and in-place edits are recorded as
+// they happen and folded in without ever scanning the table. Searches in write
+// transactions (absorb) and read transactions (overlay) must both stay exact
+// across a mixed series of changes. Debug builds additionally cross-check every
+// event absorb against a full table diff inside VectorIndex itself.
+TEST(Table_VectorIndexEventTracking)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 300;
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec, exact_cfg(2 * N));
+        wt.commit();
+    }
+
+    auto expect_hit = [&](TableRef t, int probe, int want) {
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(probe), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(want, v[0].get<Int>(col_id));
+    };
+    auto expect_gone = [&](ConstTableRef t, int probe) {
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(probe), 3);
+        for (size_t i = 0; i < v.size(); ++i)
+            CHECK_NOT_EQUAL(probe, v[i].get<Int>(col_id));
+    };
+
+    // Round 1: insert a few, erase a few, edit one — search inside the write txn
+    // (event absorb) before committing.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        for (int i = N; i < N + 8; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        for (Obj o : *t) {
+            if (o.get<Int>(col_id) == 7 || o.get<Int>(col_id) == 42) {
+                t->remove_object(o.get_key());
+                break; // iterator invalidated by remove; erase 42 below
+            }
+        }
+        for (Obj o : *t) {
+            if (o.get<Int>(col_id) == 42) {
+                t->remove_object(o.get_key());
+                break;
+            }
+        }
+        // In-place edit: object 5 now holds the vector of 5000.
+        for (Obj o : *t) {
+            if (o.get<Int>(col_id) == 5) {
+                Lst<float> lst = o.get_list<float>(col_vec);
+                auto nv = knn_test_vec(5000);
+                for (size_t j = 0; j < nv.size(); ++j)
+                    lst.set(j, nv[j]);
+                o.set(col_id, 5000);
+                break;
+            }
+        }
+        expect_hit(t, N + 3, N + 3); // new object found via the graph
+        expect_gone(t, 7);           // erased objects gone
+        expect_gone(t, 42);
+        expect_hit(t, 5000, 5000); // edited object found under its new vector
+        expect_gone(t, 5);         // ... and not under the old one
+        wt.commit();
+    }
+
+    // Round 2: the committed state answers identically from a read transaction.
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(N + 3), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(N + 3, v[0].get<Int>(col_id));
+        expect_gone(t, 7);
+    }
+
+    // Round 3: changes committed WITHOUT a search leave the event lists pending;
+    // a read transaction answers through the overlay (no write txn ever absorbed).
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        Obj o = t->create_object();
+        o.set(col_id, 9001);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(9001))
+            lst.add(x);
+        wt.commit(); // no search: nothing absorbed
+    }
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(9001), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(9001, v[0].get<Int>(col_id));
+    }
+
+    // Round 4: create and erase within the same transaction — no trace.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        Obj o = t->create_object();
+        o.set(col_id, 7777);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(7777))
+            lst.add(x);
+        t->remove_object(o.get_key());
+        expect_gone(t, 7777);
+        wt.commit();
+    }
+}
+
+// An ObjKey erased and re-created (explicit-key creation, as sync instructions
+// do) lands in both event lists; the index must drop the old vector and serve
+// the new one, absorbed or not.
+TEST(Table_VectorIndexKeyReuse)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 100;
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    ObjKey key50, key60;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+            if (i == 50)
+                key50 = o.get_key();
+            if (i == 60)
+                key60 = o.get_key();
+        }
+        t->add_vector_index(col_vec, exact_cfg(2 * N));
+        wt.commit();
+    }
+
+    // Erase key50 and re-create the same key with a different vector, then
+    // search in the same txn (event absorb sees the key in both lists).
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        t->remove_object(key50);
+        Obj o = t->create_object(key50);
+        CHECK_EQUAL(key50, o.get_key()); // same ObjKey, new life
+        o.set(col_id, 5555);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(5555))
+            lst.add(x);
+
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(5555), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(5555, v[0].get<Int>(col_id));
+
+        // The old vector no longer answers for that key.
+        TableView v2 = t->where().find_all();
+        v2.knnsearch(col_vec, knn_test_vec(50), 1);
+        if (v2.size() == 1)
+            CHECK_NOT_EQUAL(key50, v2[0].get_key());
+        wt.commit();
+    }
+
+    // Same story through the read-only overlay: erase + recreate WITHOUT any
+    // search, commit, and observe from a read transaction (nothing absorbed).
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        t->remove_object(key60);
+        Obj o = t->create_object(key60);
+        o.set(col_id, 6666);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(6666))
+            lst.add(x);
+        wt.commit(); // no search: stays in the event lists
+    }
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(6666), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(6666, v[0].get<Int>(col_id));
+        TableView v2 = t->where().find_all();
+        v2.knnsearch(col_vec, knn_test_vec(60), 1);
+        if (v2.size() == 1)
+            CHECK_NOT_EQUAL(key60, v2[0].get_key());
+    }
+}
+
+// Table::clear drops every object without per-object erase notifications; the
+// index must empty wholesale and then track new data as usual.
+TEST(Table_VectorIndexTableClear)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 120;
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec, exact_cfg(2 * N));
+        wt.commit();
+    }
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        t->clear();
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(3), 5);
+        CHECK_EQUAL(0, v.size());
+
+        // Refill with fresh data (different ids) in the same transaction.
+        for (int i = 1000; i < 1000 + 40; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        TableView v2 = t->where().find_all();
+        v2.knnsearch(col_vec, knn_test_vec(1005), 1);
+        CHECK_EQUAL(1, v2.size());
+        CHECK_EQUAL(1005, v2[0].get<Int>(col_id));
+        wt.commit();
+    }
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(1017), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(1017, v[0].get<Int>(col_id));
+    }
+}
+
+// A legacy (format-3, pre-event-tracking) index keeps answering via table diffs
+// and upgrades itself to event tracking on its next write-transaction absorb.
+TEST(Table_VectorIndexLegacyUpgrade)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 150;
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec, exact_cfg(2 * N));
+        // Rewind the persisted layout to the legacy format.
+        t->get_vector_index(col_vec)->_downgrade_to_legacy_format_for_testing();
+        wt.commit();
+    }
+
+    // Changes land while the index is still legacy (no events recorded).
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        Obj o = t->create_object();
+        o.set(col_id, 2000);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(2000))
+            lst.add(x);
+        wt.commit(); // no search: nothing absorbed, nothing recorded
+    }
+
+    // Read transactions on a legacy index diff by scan and stay exact.
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(2000), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(2000, v[0].get<Int>(col_id));
+    }
+
+    // First search in a write transaction reconciles by scan and upgrades.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(2000), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(2000, v[0].get<Int>(col_id));
+        wt.commit();
+    }
+
+    // From here on the index runs event-tracked: mutate + search, all exact.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        Obj o = t->create_object();
+        o.set(col_id, 3000);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(3000))
+            lst.add(x);
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(3000), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(3000, v[0].get<Int>(col_id));
+        wt.commit();
+    }
+}
+
+// When a write burst exceeds the event-list cap the index stops recording,
+// flags itself, reconciles with one scan on the next absorb, and re-arms.
+TEST(Table_VectorIndexEventOverflow)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 80;
+
+    VectorIndex::_max_events_for_testing = 16;
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec, exact_cfg(4 * N));
+        wt.commit();
+    }
+
+    // Blow through the cap without a single search.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        for (int i = 1000; i < 1000 + 40; ++i) { // 40 events > cap of 16
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        wt.commit();
+    }
+
+    // Read transaction: overflowed → answers via the scan overlay, still exact.
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(1023), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(1023, v[0].get<Int>(col_id));
+    }
+
+    // Write-transaction search: scan-reconciles, re-arms tracking.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(1031), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(1031, v[0].get<Int>(col_id));
+        wt.commit();
+    }
+
+    // Tracking works again after the recovery.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        Obj o = t->create_object();
+        o.set(col_id, 4000);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(4000))
+            lst.add(x);
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(4000), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(4000, v[0].get<Int>(col_id));
+        wt.commit();
+    }
+
+    VectorIndex::_max_events_for_testing = 0;
+}
+
 #endif // TEST_TABLE

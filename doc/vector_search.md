@@ -71,14 +71,21 @@ and a pending list). Because it is regular barq storage:
 
 ## How it stays fresh
 
-- New and deleted objects are folded into the graph the next time a search runs
-  inside a write transaction (or on `rebuild_vector_index`). Until then, read
-  transactions stay exact by brute-forcing the few not-yet-absorbed keys and
-  merging them into the result.
-- Editing a vector in place is detected automatically: every `Lst<float>` write
-  on an indexed column records the object in the index's pending list. The object
-  is re-ranked from live data immediately and re-inserted into the graph at the
-  next absorb.
+- Every data change is recorded the moment it happens: the table notifies the
+  index of each object insert and erase, and every `Lst<float>` write on an
+  indexed column records the object as edited. The keys queue up in small
+  persisted event lists.
+- The next search inside a write transaction (or `rebuild_vector_index`) folds
+  the queued changes into the graph in O(changes) — point lookups only, never a
+  table scan, so the first search after a write stays fast at any table size.
+  Until then, read transactions stay exact by brute-forcing the queued keys and
+  merging them into the result — also O(changes).
+- `Table::clear` empties the graph wholesale.
+- Safety valve: if a write burst queues more than a million events without a
+  search, recording stops and the next absorb reconciles with one table diff,
+  then re-arms. Pre-tracking (older) index files upgrade themselves the same
+  way on their first absorb. Debug builds cross-check every event-driven absorb
+  against a full table diff.
 - Tombstones from deletions compact via a full rebuild once they reach half the
   graph.
 

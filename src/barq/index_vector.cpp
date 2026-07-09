@@ -60,6 +60,8 @@ namespace {
 //   [5] links_upper  BPlusTree<int64>  upper adjacency, stride m+1 per (id, layer)
 //   [6] vectors      BPlusTree<float>  id -> the vector, stride dim
 //   [7] pending      BPlusTree<int64>  ObjKeys edited in place, absorbed lazily
+//   [8] added        BPlusTree<int64>  ObjKeys created since the last absorb (format >= 4)
+//   [9] removed      BPlusTree<int64>  ObjKeys erased since the last absorb (format >= 4)
 
 constexpr size_t t_header = 0;
 constexpr size_t t_keys = 1;
@@ -69,7 +71,10 @@ constexpr size_t t_upper_ofs = 4;
 constexpr size_t t_links_upper = 5;
 constexpr size_t t_vectors = 6;
 constexpr size_t t_pending = 7;
-constexpr size_t t_count = 8;
+constexpr size_t t_added = 8;
+constexpr size_t t_removed = 9;
+constexpr size_t t_count = 10;
+constexpr size_t t_count_legacy = 8; // format-3 layout: no event lists
 
 constexpr size_t h_format = 0;
 constexpr size_t h_dim = 1;
@@ -82,9 +87,17 @@ constexpr size_t h_maxlevel = 7; // level + 1, 0 = none
 constexpr size_t h_total = 8;    // ids allocated, including tombstones
 constexpr size_t h_deleted = 9;
 constexpr size_t h_salt = 10;
-constexpr size_t h_count = 11;
+constexpr size_t h_flags = 11; // format >= 4
+constexpr size_t h_count = 12;
 
-constexpr int64_t s_format = 3; // native array-backed graph
+constexpr int64_t s_format_legacy = 3;  // native graph, synced by table diff
+constexpr int64_t s_format = 4;         // + event lists: synced in O(changes)
+constexpr int64_t f_events_overflowed = 1; // h_flags bit: recording gave up, diff by scan
+
+// Recording stops (and the next absorb falls back to one table-diff scan) once the
+// event lists reach this many entries — bounds file growth when a huge write burst
+// is never followed by a search. 1M entries ~ 8 MB, dwarfed by any graph that size.
+constexpr size_t s_max_events = 1'000'000;
 
 // ---- small helpers -------------------------------------------------------------
 
@@ -306,6 +319,8 @@ struct VectorIndex::Trees {
         , links_upper(alloc)
         , vectors(alloc)
         , pending(alloc)
+        , added(alloc)
+        , removed(alloc)
     {
     }
 
@@ -317,6 +332,8 @@ struct VectorIndex::Trees {
     BPlusTree<int64_t> links_upper;
     BPlusTree<float> vectors;
     BPlusTree<int64_t> pending;
+    BPlusTree<int64_t> added;   // attached on format >= 4 only
+    BPlusTree<int64_t> removed; // attached on format >= 4 only
 
     int64_t hdr(size_t field) const
     {
@@ -1101,6 +1118,22 @@ void VectorIndex::attach_trees()
     m_trees->vectors.init_from_parent();
     m_trees->pending.set_parent(&m_top, t_pending);
     m_trees->pending.init_from_parent();
+
+    // Event lists exist on format >= 4 only; a legacy graph syncs by table diff
+    // until its next absorb upgrades it (make_tracked).
+    m_tracked = m_top.size() > t_removed;
+    if (m_tracked) {
+        m_trees->added.set_parent(&m_top, t_added);
+        m_trees->added.init_from_parent();
+        m_trees->removed.set_parent(&m_top, t_removed);
+        m_trees->removed.init_from_parent();
+    }
+    else {
+        if (m_trees->added.is_attached())
+            m_trees->added.detach();
+        if (m_trees->removed.is_attached())
+            m_trees->removed.detach();
+    }
 }
 
 void VectorIndex::reset_caches()
@@ -1188,7 +1221,8 @@ uint64_t VectorIndex::header_field(size_t index) const
 
 void VectorIndex::load_config_from_header()
 {
-    if (header_field(h_format) != uint64_t(s_format))
+    auto format = int64_t(header_field(h_format));
+    if (format != s_format && format != s_format_legacy)
         return;
     m_config.metric = VectorMetric(uint8_t(header_field(h_metric)));
     m_config.m = size_t(header_field(h_m));
@@ -1212,12 +1246,124 @@ void VectorIndex::ensure_key_map()
         return;
     m_cache->key2id.clear();
     size_t total = size_t(m_trees->hdr(h_total));
-    for (size_t id = 0; id < total; ++id) {
-        int64_t key = m_trees->keys.get(id);
-        if (key >= 0)
-            m_cache->key2id[key] = int64_t(id);
+    m_cache->key2id.reserve(total);
+    int64_t buf[1024];
+    for (size_t id = 0; id < total;) {
+        size_t chunk = std::min(total - id, size_t(1024));
+        m_trees->keys.get_range(id, chunk, buf);
+        for (size_t i = 0; i < chunk; ++i) {
+            if (buf[i] >= 0)
+                m_cache->key2id[buf[i]] = int64_t(id + i);
+        }
+        id += chunk;
     }
     m_cache->key2id_valid = true;
+}
+
+// ---- change tracking --------------------------------------------------------------
+
+bool VectorIndex::events_overflowed() const
+{
+    if (m_trees->header.size() <= h_flags)
+        return false;
+    return (m_trees->hdr(h_flags) & f_events_overflowed) != 0;
+}
+
+size_t VectorIndex::_max_events_for_testing = 0;
+
+// Append `key` to the event list in `slot` (write transactions only). Once the
+// lists grow past s_max_events the index stops recording and flags itself for a
+// one-off table-diff reconcile instead — the degenerate case behaves exactly like
+// a legacy index until the next absorb.
+void VectorIndex::record_event(size_t slot, ObjKey key)
+{
+    if (!m_tracked || events_overflowed())
+        return;
+    Trees& t = *m_trees;
+    BPlusTree<int64_t>& list = slot == t_added ? t.added : t.removed;
+    size_t cap = _max_events_for_testing ? _max_events_for_testing : s_max_events;
+    if (t.added.size() + t.removed.size() >= cap) {
+        t.added.clear();
+        t.removed.clear();
+        t.set_hdr(h_flags, t.hdr(h_flags) | f_events_overflowed);
+        m_cache->synced_version = uint64_t(-1);
+        return;
+    }
+    list.add(key.value);
+    m_cache->synced_version = uint64_t(-1); // re-sync on the next search
+}
+
+void VectorIndex::object_inserted(ObjKey key)
+{
+    std::lock_guard<std::mutex> lock(m_cache->mutex);
+    record_event(t_added, key);
+}
+
+void VectorIndex::object_erased(ObjKey key)
+{
+    std::lock_guard<std::mutex> lock(m_cache->mutex);
+    record_event(t_removed, key);
+}
+
+namespace {
+void clear_graph_arrays(VectorIndex::Trees& t); // defined below
+}
+
+// The table dropped every object at once (Table::clear) — no per-object erase
+// notifications follow, so empty the graph wholesale. Cheap and exact, so a
+// pending scan-reconcile (overflow) is resolved here too.
+void VectorIndex::table_cleared()
+{
+    std::lock_guard<std::mutex> lock(m_cache->mutex);
+    Trees& t = *m_trees;
+    clear_graph_arrays(t);
+    t.set_hdr(h_dim, 0); // rediscovered from the next data
+    if (m_tracked && t.header.size() > h_flags)
+        t.set_hdr(h_flags, t.hdr(h_flags) & ~f_events_overflowed);
+    reset_caches();
+}
+
+// (Re)arm event tracking. Only valid right after the graph has been fully
+// reconciled with the table: the lists must be empty and stay complete from this
+// moment on — so any leftover entries (from an interrupted event absorb whose
+// scan-reconcile just ran) are stale by definition and get flushed. Idempotent.
+void VectorIndex::make_tracked()
+{
+    Trees& t = *m_trees;
+    if (!m_tracked) {
+        BARQ_ASSERT(m_top.size() == t_count_legacy);
+        Allocator& alloc = m_top.get_alloc();
+        for (size_t slot = t_added; slot < t_count; ++slot) {
+            BPlusTree<int64_t> tree(alloc);
+            tree.create();
+            m_top.add(from_ref(tree.get_ref()));
+        }
+        t.set_hdr(h_format, s_format);
+        attach_trees();
+    }
+    t.pending.clear();
+    t.added.clear();
+    t.removed.clear();
+    m_cache->pending_seen.clear();
+    while (t.header.size() < h_count)
+        t.header.add(0);
+    t.set_hdr(h_flags, t.hdr(h_flags) & ~f_events_overflowed);
+}
+
+void VectorIndex::_downgrade_to_legacy_format_for_testing()
+{
+    std::lock_guard<std::mutex> lock(m_cache->mutex);
+    if (!m_tracked)
+        return;
+    m_trees->added.destroy();
+    m_trees->removed.destroy();
+    m_top.truncate(t_count_legacy);
+    if (m_trees->header.size() > h_flags)
+        m_trees->header.truncate(h_flags);
+    m_trees->set_hdr(h_format, s_format_legacy);
+    attach_trees();
+    reset_caches();
+    m_cache->synced_version = uint64_t(-1);
 }
 
 // Insert one element into the graph (ported from hnswlib::addPoint). `vec` must
@@ -1315,8 +1461,9 @@ void VectorIndex::tombstone(int64_t id)
 
 namespace {
 
-// Empty the graph arrays and reset the graph-shape header fields; dim and salt
-// are left alone. The persisted trees are then ready for a BulkBuilder::write.
+// Empty the graph arrays (event lists included) and reset the graph-shape header
+// fields; dim, salt and flags are left alone (the scan-reconcile flag only lifts
+// once its owner completes). The trees are then ready for a BulkBuilder::write.
 void clear_graph_arrays(VectorIndex::Trees& t)
 {
     t.keys.clear();
@@ -1326,6 +1473,10 @@ void clear_graph_arrays(VectorIndex::Trees& t)
     t.links_upper.clear();
     t.vectors.clear();
     t.pending.clear();
+    if (t.added.is_attached()) {
+        t.added.clear();
+        t.removed.clear();
+    }
     t.set_hdr(h_entry, 0);
     t.set_hdr(h_maxlevel, 0);
     t.set_hdr(h_total, 0);
@@ -1356,6 +1507,162 @@ void bulk_rebuild(VectorIndex::Trees& t, VectorIndex::Cache& cache, size_t build
 // Fold outstanding data changes into the graph: index new objects, tombstone gone
 // ones, re-index pending in-place edits. Write transaction only.
 void VectorIndex::absorb(const Table& table)
+{
+    if (!m_tracked || events_overflowed()) {
+        // Legacy layout, or event recording gave up (overflow / interrupted
+        // absorb): reconcile with one table diff, then (re)arm event tracking.
+        scan_absorb(table);
+        make_tracked();
+        return;
+    }
+#ifdef BARQ_DEBUG
+    bool had_events =
+        m_trees->added.size() + m_trees->removed.size() + m_trees->pending.size() > 0 && table.size() <= 100'000;
+#endif
+    event_absorb(table);
+#ifdef BARQ_DEBUG
+    // Any mismatch here means a table mutation path failed to notify the index.
+    if (had_events && !events_overflowed())
+        verify_matches_table(table);
+#endif
+}
+
+// Consume the persisted event lists: tombstone erased and edited keys, (re)index
+// created and edited ones. Costs O(changes) in point lookups — the table is never
+// scanned, so the first search after a write stays cheap at any table size.
+void VectorIndex::event_absorb(const Table& table)
+{
+    Trees& t = *m_trees;
+    size_t n_added = t.added.size();
+    size_t n_removed = t.removed.size();
+    size_t n_pending = t.pending.size();
+    if (n_added + n_removed + n_pending == 0)
+        return;
+
+    // The lists are consumed before the graph is fully updated, so an exception
+    // below would strand changes if the caller catches it inside the transaction.
+    // Flag a scan-reconcile up front and lift it again only on success (a rollback
+    // reverts the flag together with everything else).
+    t.set_hdr(h_flags, t.hdr(h_flags) | f_events_overflowed);
+
+    ensure_key_map();
+
+    // Erased objects leave the graph as tombstones.
+    for (size_t i = 0; i < n_removed; ++i) {
+        int64_t key = t.removed.get(i);
+        auto it = m_cache->key2id.find(key);
+        if (it != m_cache->key2id.end()) {
+            tombstone(it->second);
+            m_cache->key2id.erase(it);
+        }
+    }
+
+    // Created keys and pending in-place edits are the (re-)insert candidates;
+    // a stale graph copy of an edited key is dropped first. Order-preserving
+    // dedup keeps rebuilds deterministic.
+    std::vector<int64_t> cand;
+    cand.reserve(n_added + n_pending);
+    std::unordered_set<int64_t> seen;
+    auto consider = [&](int64_t key) {
+        if (seen.insert(key).second)
+            cand.push_back(key);
+    };
+    for (size_t i = 0; i < n_pending; ++i) {
+        int64_t key = t.pending.get(i);
+        auto it = m_cache->key2id.find(key);
+        if (it != m_cache->key2id.end()) {
+            tombstone(it->second);
+            m_cache->key2id.erase(it);
+        }
+        consider(key);
+    }
+    for (size_t i = 0; i < n_added; ++i)
+        consider(t.added.get(i));
+
+    auto clear_events = [&] {
+        t.pending.clear();
+        t.added.clear();
+        t.removed.clear();
+        m_cache->pending_seen.clear();
+    };
+    auto done = [&] {
+        t.set_hdr(h_flags, t.hdr(h_flags) & ~f_events_overflowed);
+    };
+
+    size_t d = dim();
+    if (d == 0) {
+        // Dimension is discovered from the first candidate with a vector.
+        for (int64_t key : cand) {
+            Obj obj = table.try_get_object(ObjKey(key));
+            if (!obj)
+                continue;
+            auto lst = obj.get_list<float>(m_column);
+            if (lst.size() > 0) {
+                d = lst.size();
+                break;
+            }
+        }
+        if (d == 0) { // none of the changes carry vector data
+            clear_events();
+            done();
+            return;
+        }
+        t.set_hdr(h_dim, int64_t(d));
+    }
+
+    int64_t live = t.hdr(h_total) - t.hdr(h_deleted);
+    if (int64_t(cand.size()) > live) {
+        // The changes dominate the graph: one scan-and-rebuild beats point
+        // lookups plus incremental inserts (and clears the lists wholesale).
+        do_rebuild(table);
+        done();
+        return;
+    }
+
+    // Point-look up each candidate. Skip keys that died again, carry no
+    // (dim-sized) vector yet — they re-enter via mark_dirty when one appears —
+    // or are already indexed (a key erased and re-created lands in both lists).
+    BulkBuilder delta(m_config, d, uint64_t(t.hdr(h_salt)));
+    std::vector<float> buf(d);
+    for (int64_t key : cand) {
+        if (m_cache->key2id.count(key))
+            continue;
+        Obj obj = table.try_get_object(ObjKey(key));
+        if (!obj)
+            continue;
+        auto lst = obj.get_list<float>(m_column);
+        if (lst.size() != d)
+            continue;
+        lst.get_tree().get_range(0, d, buf.data());
+        if (m_config.metric == VectorMetric::Cosine)
+            normalize_vec(buf.data(), d);
+        delta.add(key, buf.data());
+    }
+
+    if (delta.size() > 0 && t.hdr(h_total) - t.hdr(h_deleted) == 0) {
+        // Nothing live in the graph: build it fresh in RAM from the delta —
+        // orders of magnitude faster than one-at-a-time inserts. Clears the
+        // event lists along with the old graph arrays.
+        bulk_rebuild(t, *m_cache, m_config.build_threads, delta);
+        done();
+        return;
+    }
+
+    for (size_t i = 0; i < delta.size(); ++i)
+        insert_element(delta.key(i), delta.vec(i), d);
+    clear_events();
+
+    // Compact once tombstones dominate: rebuild from live data.
+    int64_t deleted = t.hdr(h_deleted);
+    if (deleted > 0 && deleted * 2 >= t.hdr(h_total))
+        do_rebuild(table);
+    done();
+}
+
+// Reconcile by diffing the graph against a full table scan. The pre-tracking
+// maintenance path, kept for legacy-format files and as the recovery route when
+// event recording overflowed or an event absorb was interrupted.
+void VectorIndex::scan_absorb(const Table& table)
 {
     Trees& t = *m_trees;
     ensure_key_map();
@@ -1448,6 +1755,31 @@ void VectorIndex::absorb(const Table& table)
         do_rebuild(table);
 }
 
+// Debug-only: after an event-driven absorb the graph must exactly reflect the
+// table. A mismatch means some table mutation path failed to notify the index —
+// the one failure mode event tracking can have — so fail loudly right here.
+void VectorIndex::verify_matches_table(const Table& table)
+{
+#ifdef BARQ_DEBUG
+    ensure_key_map();
+    size_t d = dim();
+    size_t expected = 0;
+    for (auto obj : table) {
+        auto lst = obj.get_list<float>(m_column);
+        if (d != 0 && lst.size() == d) {
+            ++expected;
+            BARQ_ASSERT_RELEASE(m_cache->key2id.count(obj.get_key().value));
+        }
+    }
+    BARQ_ASSERT_RELEASE(m_cache->key2id.size() == expected);
+    BARQ_ASSERT_RELEASE(m_trees->pending.size() == 0);
+    BARQ_ASSERT_RELEASE(m_trees->added.size() == 0);
+    BARQ_ASSERT_RELEASE(m_trees->removed.size() == 0);
+#else
+    static_cast<void>(table);
+#endif
+}
+
 void VectorIndex::do_rebuild(const Table& table)
 {
     Trees& t = *m_trees;
@@ -1488,6 +1820,7 @@ void VectorIndex::rebuild(const Table& table)
 {
     std::lock_guard<std::mutex> lock(m_cache->mutex);
     do_rebuild(table);
+    make_tracked(); // a full rebuild reconciles everything; upgrades legacy layouts
     m_cache->overlay.clear();
     m_cache->stale.clear();
     m_cache->pending_seen.clear();
@@ -1497,20 +1830,17 @@ void VectorIndex::rebuild(const Table& table)
 void VectorIndex::mark_dirty(ObjKey key)
 {
     std::lock_guard<std::mutex> lock(m_cache->mutex);
-    int64_t k = key.value;
-    if (m_cache->pending_seen.count(k))
-        return;
-    // Dedupe against entries persisted by earlier transactions (the list is small;
-    // it is consumed by the next absorb).
-    size_t n = m_trees->pending.size();
-    for (size_t i = 0; i < n; ++i) {
-        if (m_trees->pending.get(i) == k) {
-            m_cache->pending_seen.insert(k);
-            return;
-        }
+    // pending_seen mirrors the persisted list (primed from it on first use, kept
+    // in step by every path that mutates it), so dedup is one hash probe instead
+    // of a list rescan per new key.
+    if (m_cache->pending_seen.empty()) {
+        size_t n = m_trees->pending.size();
+        for (size_t i = 0; i < n; ++i)
+            m_cache->pending_seen.insert(m_trees->pending.get(i));
     }
-    m_trees->pending.add(k);
-    m_cache->pending_seen.insert(k);
+    if (!m_cache->pending_seen.insert(key.value).second)
+        return;
+    m_trees->pending.add(key.value);
     m_cache->synced_version = uint64_t(-1); // re-sync on the next search
 }
 
@@ -1532,6 +1862,39 @@ void VectorIndex::ensure_synced(const Table& table)
     }
 
     ensure_key_map();
+
+    if (m_tracked && !events_overflowed()) {
+        // The event lists say exactly which keys the graph does not answer for —
+        // the overlay costs O(changes), not a table scan. Liberal by design: a
+        // listed key without a (dim-sized) vector is overlaid too and skipped by
+        // the search's own size check.
+        std::unordered_set<int64_t> seen;
+        auto overlay_if_live = [&](int64_t key) {
+            if (seen.insert(key).second && table.is_valid(ObjKey(key)))
+                m_cache->overlay.push_back(key);
+        };
+        size_t n_pending = m_trees->pending.size();
+        for (size_t i = 0; i < n_pending; ++i) {
+            int64_t key = m_trees->pending.get(i);
+            if (m_cache->key2id.count(key))
+                m_cache->stale.insert(key); // graph copy outdated
+            overlay_if_live(key);
+        }
+        size_t n_removed = m_trees->removed.size();
+        for (size_t i = 0; i < n_removed; ++i) {
+            int64_t key = m_trees->removed.get(i);
+            if (m_cache->key2id.count(key)) {
+                m_cache->stale.insert(key); // object gone (or re-created since)
+                overlay_if_live(key);       // re-created: re-rank from live data
+            }
+        }
+        size_t n_added = m_trees->added.size();
+        for (size_t i = 0; i < n_added; ++i)
+            overlay_if_live(m_trees->added.get(i));
+        m_cache->synced_version = cur;
+        return;
+    }
+
     size_t d = dim();
     size_t n_pending = m_trees->pending.size();
     for (size_t i = 0; i < n_pending; ++i) {
