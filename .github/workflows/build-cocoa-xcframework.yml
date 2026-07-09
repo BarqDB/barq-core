@@ -57,14 +57,16 @@ jobs:
       - name: Build Apple slices + assemble xcframework
         env:
           VERSION: ${{ steps.v.outputs.VERSION }}
-          MACOS_ONLY: ${{ github.event.inputs.macos_only }}
+          # NOTE: do NOT name this MACOS_ONLY — build-cocoa.sh checks `[[ -z $MACOS_ONLY ]]`,
+          # so any non-empty value (even "false") would force macOS-only.
+          INPUT_MACOS_ONLY: ${{ github.event.inputs.macos_only }}
         # -b builds from source; -m limits to macOS. OpenSSL/zlib for the CMake
         # build come from Barq hosting via tools/cmake/AcquireBarqDependency.cmake;
         # Apple sync uses SecureTransport.
         run: |
           cmake --version
           flags="-b -v $VERSION"
-          [ "$MACOS_ONLY" = "true" ] && flags="$flags -m"
+          [ "$INPUT_MACOS_ONLY" = "true" ] && flags="$flags -m"
           sh tools/build-cocoa.sh $flags
 
       - name: Verify artifact
