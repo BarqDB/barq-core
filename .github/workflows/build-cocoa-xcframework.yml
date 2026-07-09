@@ -49,10 +49,10 @@ jobs:
         with:
           xcode-version: latest-stable
 
-      - name: Pin CMake 3.x (the Xcode toolchain build is incompatible with CMake 4)
+      - name: Pin CMake 3.26 (3.27+ rejects universal x86_64;arm64 in the Xcode ABI check)
         uses: jwlawson/actions-setup-cmake@v2
         with:
-          cmake-version: '3.31.6'
+          cmake-version: '3.26.4'
 
       - name: Build Apple slices + assemble xcframework
         env:
