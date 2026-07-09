@@ -30,6 +30,7 @@
 #include <barq/exceptions.hpp>
 #include <barq/impl/destroy_guard.hpp>
 #include <barq/index_string.hpp>
+#include <barq/index_vector.hpp>
 #include <barq/query_conditions_tpl.hpp>
 #include <barq/replication.hpp>
 #include <barq/table_view.hpp>
@@ -356,6 +357,7 @@ Table::Table(Allocator& alloc)
     , m_index_refs(m_alloc)
     , m_opposite_table(m_alloc)
     , m_opposite_column(m_alloc)
+    , m_vector_index_refs(m_alloc)
     , m_repl(&g_dummy_replication)
     , m_own_ref(this, alloc.get_instance_version())
 {
@@ -378,6 +380,7 @@ Table::Table(Replication* const* repl, Allocator& alloc)
     , m_index_refs(m_alloc)
     , m_opposite_table(m_alloc)
     , m_opposite_column(m_alloc)
+    , m_vector_index_refs(m_alloc)
     , m_repl(repl)
     , m_own_ref(this, alloc.get_instance_version())
 {
@@ -916,6 +919,8 @@ void Table::add_search_index(ColKey col_key, IndexType type)
         throw InvalidColumnKey("primary key cannot have a full text index");
 
     switch (type) {
+        case IndexType::Vector:
+            throw IllegalOperation("Use add_vector_index() to create a vector index");
         case IndexType::None:
             remove_search_index(col_key);
             return;
@@ -1039,6 +1044,12 @@ ColKey Table::do_insert_root_column(ColKey col_key, ColumnType type, StringData 
     else {
         m_index_refs.set(col_ndx, 0);
     }
+    if (m_vector_index_refs.is_attached()) {
+        if (col_ndx == m_vector_index_refs.size())
+            m_vector_index_refs.insert(col_ndx, 0);
+        else
+            m_vector_index_refs.set(col_ndx, 0);
+    }
     BARQ_ASSERT(col_ndx <= m_opposite_table.size());
     if (col_ndx == m_opposite_table.size()) {
         // m_opposite_table and m_opposite_column are always resized together!
@@ -1071,6 +1082,14 @@ void Table::do_erase_root_column(ColKey col_key)
         m_index_refs.set(col_ndx, 0);
         m_index_accessors[col_ndx].reset();
     }
+    if (m_vector_index_refs.is_attached() && col_ndx < m_vector_index_refs.size()) {
+        if (ref_type vref = m_vector_index_refs.get_as_ref(col_ndx)) {
+            Array::destroy_deep(vref, m_vector_index_refs.get_alloc());
+            m_vector_index_refs.set(col_ndx, 0);
+        }
+        if (col_ndx < m_vector_index_accessors.size())
+            m_vector_index_accessors[col_ndx].reset();
+    }
     m_opposite_table.set(col_ndx, TableKey().value);
     m_opposite_column.set(col_ndx, ColKey().value);
     m_index_accessors[col_ndx] = nullptr;
@@ -1085,6 +1104,9 @@ void Table::do_erase_root_column(ColKey col_key)
     while (m_index_accessors.size() > m_leaf_ndx2colkey.size()) {
         BARQ_ASSERT(m_index_accessors.back() == nullptr);
         m_index_accessors.pop_back();
+    }
+    while (m_vector_index_accessors.size() > m_leaf_ndx2colkey.size()) {
+        m_vector_index_accessors.pop_back();
     }
     bump_content_version();
     bump_storage_version();
@@ -2173,6 +2195,107 @@ void Table::refresh_index_accessors()
             }
         }
     }
+
+    refresh_vector_index_accessors();
+}
+
+void Table::refresh_vector_index_accessors()
+{
+    bool has_slot = m_top.size() > size_t(top_position_for_vector_indexes) &&
+                    m_top.get_as_ref(top_position_for_vector_indexes) != 0;
+    if (!has_slot) {
+        m_vector_index_accessors.clear();
+        return;
+    }
+    m_vector_index_refs.set_parent(&m_top, top_position_for_vector_indexes);
+    m_vector_index_refs.init_from_parent();
+
+    size_t col_ndx_end = m_leaf_ndx2colkey.size();
+    m_vector_index_accessors.resize(col_ndx_end);
+    for (size_t col_ndx = 0; col_ndx < col_ndx_end; ++col_ndx) {
+        ref_type ref = (col_ndx < m_vector_index_refs.size()) ? m_vector_index_refs.get_as_ref(col_ndx) : 0;
+        if (ref == 0) {
+            m_vector_index_accessors[col_ndx].reset();
+        }
+        else if (m_vector_index_accessors[col_ndx]) {
+            m_vector_index_accessors[col_ndx]->refresh_accessor_tree();
+        }
+        else {
+            m_vector_index_accessors[col_ndx] = std::make_unique<VectorIndex>(
+                ref, &m_vector_index_refs, col_ndx, m_leaf_ndx2colkey[col_ndx], get_alloc());
+        }
+    }
+}
+
+void Table::do_add_vector_index(ColKey col_key)
+{
+    size_t column_ndx = col_key.get_index().val;
+
+    // Lazily append the optional top-array slot and create the per-column refs array.
+    while (m_top.size() <= size_t(top_position_for_vector_indexes))
+        m_top.add(0);
+    if (m_top.get_as_ref(top_position_for_vector_indexes) == 0) {
+        bool context_flag = false;
+        size_t nb_columns = m_spec.get_column_count();
+        MemRef mem = Array::create_array(Array::type_HasRefs, context_flag, nb_columns, 0, m_top.get_alloc());
+        m_vector_index_refs.set_parent(&m_top, top_position_for_vector_indexes);
+        m_vector_index_refs.init_from_mem(mem);
+        m_vector_index_refs.update_parent();
+        m_vector_index_accessors.resize(nb_columns);
+    }
+    else if (!m_vector_index_refs.is_attached()) {
+        m_vector_index_refs.set_parent(&m_top, top_position_for_vector_indexes);
+        m_vector_index_refs.init_from_parent();
+        m_vector_index_accessors.resize(m_vector_index_refs.size());
+    }
+
+    while (m_vector_index_refs.size() <= column_ndx)
+        m_vector_index_refs.add(0);
+    if (m_vector_index_accessors.size() <= column_ndx)
+        m_vector_index_accessors.resize(column_ndx + 1);
+
+    if (m_vector_index_accessors[column_ndx])
+        return; // already indexed
+
+    auto index = std::make_unique<VectorIndex>(col_key, get_alloc());
+    index->set_parent(&m_vector_index_refs, column_ndx);
+    m_vector_index_refs.set(column_ndx, index->get_ref());
+    index->rebuild(*this); // build the graph from the current data and persist it
+    m_vector_index_refs.set(column_ndx, index->get_ref());
+    m_vector_index_accessors[column_ndx] = std::move(index);
+}
+
+void Table::add_vector_index(ColKey col_key)
+{
+    check_column(col_key);
+    if (!(col_key.is_list() && col_key.get_type() == col_type_Float)) {
+        throw IllegalOperation(
+            util::format("Vector index requires a list-of-float property: %1", get_column_name(col_key)));
+    }
+
+    auto spec_ndx = leaf_ndx2spec_ndx(col_key.get_index());
+    auto attr = m_spec.get_column_attr(spec_ndx);
+    if (attr.test(col_attr_Vector_Indexed))
+        return; // already indexed
+
+    do_add_vector_index(col_key);
+
+    attr.set(col_attr_Vector_Indexed);
+    m_spec.set_column_attr(spec_ndx, attr); // Throws
+}
+
+bool Table::has_vector_index(ColKey col_key) const noexcept
+{
+    size_t col_ndx = col_key.get_index().val;
+    return col_ndx < m_vector_index_accessors.size() && m_vector_index_accessors[col_ndx] != nullptr;
+}
+
+VectorIndex* Table::get_vector_index(ColKey col_key) const noexcept
+{
+    size_t col_ndx = col_key.get_index().val;
+    if (col_ndx < m_vector_index_accessors.size())
+        return m_vector_index_accessors[col_ndx].get();
+    return nullptr;
 }
 
 bool Table::is_cross_table_link_target() const noexcept

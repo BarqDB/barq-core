@@ -5372,4 +5372,70 @@ TEST(Table_LoggingMutations)
     CHECK(str.find("Set 'any' to list") != std::string::npos);
 }
 
+// Deterministic, collision-free unit vectors: the first 11 sign bits encode the id,
+// so make_vec(i) is unique and equals the stored vector for object i.
+static std::vector<float> knn_test_vec(int i)
+{
+    std::vector<float> v(16);
+    for (size_t j = 0; j < v.size(); ++j) {
+        bool bit;
+        if (j < 11)
+            bit = (i >> j) & 1;
+        else
+            bit = ((uint32_t(i) * 2654435761u + uint32_t(j) * 40503u) >> 16) & 1u;
+        v[j] = bit ? 0.25f : -0.25f;
+    }
+    return v;
+}
+
+// Stage 1 persistence: a vector index built in one session must survive a reopen and
+// answer queries by loading the persisted graph — no rebuild from the raw vectors.
+TEST(Table_VectorIndexPersistence)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 500;
+    const int target = 321;
+
+    // Session 1: build the index and persist it.
+    {
+        DBRef sg = DB::create(path);
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        auto col_id = t->add_column(type_Int, "id");
+        auto col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec);
+        CHECK(t->has_vector_index(col_vec));
+        wt.commit();
+    }
+
+    // Session 2: reopen from disk and query through the persisted index.
+    {
+        DBRef sg = DB::create(path);
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        auto col_id = t->get_column_key("id");
+        auto col_vec = t->get_column_key("embedding");
+        CHECK(t->has_vector_index(col_vec));
+
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(target), 5);
+        CHECK_EQUAL(5, v.size());
+        CHECK_EQUAL(target, v[0].get<Int>(col_id));
+
+        // Composed with a regular query: target excluded, every result satisfies the predicate.
+        TableView v2 = t->where().less(col_id, target).find_all();
+        v2.knnsearch(col_vec, knn_test_vec(target), 5);
+        CHECK_EQUAL(5, v2.size());
+        for (size_t i = 0; i < v2.size(); ++i)
+            CHECK(v2[i].get<Int>(col_id) < target);
+    }
+}
+
 #endif // TEST_TABLE

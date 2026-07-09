@@ -41,6 +41,7 @@ set(BARQ_SOURCES
     impl/simulated_failure.cpp
     impl/transact_log.cpp
     index_string.cpp
+    index_vector.cpp
     link_translator.cpp
     list.cpp
     node.cpp
@@ -161,6 +162,7 @@ set(BARQ_INSTALL_HEADERS
     handover_defs.hpp
     history.hpp
     index_string.hpp
+    index_vector.hpp
     keys.hpp
     list.hpp
     mixed.hpp

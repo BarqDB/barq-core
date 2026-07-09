@@ -56,6 +56,7 @@ struct GlobalKey;
 class Group;
 class LinkChain;
 class SearchIndex;
+class VectorIndex;
 class SortDescriptor;
 class StringIndex;
 class Subexpr;
@@ -247,6 +248,12 @@ public:
         add_search_index(col_key, IndexType::Fulltext);
     }
     void remove_search_index(ColKey col_key);
+
+    /// Vector (HNSW) search index over a list-of-floats column. Persisted in the
+    /// database file and purely local (never written to sync changesets).
+    void add_vector_index(ColKey col_key);
+    bool has_vector_index(ColKey col_key) const noexcept;
+    VectorIndex* get_vector_index(ColKey col_key) const noexcept;
 
     void enumerate_string_column(ColKey col_key);
     bool is_enumerated(ColKey col_key) const noexcept;
@@ -732,6 +739,8 @@ private:
     Array m_opposite_table;                    // 7th slot in m_top
     Array m_opposite_column;                   // 8th slot in m_top
     std::vector<std::unique_ptr<SearchIndex>> m_index_accessors;
+    Array m_vector_index_refs; // optional 15th slot in m_top, only present when a vector index exists
+    std::vector<std::unique_ptr<VectorIndex>> m_vector_index_accessors;
     ColKey m_primary_key_col;
     Replication* const* m_repl;
     static Replication* g_dummy_replication;
@@ -782,6 +791,7 @@ private:
     ColKey do_insert_root_column(ColKey col_key, ColumnType, StringData name, DataType key_type = DataType(0));
     void do_erase_root_column(ColKey col_key);
     void do_add_search_index(ColKey col_key, IndexType type);
+    void do_add_vector_index(ColKey col_key);
 
     bool has_any_embedded_objects();
     void set_opposite_column(ColKey col_key, TableKey opposite_table, ColKey opposite_column);
@@ -842,6 +852,7 @@ private:
     /// table.
     void refresh_accessor_tree();
     void refresh_index_accessors();
+    void refresh_vector_index_accessors();
     void refresh_content_version();
     void flush_for_commit();
 
@@ -873,6 +884,9 @@ private:
     // flags contents: bit 0-1 - table type
     static constexpr int top_position_for_tombstones = 13;
     static constexpr int top_array_size = 14;
+    // Optional slot appended lazily on tables that carry a vector index, so default
+    // tables stay byte-compatible with the base (14-slot) file format.
+    static constexpr int top_position_for_vector_indexes = 14;
 
     enum { s_collision_map_lo = 0, s_collision_map_hi = 1, s_collision_map_local_id = 2, s_collision_map_num_slots };
 

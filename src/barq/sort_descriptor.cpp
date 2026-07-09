@@ -18,6 +18,7 @@
 
 #include <barq/sort_descriptor.hpp>
 #include <barq/table.hpp>
+#include <barq/index_vector.hpp>
 #include <barq/table_view.hpp>
 #include <barq/db.hpp>
 #include <barq/util/assert.hpp>
@@ -801,6 +802,21 @@ void SemanticSearchDescriptor::execute(const Table& table, KeyValues& key_values
         return;
     }
 
+    // If a persisted vector index exists on this column, use it — it survives reopen
+    // without a rebuild and is maintained through the table.
+    if (VectorIndex* vindex = table.get_vector_index(m_column)) {
+        std::unordered_set<uint64_t> cand;
+        cand.reserve(candidates);
+        for (size_t i = 0; i < candidates; ++i)
+            cand.insert(uint64_t(key_values.get(i).value));
+        std::vector<ObjKey> ordered = vindex->search(table, m_query_data, m_k, cand);
+        key_values.clear();
+        for (ObjKey key : ordered)
+            key_values.add(key);
+        return;
+    }
+
+    // Otherwise fall back to an ad-hoc in-memory graph (no persisted index required).
     // Only objects that passed the preceding query are eligible neighbours.
     std::unordered_set<hnswlib::labeltype> allowed;
     allowed.reserve(candidates);
