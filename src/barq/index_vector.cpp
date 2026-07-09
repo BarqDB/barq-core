@@ -18,12 +18,12 @@
 
 #include <barq/index_vector.hpp>
 
-#include <barq/array_blob.hpp>
 #include <barq/list.hpp>
 #include <barq/table.hpp>
 
 #include <algorithm>
-#include <limits>
+#include <cstring>
+#include <mutex>
 #include <sstream>
 
 // hnswlib is vendored third-party (Apache 2.0); silence its internal warnings.
@@ -44,24 +44,29 @@ using namespace barq;
 
 namespace {
 
-// Layout of the container (m_top, type_HasRefs):
-constexpr size_t s_meta_slot = 0;   // -> Array(type_Normal) of int64 metadata
-constexpr size_t s_chunks_slot = 1; // -> Array(type_HasRefs) of ArrayBlob refs
+// Blob layout: a fixed header of uint64 fields, then the serialized hnswlib graph.
+constexpr size_t s_hdr_magic = 0;
+constexpr size_t s_hdr_format = 1;
+constexpr size_t s_hdr_dim = 2;
+constexpr size_t s_hdr_count = 3;
+constexpr size_t s_hdr_rows = 4;
+constexpr size_t s_hdr_fields = 5;
+constexpr size_t s_hdr_bytes = s_hdr_fields * sizeof(uint64_t);
+constexpr uint64_t s_magic = 0x42'41'52'51'56'45'43'31ULL; // "BARQVEC1"
+constexpr uint64_t s_format = 1;
 
-// Metadata array slots:
-constexpr size_t s_meta_format = 0;
-constexpr size_t s_meta_dim = 1;
-constexpr size_t s_meta_count = 2; // number of vectors in the persisted graph
-constexpr size_t s_meta_rows = 3;  // table row count when the graph was built (staleness check)
+// Serialize a graph is capped to a single ArrayBlob node; larger indexes would need a
+// chunked/big-blob store (a later refinement). Guard against silently truncating.
+constexpr size_t s_max_blob = ArrayBlob::max_binary_size;
 
-constexpr int64_t s_format_version = 1;
-constexpr size_t s_chunk_bytes = 8 * 1024 * 1024; // keep each blob under the single-node blob cap
+// The index-cache graph operations are serialized; the in-memory graph is a lazily
+// (re)built cache shared by whichever thread queries the column.
+std::mutex g_vector_index_mutex;
 
 } // anonymous namespace
 
-// The in-memory graph. Kept behind a PIMPL so hnswlib stays out of the header.
-// m_space must outlive m_hnsw (the graph captures the space's distance-func param),
-// so declaration order matters here.
+// The in-memory graph. m_space must outlive m_hnsw (the graph captures the space's
+// distance-func param), so declaration order matters.
 struct VectorIndex::Graph {
     std::unique_ptr<hnswlib::InnerProductSpace> space;
     std::unique_ptr<hnswlib::HierarchicalNSW<float>> hnsw;
@@ -69,61 +74,50 @@ struct VectorIndex::Graph {
 
 VectorIndex::VectorIndex(ColKey column, Allocator& alloc)
     : m_column(column)
-    , m_top(alloc)
+    , m_blob(alloc)
 {
-    m_top.create(Array::type_HasRefs);
-
-    Array meta(alloc);
-    meta.create(Array::type_Normal);
-    meta.add(s_format_version);
-    meta.add(0); // dim
-    meta.add(0); // count
-    meta.add(0); // built content version
-    m_top.add(from_ref(meta.get_ref()));
-
-    Array chunks(alloc);
-    chunks.create(Array::type_HasRefs);
-    m_top.add(from_ref(chunks.get_ref()));
+    m_blob.create(); // empty blob (no header yet -> count()==0 means "not built")
 }
 
 VectorIndex::VectorIndex(ref_type ref, ArrayParent* parent, size_t ndx_in_parent, ColKey column, Allocator& alloc)
     : m_column(column)
-    , m_top(alloc)
+    , m_blob(alloc)
 {
-    m_top.init_from_ref(ref);
-    m_top.set_parent(parent, ndx_in_parent);
+    m_blob.init_from_ref(ref);
+    m_blob.set_parent(parent, ndx_in_parent);
 }
 
 VectorIndex::~VectorIndex() = default;
 
 Allocator& VectorIndex::get_alloc() const noexcept
 {
-    return m_top.get_alloc();
+    return m_blob.get_alloc();
 }
 
 void VectorIndex::destroy() noexcept
 {
-    m_top.destroy_deep();
+    m_blob.destroy_deep();
 }
 
 bool VectorIndex::is_attached() const noexcept
 {
-    return m_top.is_attached();
+    return m_blob.is_attached();
 }
 
 void VectorIndex::set_parent(ArrayParent* parent, size_t ndx_in_parent) noexcept
 {
-    m_top.set_parent(parent, ndx_in_parent);
+    m_blob.set_parent(parent, ndx_in_parent);
 }
 
 size_t VectorIndex::get_ndx_in_parent() const noexcept
 {
-    return m_top.get_ndx_in_parent();
+    return m_blob.get_ndx_in_parent();
 }
 
 void VectorIndex::update_from_parent() noexcept
 {
-    m_top.init_from_parent();
+    std::lock_guard<std::mutex> lock(g_vector_index_mutex);
+    m_blob.init_from_parent();
     m_graph.reset();
     m_graph_version = uint64_t(-1);
     m_tried_load = false;
@@ -131,9 +125,8 @@ void VectorIndex::update_from_parent() noexcept
 
 void VectorIndex::refresh_accessor_tree()
 {
-    m_top.init_from_parent();
-    // The container may have advanced to a new version; drop the cached graph and
-    // re-attempt loading the persisted blob on the next query.
+    std::lock_guard<std::mutex> lock(g_vector_index_mutex);
+    m_blob.init_from_parent();
     m_graph.reset();
     m_graph_version = uint64_t(-1);
     m_tried_load = false;
@@ -141,33 +134,36 @@ void VectorIndex::refresh_accessor_tree()
 
 ref_type VectorIndex::get_ref() const noexcept
 {
-    return m_top.get_ref();
+    return m_blob.get_ref();
+}
+
+uint64_t VectorIndex::header_field(size_t index) const
+{
+    size_t sz = m_blob.is_attached() ? m_blob.size() : 0;
+    if (sz < s_hdr_bytes)
+        return 0;
+    uint64_t v = 0;
+    std::memcpy(&v, m_blob.get(0) + index * sizeof(uint64_t), sizeof(uint64_t));
+    return v;
 }
 
 size_t VectorIndex::dim() const
 {
-    Array meta(m_top.get_alloc());
-    meta.init_from_ref(m_top.get_as_ref(s_meta_slot));
-    return size_t(meta.get(s_meta_dim));
+    return size_t(header_field(s_hdr_dim));
 }
 
 size_t VectorIndex::count() const
 {
-    Array meta(m_top.get_alloc());
-    meta.init_from_ref(m_top.get_as_ref(s_meta_slot));
-    return size_t(meta.get(s_meta_count));
+    return size_t(header_field(s_hdr_count));
 }
 
 size_t VectorIndex::stored_row_count() const
 {
-    Array meta(m_top.get_alloc());
-    meta.init_from_ref(m_top.get_as_ref(s_meta_slot));
-    return size_t(meta.get(s_meta_rows));
+    return size_t(header_field(s_hdr_rows));
 }
 
 void VectorIndex::build_in_memory(const Table& table)
 {
-    // Determine the vector dimension from the first non-empty list.
     size_t dim = 0;
     for (auto obj : table) {
         auto lst = obj.get_list<float>(m_column);
@@ -191,7 +187,7 @@ void VectorIndex::build_in_memory(const Table& table)
     for (auto obj : table) {
         auto lst = obj.get_list<float>(m_column);
         if (lst.size() != dim)
-            continue; // only index vectors of the index's dimension
+            continue;
         for (size_t i = 0; i < dim; ++i)
             buf[i] = lst.get(i);
         g->hnsw->addPoint(buf.data(), hnswlib::labeltype(obj.get_key().value));
@@ -199,37 +195,23 @@ void VectorIndex::build_in_memory(const Table& table)
     m_graph = std::move(g);
 }
 
-void VectorIndex::read_all_bytes(std::string& out) const
-{
-    Allocator& alloc = m_top.get_alloc();
-    Array chunks(alloc);
-    chunks.init_from_ref(m_top.get_as_ref(s_chunks_slot));
-    for (size_t i = 0; i < chunks.size(); ++i) {
-        ref_type r = chunks.get_as_ref(i);
-        if (!r)
-            continue;
-        ArrayBlob blob(alloc);
-        blob.init_from_ref(r);
-        out.append(blob.get(0), blob.size());
-    }
-}
-
 bool VectorIndex::load_from_blob()
 {
-    Allocator& alloc = m_top.get_alloc();
-    Array meta(alloc);
-    meta.init_from_ref(m_top.get_as_ref(s_meta_slot));
-    size_t dim = size_t(meta.get(s_meta_dim));
-    size_t count = size_t(meta.get(s_meta_count));
+    size_t sz = m_blob.is_attached() ? m_blob.size() : 0;
+    if (sz < s_hdr_bytes)
+        return false;
+    std::string all(m_blob.get(0), sz);
+
+    uint64_t hdr[s_hdr_fields];
+    std::memcpy(hdr, all.data(), s_hdr_bytes);
+    if (hdr[s_hdr_magic] != s_magic)
+        return false;
+    size_t dim = size_t(hdr[s_hdr_dim]);
+    size_t count = size_t(hdr[s_hdr_count]);
     if (dim == 0 || count == 0)
         return false;
 
-    std::string bytes;
-    read_all_bytes(bytes);
-    if (bytes.empty())
-        return false;
-
-    std::istringstream iss(bytes, std::ios::binary);
+    std::istringstream iss(all.substr(s_hdr_bytes), std::ios::binary);
     auto g = std::make_unique<Graph>();
     g->space = std::make_unique<hnswlib::InnerProductSpace>(dim);
     g->hnsw = std::make_unique<hnswlib::HierarchicalNSW<float>>(g->space.get());
@@ -241,70 +223,119 @@ bool VectorIndex::load_from_blob()
 
 void VectorIndex::store_to_blob(size_t row_count)
 {
-    Allocator& alloc = m_top.get_alloc();
-
-    std::string bytes;
-    size_t count = 0;
+    std::string graph_bytes;
+    uint64_t count = 0;
     if (m_graph && m_graph->hnsw) {
         std::ostringstream oss(std::ios::binary);
         m_graph->hnsw->saveIndex(oss);
-        bytes = oss.str();
+        graph_bytes = oss.str();
         count = m_graph->hnsw->cur_element_count;
     }
 
-    // Replace the chunk subtree wholesale.
-    if (ref_type old_chunks = m_top.get_as_ref(s_chunks_slot))
-        Array::destroy_deep(old_chunks, alloc);
-    Array chunks(alloc);
-    chunks.create(Array::type_HasRefs);
-    size_t off = 0;
-    while (off < bytes.size()) {
-        size_t n = std::min(s_chunk_bytes, bytes.size() - off);
-        ArrayBlob blob(alloc);
-        blob.create();
-        blob.add(bytes.data() + off, n);
-        chunks.add(from_ref(blob.get_ref()));
-        off += n;
-    }
-    m_top.set_as_ref(s_chunks_slot, chunks.get_ref());
+    uint64_t hdr[s_hdr_fields];
+    hdr[s_hdr_magic] = s_magic;
+    hdr[s_hdr_format] = s_format;
+    hdr[s_hdr_dim] = uint64_t(m_graph_dim);
+    hdr[s_hdr_count] = count;
+    hdr[s_hdr_rows] = uint64_t(row_count);
 
-    // Update metadata (COW propagates back through the parent chain).
-    Array meta(alloc);
-    meta.set_parent(&m_top, s_meta_slot);
-    meta.init_from_parent();
-    meta.set(s_meta_dim, int64_t(m_graph_dim));
-    meta.set(s_meta_count, int64_t(count));
-    meta.set(s_meta_rows, int64_t(row_count));
+    std::string content;
+    content.reserve(s_hdr_bytes + graph_bytes.size());
+    content.append(reinterpret_cast<const char*>(hdr), s_hdr_bytes);
+    content.append(graph_bytes);
+
+    if (content.size() > s_max_blob) {
+        // A single ArrayBlob node cannot hold this yet; leave the index unbuilt rather
+        // than corrupt the store. (Chunked/big-blob storage is a later refinement.)
+        if (m_blob.size() > 0)
+            m_blob.erase(0, m_blob.size());
+        return;
+    }
+
+    if (m_blob.size() > 0)
+        m_blob.erase(0, m_blob.size());
+    m_blob.add(content.data(), content.size());
 }
 
 void VectorIndex::ensure_graph(const Table& table)
 {
     uint64_t cur = table.get_content_version();
-    if (m_graph && m_graph_version == cur)
+    if (m_graph && m_graph->hnsw && m_graph_version == cur)
         return;
-    // On first use this session, try the persisted graph. It is valid as long as the
-    // table's row count is unchanged since the graph was built — a cheap check that
-    // catches inserts and deletes. (In-place vector edits keeping the same row count
-    // require an explicit rebuild; incremental maintenance is a later stage.)
-    if (!m_tried_load) {
+
+    if (!m_graph && !m_tried_load) {
         m_tried_load = true;
-        if (count() > 0 && stored_row_count() == table.size() && load_from_blob()) {
-            m_graph_version = cur;
-            return;
-        }
-        m_graph.reset();
+        if (count() > 0)
+            load_from_blob();
     }
-    // Data changed within this session (or no valid persisted graph): rebuild in memory.
-    build_in_memory(table);
+
+    if (!m_graph || !m_graph->hnsw) {
+        build_in_memory(table);
+        m_graph_version = cur;
+        return;
+    }
+
+    // Reconcile the loaded/cached graph with the current data (add new, soft-delete gone).
+    sync_in_memory(table);
     m_graph_version = cur;
+}
+
+bool VectorIndex::sync_in_memory(const Table& table)
+{
+    hnswlib::HierarchicalNSW<float>& hnsw = *m_graph->hnsw;
+    const size_t dim = m_graph_dim;
+    if (dim == 0)
+        return false;
+
+    std::vector<float> buf(dim);
+    std::unordered_set<hnswlib::labeltype> current;
+    bool changed = false;
+
+    for (auto obj : table) {
+        auto lst = obj.get_list<float>(m_column);
+        if (lst.size() != dim)
+            continue;
+        hnswlib::labeltype key = hnswlib::labeltype(obj.get_key().value);
+        current.insert(key);
+        auto it = hnsw.label_lookup_.find(key);
+        if (it == hnsw.label_lookup_.end()) {
+            if (hnsw.cur_element_count >= hnsw.max_elements_)
+                hnsw.resizeIndex(hnsw.max_elements_ * 2 + 16);
+            for (size_t i = 0; i < dim; ++i)
+                buf[i] = lst.get(i);
+            hnsw.addPoint(buf.data(), key);
+            changed = true;
+        }
+        else if (hnsw.isMarkedDeleted(it->second)) {
+            hnsw.unmarkDelete(key);
+            changed = true;
+        }
+    }
+
+    std::vector<hnswlib::labeltype> gone;
+    for (const auto& kv : hnsw.label_lookup_) {
+        if (!current.count(kv.first) && !hnsw.isMarkedDeleted(kv.second))
+            gone.push_back(kv.first);
+    }
+    for (hnswlib::labeltype label : gone) {
+        hnsw.markDelete(label);
+        changed = true;
+    }
+
+    if (hnsw.num_deleted_ > 0 && hnsw.num_deleted_ * 2 >= hnsw.cur_element_count) {
+        build_in_memory(table);
+        changed = true;
+    }
+    return changed;
 }
 
 void VectorIndex::rebuild(const Table& table)
 {
+    std::lock_guard<std::mutex> lock(g_vector_index_mutex);
     build_in_memory(table);
     store_to_blob(table.size());
     m_graph_version = table.get_content_version();
-    m_tried_load = true; // the freshly built graph is already in memory
+    m_tried_load = true;
 }
 
 std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<float>& query, size_t k,
@@ -314,6 +345,7 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
     if (query.empty() || candidates.empty())
         return out;
 
+    std::lock_guard<std::mutex> lock(g_vector_index_mutex);
     ensure_graph(table);
     if (!m_graph || !m_graph->hnsw || m_graph->hnsw->cur_element_count == 0)
         return out;

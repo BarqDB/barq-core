@@ -739,7 +739,8 @@ private:
     Array m_opposite_table;                    // 7th slot in m_top
     Array m_opposite_column;                   // 8th slot in m_top
     std::vector<std::unique_ptr<SearchIndex>> m_index_accessors;
-    Array m_vector_index_refs; // optional 15th slot in m_top, only present when a vector index exists
+    // Vector indexes reuse the per-column search-index ref slot (m_index_refs); a column
+    // is either general/fulltext (StringIndex) or vector (VectorIndex), never both.
     std::vector<std::unique_ptr<VectorIndex>> m_vector_index_accessors;
     ColKey m_primary_key_col;
     Replication* const* m_repl;
@@ -884,9 +885,6 @@ private:
     // flags contents: bit 0-1 - table type
     static constexpr int top_position_for_tombstones = 13;
     static constexpr int top_array_size = 14;
-    // Optional slot appended lazily on tables that carry a vector index, so default
-    // tables stay byte-compatible with the base (14-slot) file format.
-    static constexpr int top_position_for_vector_indexes = 14;
 
     enum { s_collision_map_lo = 0, s_collision_map_hi = 1, s_collision_map_local_id = 2, s_collision_map_num_slots };
 

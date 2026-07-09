@@ -357,7 +357,6 @@ Table::Table(Allocator& alloc)
     , m_index_refs(m_alloc)
     , m_opposite_table(m_alloc)
     , m_opposite_column(m_alloc)
-    , m_vector_index_refs(m_alloc)
     , m_repl(&g_dummy_replication)
     , m_own_ref(this, alloc.get_instance_version())
 {
@@ -380,7 +379,6 @@ Table::Table(Replication* const* repl, Allocator& alloc)
     , m_index_refs(m_alloc)
     , m_opposite_table(m_alloc)
     , m_opposite_column(m_alloc)
-    , m_vector_index_refs(m_alloc)
     , m_repl(repl)
     , m_own_ref(this, alloc.get_instance_version())
 {
@@ -1044,12 +1042,6 @@ ColKey Table::do_insert_root_column(ColKey col_key, ColumnType type, StringData 
     else {
         m_index_refs.set(col_ndx, 0);
     }
-    if (m_vector_index_refs.is_attached()) {
-        if (col_ndx == m_vector_index_refs.size())
-            m_vector_index_refs.insert(col_ndx, 0);
-        else
-            m_vector_index_refs.set(col_ndx, 0);
-    }
     BARQ_ASSERT(col_ndx <= m_opposite_table.size());
     if (col_ndx == m_opposite_table.size()) {
         // m_opposite_table and m_opposite_column are always resized together!
@@ -1082,14 +1074,9 @@ void Table::do_erase_root_column(ColKey col_key)
         m_index_refs.set(col_ndx, 0);
         m_index_accessors[col_ndx].reset();
     }
-    if (m_vector_index_refs.is_attached() && col_ndx < m_vector_index_refs.size()) {
-        if (ref_type vref = m_vector_index_refs.get_as_ref(col_ndx)) {
-            Array::destroy_deep(vref, m_vector_index_refs.get_alloc());
-            m_vector_index_refs.set(col_ndx, 0);
-        }
-        if (col_ndx < m_vector_index_accessors.size())
-            m_vector_index_accessors[col_ndx].reset();
-    }
+    // The vector index (if any) shares m_index_refs[col_ndx], destroyed just above.
+    if (col_ndx < m_vector_index_accessors.size())
+        m_vector_index_accessors[col_ndx].reset();
     m_opposite_table.set(col_ndx, TableKey().value);
     m_opposite_column.set(col_ndx, ColKey().value);
     m_index_accessors[col_ndx] = nullptr;
@@ -2177,22 +2164,27 @@ void Table::refresh_index_accessors()
         ref_type ref = m_index_refs.get_as_ref(col_ndx);
 
         if (ref == 0) {
-            // accessor drop
+            // accessor drop (read no spec attr for unindexed columns — some have no attr slot)
             m_index_accessors[col_ndx].reset();
+            continue;
         }
-        else {
-            auto attr = m_spec.get_column_attr(m_leaf_ndx2spec_ndx[col_ndx]);
-            bool fulltext = attr.test(col_attr_FullText_Indexed);
-            auto col_key = m_leaf_ndx2colkey[col_ndx];
-            ClusterColumn virtual_col(&m_clusters, col_key, fulltext ? IndexType::Fulltext : IndexType::General);
+        auto attr = m_spec.get_column_attr(m_leaf_ndx2spec_ndx[col_ndx]);
+        if (attr.test(col_attr_Vector_Indexed)) {
+            // m_index_refs[col_ndx] holds a vector index blob, not a StringIndex tree;
+            // it is (re)built by refresh_vector_index_accessors below.
+            m_index_accessors[col_ndx].reset();
+            continue;
+        }
+        bool fulltext = attr.test(col_attr_FullText_Indexed);
+        auto col_key = m_leaf_ndx2colkey[col_ndx];
+        ClusterColumn virtual_col(&m_clusters, col_key, fulltext ? IndexType::Fulltext : IndexType::General);
 
-            if (m_index_accessors[col_ndx]) { // still there, refresh:
-                m_index_accessors[col_ndx]->refresh_accessor_tree(virtual_col);
-            }
-            else { // new index!
-                m_index_accessors[col_ndx] =
-                    std::make_unique<StringIndex>(ref, &m_index_refs, col_ndx, virtual_col, get_alloc());
-            }
+        if (m_index_accessors[col_ndx]) { // still there, refresh:
+            m_index_accessors[col_ndx]->refresh_accessor_tree(virtual_col);
+        }
+        else { // new index!
+            m_index_accessors[col_ndx] =
+                std::make_unique<StringIndex>(ref, &m_index_refs, col_ndx, virtual_col, get_alloc());
         }
     }
 
@@ -2201,28 +2193,21 @@ void Table::refresh_index_accessors()
 
 void Table::refresh_vector_index_accessors()
 {
-    bool has_slot = m_top.size() > size_t(top_position_for_vector_indexes) &&
-                    m_top.get_as_ref(top_position_for_vector_indexes) != 0;
-    if (!has_slot) {
-        m_vector_index_accessors.clear();
-        return;
-    }
-    m_vector_index_refs.set_parent(&m_top, top_position_for_vector_indexes);
-    m_vector_index_refs.init_from_parent();
-
     size_t col_ndx_end = m_leaf_ndx2colkey.size();
     m_vector_index_accessors.resize(col_ndx_end);
     for (size_t col_ndx = 0; col_ndx < col_ndx_end; ++col_ndx) {
-        ref_type ref = (col_ndx < m_vector_index_refs.size()) ? m_vector_index_refs.get_as_ref(col_ndx) : 0;
-        if (ref == 0) {
+        ref_type ref = (col_ndx < m_index_refs.size()) ? m_index_refs.get_as_ref(col_ndx) : 0;
+        // Only indexed columns (ref != 0) have a meaningful spec attribute; reading the
+        // attr for unindexed/backlink columns would index past the spec's attr array.
+        if (ref == 0 || !m_spec.get_column_attr(m_leaf_ndx2spec_ndx[col_ndx]).test(col_attr_Vector_Indexed)) {
             m_vector_index_accessors[col_ndx].reset();
         }
         else if (m_vector_index_accessors[col_ndx]) {
             m_vector_index_accessors[col_ndx]->refresh_accessor_tree();
         }
         else {
-            m_vector_index_accessors[col_ndx] = std::make_unique<VectorIndex>(
-                ref, &m_vector_index_refs, col_ndx, m_leaf_ndx2colkey[col_ndx], get_alloc());
+            m_vector_index_accessors[col_ndx] =
+                std::make_unique<VectorIndex>(ref, &m_index_refs, col_ndx, m_leaf_ndx2colkey[col_ndx], get_alloc());
         }
     }
 }
@@ -2230,38 +2215,18 @@ void Table::refresh_vector_index_accessors()
 void Table::do_add_vector_index(ColKey col_key)
 {
     size_t column_ndx = col_key.get_index().val;
-
-    // Lazily append the optional top-array slot and create the per-column refs array.
-    while (m_top.size() <= size_t(top_position_for_vector_indexes))
-        m_top.add(0);
-    if (m_top.get_as_ref(top_position_for_vector_indexes) == 0) {
-        bool context_flag = false;
-        size_t nb_columns = m_spec.get_column_count();
-        MemRef mem = Array::create_array(Array::type_HasRefs, context_flag, nb_columns, 0, m_top.get_alloc());
-        m_vector_index_refs.set_parent(&m_top, top_position_for_vector_indexes);
-        m_vector_index_refs.init_from_mem(mem);
-        m_vector_index_refs.update_parent();
-        m_vector_index_accessors.resize(nb_columns);
-    }
-    else if (!m_vector_index_refs.is_attached()) {
-        m_vector_index_refs.set_parent(&m_top, top_position_for_vector_indexes);
-        m_vector_index_refs.init_from_parent();
-        m_vector_index_accessors.resize(m_vector_index_refs.size());
-    }
-
-    while (m_vector_index_refs.size() <= column_ndx)
-        m_vector_index_refs.add(0);
     if (m_vector_index_accessors.size() <= column_ndx)
         m_vector_index_accessors.resize(column_ndx + 1);
-
     if (m_vector_index_accessors[column_ndx])
         return; // already indexed
 
+    // Reuse the per-column search-index ref slot (m_index_refs) — no top-array growth.
+    // A list-of-float column never carries a StringIndex, so the slot is free.
     auto index = std::make_unique<VectorIndex>(col_key, get_alloc());
-    index->set_parent(&m_vector_index_refs, column_ndx);
-    m_vector_index_refs.set(column_ndx, index->get_ref());
+    index->set_parent(&m_index_refs, column_ndx);
+    m_index_refs.set(column_ndx, index->get_ref());
     index->rebuild(*this); // build the graph from the current data and persist it
-    m_vector_index_refs.set(column_ndx, index->get_ref());
+    m_index_refs.set(column_ndx, index->get_ref());
     m_vector_index_accessors[column_ndx] = std::move(index);
 }
 

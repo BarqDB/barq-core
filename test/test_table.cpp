@@ -5438,4 +5438,85 @@ TEST(Table_VectorIndexPersistence)
     }
 }
 
+// Stage 2 incremental maintenance: after the index is built, deleting and inserting
+// objects must be reflected without a full rebuild, and must survive a reopen.
+TEST(Table_VectorIndexIncremental)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 400;
+    const int target = 111; // will be deleted
+    const int newid = 10000; // will be inserted (unique vector, no collision with 0..N)
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec);
+        wt.commit();
+    }
+
+    // Mutate: delete `target`, insert `newid`.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        for (Obj o : *t) {
+            if (o.get<Int>(col_id) == target) {
+                t->remove_object(o.get_key());
+                break;
+            }
+        }
+        Obj o = t->create_object();
+        o.set(col_id, newid);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(newid))
+            lst.add(x);
+        wt.commit();
+    }
+
+    // The index reconciles incrementally: the deleted object is gone, the new one is found.
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView vt = t->where().find_all();
+        vt.knnsearch(col_vec, knn_test_vec(target), 5);
+        CHECK_EQUAL(5, vt.size());
+        for (size_t i = 0; i < vt.size(); ++i)
+            CHECK_NOT_EQUAL(target, vt[i].get<Int>(col_id));
+
+        TableView vn = t->where().find_all();
+        vn.knnsearch(col_vec, knn_test_vec(newid), 1);
+        CHECK_EQUAL(1, vn.size());
+        CHECK_EQUAL(newid, vn[0].get<Int>(col_id));
+    }
+
+    // Reopen from disk: base graph loads and re-syncs to the committed data.
+    {
+        DBRef sg2 = DB::create(path);
+        ReadTransaction rt(sg2);
+        ConstTableRef t = rt.get_table("vectors");
+        auto cid = t->get_column_key("id");
+        auto cvec = t->get_column_key("embedding");
+        TableView vn = t->where().find_all();
+        vn.knnsearch(cvec, knn_test_vec(newid), 1);
+        CHECK_EQUAL(1, vn.size());
+        CHECK_EQUAL(newid, vn[0].get<Int>(cid));
+
+        TableView vt = t->where().find_all();
+        vt.knnsearch(cvec, knn_test_vec(target), 5);
+        CHECK_EQUAL(5, vt.size());
+        for (size_t i = 0; i < vt.size(); ++i)
+            CHECK_NOT_EQUAL(target, vt[i].get<Int>(cid));
+    }
+}
+
 #endif // TEST_TABLE
