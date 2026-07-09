@@ -29,7 +29,7 @@ function(barq_acquire_dependency dep_name dep_version out_dep_cmake)
     endif()
 
     if(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/${dep_name}/include.cmake)
-        set(DEP_URL "https://github.com/BarqDB/barq-core/releases/download/dependencies/${dep_name}-${dep_version}-${_target_architecture_${CMAKE_SYSTEM_NAME}_${_target_architecture}}-${_target_platform_name_${CMAKE_SYSTEM_NAME}}.tar.gz")
+        set(DEP_URL "https://static.barqdb.space/downloads/dependencies/${dep_name}/${dep_version}/${dep_name}-${dep_version}-${_target_architecture_${CMAKE_SYSTEM_NAME}_${_target_architecture}}-${_target_platform_name_${CMAKE_SYSTEM_NAME}}.tar.gz")
         message(STATUS "Getting ${DEP_URL}...")
         file(DOWNLOAD "${DEP_URL}" "${CMAKE_CURRENT_BINARY_DIR}/${dep_name}/${dep_name}.tar.gz" STATUS download_status)
 
