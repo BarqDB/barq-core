@@ -32,6 +32,22 @@ namespace barq {
 
 class Table;
 
+/// Distance metric for a vector index.
+enum class VectorMetric : uint8_t {
+    InnerProduct = 0, // dot product (higher = closer); embeddings pre-normalized upstream
+    L2 = 1,           // squared euclidean distance (lower = closer)
+    Cosine = 2,       // inner product on vectors normalized at insert/query time
+};
+
+/// Build/search parameters for a vector index. Persisted with the index, so a
+/// reopened index keeps the metric and graph shape it was built with.
+struct VectorIndexConfig {
+    VectorMetric metric = VectorMetric::InnerProduct;
+    size_t m = 16;                // HNSW out-degree (graph connectivity)
+    size_t ef_construction = 200; // build-time beam width (higher = better graph, slower build)
+    size_t ef_search = 64;        // query-time beam width floor (higher = better recall, slower query)
+};
+
 /// A persisted approximate-nearest-neighbour (HNSW) index over a list-of-floats
 /// property. It is a standalone accessor whose single on-disk node is an ArrayBlob
 /// holding a small fixed header (dim, element count, table row count at build time)
@@ -44,10 +60,15 @@ class Table;
 class VectorIndex {
 public:
     // Create a fresh (empty) vector index.
-    VectorIndex(ColKey column, Allocator& alloc);
-    // Reattach to a persisted blob.
+    VectorIndex(ColKey column, Allocator& alloc, const VectorIndexConfig& config = {});
+    // Reattach to a persisted blob (config is read back from the persisted header).
     VectorIndex(ref_type ref, ArrayParent* parent, size_t ndx_in_parent, ColKey column, Allocator& alloc);
     ~VectorIndex();
+
+    const VectorIndexConfig& config() const noexcept
+    {
+        return m_config;
+    }
 
     // Accessor concept (mirrors SearchIndex):
     Allocator& get_alloc() const noexcept;
@@ -86,9 +107,11 @@ private:
     bool load_from_blob();
     void store_to_blob(size_t row_count);
     uint64_t header_field(size_t index) const; // read a header field, 0 if not present
+    void load_config_from_header();            // restore m_config from a persisted header, if any
 
     ColKey m_column;
     ArrayBlob m_blob; // single on-disk node: [header][serialized hnswlib graph]
+    VectorIndexConfig m_config;
     std::unique_ptr<Graph> m_graph;
     uint64_t m_graph_version = uint64_t(-1);
     size_t m_graph_dim = 0;

@@ -57,6 +57,7 @@ class Group;
 class LinkChain;
 class SearchIndex;
 class VectorIndex;
+struct VectorIndexConfig;
 class SortDescriptor;
 class StringIndex;
 class Subexpr;
@@ -251,6 +252,7 @@ public:
 
     /// Vector (HNSW) search index over a list-of-floats column. Persisted in the
     /// database file and purely local (never written to sync changesets).
+    void add_vector_index(ColKey col_key, const VectorIndexConfig& config);
     void add_vector_index(ColKey col_key);
     void remove_vector_index(ColKey col_key);
     /// Re-index from the current data. Use after editing vector values in place —
@@ -796,7 +798,7 @@ private:
     ColKey do_insert_root_column(ColKey col_key, ColumnType, StringData name, DataType key_type = DataType(0));
     void do_erase_root_column(ColKey col_key);
     void do_add_search_index(ColKey col_key, IndexType type);
-    void do_add_vector_index(ColKey col_key);
+    void do_add_vector_index(ColKey col_key, const VectorIndexConfig& config);
 
     bool has_any_embedded_objects();
     void set_opposite_column(ColKey col_key, TableKey opposite_table, ColKey opposite_column);

@@ -2212,7 +2212,7 @@ void Table::refresh_vector_index_accessors()
     }
 }
 
-void Table::do_add_vector_index(ColKey col_key)
+void Table::do_add_vector_index(ColKey col_key, const VectorIndexConfig& config)
 {
     size_t column_ndx = col_key.get_index().val;
     if (m_vector_index_accessors.size() <= column_ndx)
@@ -2222,7 +2222,7 @@ void Table::do_add_vector_index(ColKey col_key)
 
     // Reuse the per-column search-index ref slot (m_index_refs) — no top-array growth.
     // A list-of-float column never carries a StringIndex, so the slot is free.
-    auto index = std::make_unique<VectorIndex>(col_key, get_alloc());
+    auto index = std::make_unique<VectorIndex>(col_key, get_alloc(), config);
     index->set_parent(&m_index_refs, column_ndx);
     m_index_refs.set(column_ndx, index->get_ref());
     index->rebuild(*this); // build the graph from the current data and persist it
@@ -2230,7 +2230,7 @@ void Table::do_add_vector_index(ColKey col_key)
     m_vector_index_accessors[column_ndx] = std::move(index);
 }
 
-void Table::add_vector_index(ColKey col_key)
+void Table::add_vector_index(ColKey col_key, const VectorIndexConfig& config)
 {
     check_column(col_key);
     if (!(col_key.is_list() && col_key.get_type() == col_type_Float)) {
@@ -2243,10 +2243,15 @@ void Table::add_vector_index(ColKey col_key)
     if (attr.test(col_attr_Vector_Indexed))
         return; // already indexed
 
-    do_add_vector_index(col_key);
+    do_add_vector_index(col_key, config);
 
     attr.set(col_attr_Vector_Indexed);
     m_spec.set_column_attr(spec_ndx, attr); // Throws
+}
+
+void Table::add_vector_index(ColKey col_key)
+{
+    add_vector_index(col_key, VectorIndexConfig{});
 }
 
 void Table::remove_vector_index(ColKey col_key)

@@ -22,6 +22,7 @@
 #include <barq/table.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -50,10 +51,27 @@ constexpr size_t s_hdr_format = 1;
 constexpr size_t s_hdr_dim = 2;
 constexpr size_t s_hdr_count = 3;
 constexpr size_t s_hdr_rows = 4;
-constexpr size_t s_hdr_fields = 5;
+constexpr size_t s_hdr_metric = 5;
+constexpr size_t s_hdr_m = 6;
+constexpr size_t s_hdr_efc = 7;
+constexpr size_t s_hdr_efs = 8;
+constexpr size_t s_hdr_fields = 9;
 constexpr size_t s_hdr_bytes = s_hdr_fields * sizeof(uint64_t);
 constexpr uint64_t s_magic = 0x42'41'52'51'56'45'43'31ULL; // "BARQVEC1"
-constexpr uint64_t s_format = 1;
+constexpr uint64_t s_format = 2;
+
+// Normalize in place (cosine metric); zero vectors are left untouched.
+void normalize_vec(float* v, size_t dim)
+{
+    double n = 0;
+    for (size_t i = 0; i < dim; ++i)
+        n += double(v[i]) * double(v[i]);
+    if (n > 0) {
+        float inv = float(1.0 / std::sqrt(n));
+        for (size_t i = 0; i < dim; ++i)
+            v[i] *= inv;
+    }
+}
 
 // Serialize a graph is capped to a single ArrayBlob node; larger indexes would need a
 // chunked/big-blob store (a later refinement). Guard against silently truncating.
@@ -68,13 +86,26 @@ std::mutex g_vector_index_mutex;
 // The in-memory graph. m_space must outlive m_hnsw (the graph captures the space's
 // distance-func param), so declaration order matters.
 struct VectorIndex::Graph {
-    std::unique_ptr<hnswlib::InnerProductSpace> space;
+    std::unique_ptr<hnswlib::SpaceInterface<float>> space;
     std::unique_ptr<hnswlib::HierarchicalNSW<float>> hnsw;
 };
 
-VectorIndex::VectorIndex(ColKey column, Allocator& alloc)
+namespace {
+
+std::unique_ptr<hnswlib::SpaceInterface<float>> make_space(VectorMetric metric, size_t dim)
+{
+    if (metric == VectorMetric::L2)
+        return std::make_unique<hnswlib::L2Space>(dim);
+    // Cosine uses the inner-product space over normalized vectors.
+    return std::make_unique<hnswlib::InnerProductSpace>(dim);
+}
+
+} // anonymous namespace
+
+VectorIndex::VectorIndex(ColKey column, Allocator& alloc, const VectorIndexConfig& config)
     : m_column(column)
     , m_blob(alloc)
+    , m_config(config)
 {
     m_blob.create(); // empty blob (no header yet -> count()==0 means "not built")
 }
@@ -85,6 +116,7 @@ VectorIndex::VectorIndex(ref_type ref, ArrayParent* parent, size_t ndx_in_parent
 {
     m_blob.init_from_ref(ref);
     m_blob.set_parent(parent, ndx_in_parent);
+    load_config_from_header();
 }
 
 VectorIndex::~VectorIndex() = default;
@@ -121,6 +153,7 @@ void VectorIndex::update_from_parent() noexcept
     m_graph.reset();
     m_graph_version = uint64_t(-1);
     m_tried_load = false;
+    load_config_from_header();
 }
 
 void VectorIndex::refresh_accessor_tree()
@@ -130,6 +163,7 @@ void VectorIndex::refresh_accessor_tree()
     m_graph.reset();
     m_graph_version = uint64_t(-1);
     m_tried_load = false;
+    load_config_from_header();
 }
 
 ref_type VectorIndex::get_ref() const noexcept
@@ -162,6 +196,16 @@ size_t VectorIndex::stored_row_count() const
     return size_t(header_field(s_hdr_rows));
 }
 
+void VectorIndex::load_config_from_header()
+{
+    if (header_field(s_hdr_magic) != s_magic || header_field(s_hdr_format) != s_format)
+        return; // never built (or unknown format): keep the current config
+    m_config.metric = VectorMetric(uint8_t(header_field(s_hdr_metric)));
+    m_config.m = size_t(header_field(s_hdr_m));
+    m_config.ef_construction = size_t(header_field(s_hdr_efc));
+    m_config.ef_search = size_t(header_field(s_hdr_efs));
+}
+
 void VectorIndex::build_in_memory(const Table& table)
 {
     size_t dim = 0;
@@ -179,9 +223,10 @@ void VectorIndex::build_in_memory(const Table& table)
     }
 
     auto g = std::make_unique<Graph>();
-    g->space = std::make_unique<hnswlib::InnerProductSpace>(dim);
+    g->space = make_space(m_config.metric, dim);
     size_t capacity = std::max<size_t>(table.size(), 1);
-    g->hnsw = std::make_unique<hnswlib::HierarchicalNSW<float>>(g->space.get(), capacity, 16, 200);
+    g->hnsw = std::make_unique<hnswlib::HierarchicalNSW<float>>(g->space.get(), capacity, m_config.m,
+                                                                m_config.ef_construction);
 
     std::vector<float> buf(dim);
     for (auto obj : table) {
@@ -190,6 +235,8 @@ void VectorIndex::build_in_memory(const Table& table)
             continue;
         for (size_t i = 0; i < dim; ++i)
             buf[i] = lst.get(i);
+        if (m_config.metric == VectorMetric::Cosine)
+            normalize_vec(buf.data(), dim);
         g->hnsw->addPoint(buf.data(), hnswlib::labeltype(obj.get_key().value));
     }
     m_graph = std::move(g);
@@ -204,7 +251,7 @@ bool VectorIndex::load_from_blob()
 
     uint64_t hdr[s_hdr_fields];
     std::memcpy(hdr, all.data(), s_hdr_bytes);
-    if (hdr[s_hdr_magic] != s_magic)
+    if (hdr[s_hdr_magic] != s_magic || hdr[s_hdr_format] != s_format)
         return false;
     size_t dim = size_t(hdr[s_hdr_dim]);
     size_t count = size_t(hdr[s_hdr_count]);
@@ -213,7 +260,7 @@ bool VectorIndex::load_from_blob()
 
     std::istringstream iss(all.substr(s_hdr_bytes), std::ios::binary);
     auto g = std::make_unique<Graph>();
-    g->space = std::make_unique<hnswlib::InnerProductSpace>(dim);
+    g->space = make_space(VectorMetric(uint8_t(hdr[s_hdr_metric])), dim);
     g->hnsw = std::make_unique<hnswlib::HierarchicalNSW<float>>(g->space.get());
     g->hnsw->loadIndex(iss, g->space.get());
     m_graph = std::move(g);
@@ -238,6 +285,10 @@ void VectorIndex::store_to_blob(size_t row_count)
     hdr[s_hdr_dim] = uint64_t(m_graph_dim);
     hdr[s_hdr_count] = count;
     hdr[s_hdr_rows] = uint64_t(row_count);
+    hdr[s_hdr_metric] = uint64_t(m_config.metric);
+    hdr[s_hdr_m] = uint64_t(m_config.m);
+    hdr[s_hdr_efc] = uint64_t(m_config.ef_construction);
+    hdr[s_hdr_efs] = uint64_t(m_config.ef_search);
 
     std::string content;
     content.reserve(s_hdr_bytes + graph_bytes.size());
@@ -303,6 +354,8 @@ bool VectorIndex::sync_in_memory(const Table& table)
                 hnsw.resizeIndex(hnsw.max_elements_ * 2 + 16);
             for (size_t i = 0; i < dim; ++i)
                 buf[i] = lst.get(i);
+            if (m_config.metric == VectorMetric::Cosine)
+                normalize_vec(buf.data(), dim);
             hnsw.addPoint(buf.data(), key);
             changed = true;
         }
@@ -367,8 +420,15 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
     size_t kk = std::min({k, candidates.size(), size_t(m_graph->hnsw->cur_element_count)});
     if (kk == 0)
         return out;
-    m_graph->hnsw->setEf(std::max({kk, candidates.size(), size_t(64)}));
-    for (auto& hit : m_graph->hnsw->searchKnnCloserFirst(query.data(), kk, &filter))
+    m_graph->hnsw->setEf(std::max({kk, candidates.size(), m_config.ef_search}));
+    const float* qdata = query.data();
+    std::vector<float> qnorm;
+    if (m_config.metric == VectorMetric::Cosine) {
+        qnorm = query;
+        normalize_vec(qnorm.data(), qnorm.size());
+        qdata = qnorm.data();
+    }
+    for (auto& hit : m_graph->hnsw->searchKnnCloserFirst(qdata, kk, &filter))
         out.push_back(ObjKey(int64_t(hit.second)));
     return out;
 }

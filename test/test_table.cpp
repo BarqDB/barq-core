@@ -38,6 +38,7 @@ using namespace std::chrono;
 #include <barq/array_string.hpp>
 #include <barq/array_timestamp.hpp>
 #include <barq/index_string.hpp>
+#include <barq/index_vector.hpp>
 
 #include "util/misc.hpp"
 
@@ -5643,6 +5644,113 @@ TEST(Table_VectorIndexRemoveRebuild)
         t->remove_vector_index(col_vec);
         CHECK_THROW(t->rebuild_vector_index(col_vec), IllegalOperation);
         wt.commit();
+    }
+}
+
+// Metric and tuning config: inner-product, L2 and cosine rank differently; the
+// config is persisted with the index and restored on reopen.
+TEST(Table_VectorIndexConfig)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    // Query (1,0). Winners: IP -> id 0 (big vector), L2 -> id 1 (nearest point),
+    // Cosine -> id 3 (tiny but perfectly aligned).
+    std::vector<std::vector<float>> data = {
+        {5.0f, 1.0f},     // id 0: IP = 5.0 (max)
+        {0.95f, 0.05f},   // id 1: L2^2 = 0.005 (min)
+        {0.0f, 1.0f},     // id 2: decoy
+        {0.002f, 0.0f},   // id 3: cos = 1.0 (max)
+        {-1.0f, -2.0f},   // fillers
+        {-1.5f, -2.0f},
+        {-2.0f, -2.5f},
+        {-3.0f, -1.0f},
+    };
+    const std::vector<float> q = {1.0f, 0.0f};
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (size_t i = 0; i < data.size(); ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, int64_t(i));
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : data[i])
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec); // defaults: inner product
+        wt.commit();
+    }
+
+    auto top1 = [&](DBRef& db) -> int64_t {
+        ReadTransaction rt(db);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(t->get_column_key("embedding"), q, 1);
+        return v.size() == 1 ? v[0].get<Int>(t->get_column_key("id")) : -1;
+    };
+
+    // Default metric: inner product.
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        const VectorIndexConfig& c = t->get_vector_index(t->get_column_key("embedding"))->config();
+        CHECK(c.metric == VectorMetric::InnerProduct);
+        CHECK_EQUAL(16, c.m);
+        CHECK_EQUAL(200, c.ef_construction);
+        CHECK_EQUAL(64, c.ef_search);
+    }
+    CHECK_EQUAL(0, top1(sg));
+
+    // Switch to L2 (with custom tuning knobs).
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        t->remove_vector_index(col_vec);
+        VectorIndexConfig cfg;
+        cfg.metric = VectorMetric::L2;
+        cfg.m = 8;
+        cfg.ef_construction = 50;
+        cfg.ef_search = 32;
+        t->add_vector_index(col_vec, cfg);
+        wt.commit();
+    }
+    CHECK_EQUAL(1, top1(sg));
+
+    // Reopen: config comes back from the persisted header, L2 ordering holds.
+    {
+        DBRef sg2 = DB::create(path);
+        {
+            ReadTransaction rt(sg2);
+            ConstTableRef t = rt.get_table("vectors");
+            CHECK(t->has_vector_index(t->get_column_key("embedding")));
+            const VectorIndexConfig& c = t->get_vector_index(t->get_column_key("embedding"))->config();
+            CHECK(c.metric == VectorMetric::L2);
+            CHECK_EQUAL(8, c.m);
+            CHECK_EQUAL(50, c.ef_construction);
+            CHECK_EQUAL(32, c.ef_search);
+        }
+        CHECK_EQUAL(1, top1(sg2));
+    }
+
+    // Switch to cosine.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        t->remove_vector_index(col_vec);
+        VectorIndexConfig cfg;
+        cfg.metric = VectorMetric::Cosine;
+        t->add_vector_index(col_vec, cfg);
+        wt.commit();
+    }
+    CHECK_EQUAL(3, top1(sg));
+
+    // Cosine also survives a reopen.
+    {
+        DBRef sg2 = DB::create(path);
+        CHECK_EQUAL(3, top1(sg2));
     }
 }
 
