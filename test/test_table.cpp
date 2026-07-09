@@ -5864,6 +5864,59 @@ TEST(Table_VectorIndexInPlaceEdit)
     }
 }
 
+// Parallel search: no process-wide lock — every read transaction searches its own
+// snapshot arrays through its own accessor, so queries run concurrently across
+// threads. (Within one shared accessor a small internal mutex keeps caches safe.)
+TEST(Table_VectorIndexParallelSearch)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 500;
+    const int num_threads = 4;
+    const int queries_per_thread = 50;
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec);
+        wt.commit();
+    }
+
+    std::atomic<int> mismatches{0};
+    auto worker = [&](int tid) {
+        // Each thread runs on its own transaction (its own snapshot + accessors).
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        auto cid = t->get_column_key("id");
+        auto cvec = t->get_column_key("embedding");
+        for (int i = 0; i < queries_per_thread; ++i) {
+            int target = (tid * 131 + i * 7) % N;
+            TableView v = t->where().find_all();
+            v.knnsearch(cvec, knn_test_vec(target), 3);
+            if (v.size() != 3 || v[0].get<Int>(cid) != target)
+                mismatches.fetch_add(1);
+        }
+    };
+
+    std::thread threads[num_threads];
+    for (int i = 0; i < num_threads; ++i)
+        threads[i] = std::thread(worker, i);
+    for (int i = 0; i < num_threads; ++i)
+        threads[i].join();
+
+    CHECK_EQUAL(0, mismatches.load());
+}
+
 // Stage 3 MVCC: the graph lives in copy-on-write arrays, so a reader pinned to an
 // older snapshot keeps searching the graph exactly as it was, while a writer absorbs
 // new data into its own version.
