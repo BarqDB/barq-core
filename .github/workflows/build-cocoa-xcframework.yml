@@ -23,6 +23,8 @@ jobs:
     name: Build barq-monorepo xcframework
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags so `git describe` works
 
       - name: Resolve version
         id: v

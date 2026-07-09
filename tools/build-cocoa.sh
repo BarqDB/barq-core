@@ -7,7 +7,8 @@ set -e
 
 #Set Script Name variable
 SCRIPT=$(basename "${BASH_SOURCE[0]}")
-VERSION=$(git describe)
+# Non-fatal: callers pass the real version with -v (CI checkouts may have no tags).
+VERSION=$(git describe 2>/dev/null || true)
 
 function usage {
     echo "Usage: ${SCRIPT} [-b] [-m] [-c <barq-swift-folder>] [-v <version>] [-f <cmake-flags>]"
