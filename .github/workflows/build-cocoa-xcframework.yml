@@ -1,0 +1,90 @@
+# Copyright (c) 2026 the Barq authors
+#
+# Builds the barq-monorepo cocoa xcframework and publishes it so that
+# barq-swift's scripts/download-core.sh can fetch it.
+name: Build cocoa xcframework
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Core version tag to build, e.g. v20.1.5'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    name: Build barq-monorepo xcframework
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: v
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="${INPUT_VERSION:-$REF_NAME}"
+          # download-core.sh expects a leading "v" (BARQ_CORE_VERSION=v20.1.5)
+          case "$version" in v*) : ;; *) version="v$version" ;; esac
+          if ! printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::invalid version '$version'"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Select Xcode
+        run: sudo xcode-select -switch /Applications/Xcode.app
+
+      - name: Build all Apple slices + assemble xcframework
+        env:
+          VERSION: ${{ steps.v.outputs.VERSION }}
+        # -b builds from source; drop it and pre-stage cpack tarballs to reuse a build.
+        # OpenSSL/zlib for the CMake build come from Barq hosting via
+        # tools/cmake/AcquireBarqDependency.cmake; Apple sync uses SecureTransport.
+        run: sh tools/build-cocoa.sh -b -v "$VERSION"
+
+      - name: Verify artifact
+        env:
+          VERSION: ${{ steps.v.outputs.VERSION }}
+        run: |
+          tar tf "barq-monorepo-xcframework-${VERSION}.tar.xz" | head
+          test -f "barq-monorepo-xcframework-${VERSION}.tar.xz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: barq-monorepo-xcframework
+          path: barq-monorepo-xcframework-*.tar.xz
+
+      # Option A — publish to the barq-core GitHub release (free, no CDN needed).
+      - name: Attach to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.v.outputs.VERSION }}
+        run: |
+          gh release view "$VERSION" >/dev/null 2>&1 || gh release create "$VERSION" --title "barq-core $VERSION" --notes "barq-core $VERSION"
+          gh release upload "$VERSION" "barq-monorepo-xcframework-${VERSION}.tar.xz" --clobber
+
+      # Option B — mirror to static.barqdb.space (S3/R2-compatible). Runs only if
+      # the bucket secrets are set; matches the path download-core.sh fetches:
+      #   downloads/core/<version>/cocoa/barq-monorepo-xcframework-<version>.tar.xz
+      - name: Upload to static.barqdb.space
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CDN_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CDN_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.CDN_S3_ENDPOINT }}
+          CDN_S3_BUCKET: ${{ secrets.CDN_S3_BUCKET }}
+          VERSION: ${{ steps.v.outputs.VERSION }}
+        run: |
+          if [ -z "${CDN_S3_BUCKET}" ]; then
+            echo "CDN_S3_BUCKET not set; skipping CDN upload (GitHub release already has the artifact)."
+            exit 0
+          fi
+          f="barq-monorepo-xcframework-${VERSION}.tar.xz"
+          aws s3 cp "$f" "s3://${CDN_S3_BUCKET}/downloads/core/${VERSION}/cocoa/$f" \
+            ${AWS_ENDPOINT_URL:+--endpoint-url "$AWS_ENDPOINT_URL"}
