@@ -6382,6 +6382,83 @@ TEST(Table_VectorIndexAutoBeam)
     CHECK_EQUAL(31, v[0].get<Int>(col_id));
 }
 
+// Filtered searches: a tiny view is ranked exactly straight from live table
+// data (no graph walk, no absorb — so it is exact even over changes the graph
+// has not seen), and sparse key ranges fall back from the candidate bitmap to
+// a hash set with identical results.
+TEST(Table_VectorIndexFilteredViews)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 200;
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec, exact_cfg(4 * N));
+        wt.commit();
+    }
+
+    // Queue a change without absorbing it.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        Obj o = t->create_object();
+        o.set(col_id, 999);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(999))
+            lst.add(x);
+        wt.commit(); // no search: not absorbed
+    }
+
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        // Tiny view containing the un-absorbed object: exact from live data.
+        TableView v = t->where().greater(col_id, 100).find_all(); // 99 old + the new one
+        v.knnsearch(col_vec, knn_test_vec(999), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(999, v[0].get<Int>(col_id));
+
+        // ... and closest-first ordering holds within a 10-key window.
+        TableView v2 = t->where().greater_equal(col_id, 150).less(col_id, 160).find_all();
+        v2.knnsearch(col_vec, knn_test_vec(155), 3);
+        CHECK_EQUAL(3, v2.size());
+        CHECK_EQUAL(155, v2[0].get<Int>(col_id));
+    }
+
+    // Sparse key range (explicit keys, as sync instructions create them): the
+    // candidate bitmap is infeasible, the hash-set fallback must answer — and
+    // with > 128 candidates this runs the graph path, not the tiny-view one.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        for (int i = 0; i < 200; ++i) {
+            Obj o = t->create_object(ObjKey((int64_t(1) << 40) + int64_t(i) * 7919));
+            o.set(col_id, 5000 + i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(5000 + i))
+                lst.add(x);
+        }
+        TableView v = t->where().greater_equal(col_id, 5000).find_all();
+        CHECK_EQUAL(200, v.size());
+        v.knnsearch(col_vec, knn_test_vec(5100), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(5100, v[0].get<Int>(col_id));
+        wt.commit();
+    }
+}
+
 // SQ8 encoding: the index stores 1-byte quantized codes and re-ranks the best
 // beam hits against the exact table data. The test vectors use two distinct
 // values per dimension, which the quantizer represents exactly — so winners

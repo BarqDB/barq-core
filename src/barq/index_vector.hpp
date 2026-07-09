@@ -47,6 +47,55 @@ enum class VectorEncoding : uint8_t {
                  // exactly against the table data, so recall stays near full precision.
 };
 
+/// The admissible keys of a filtered vector search: a dense bitmap over the key
+/// range when the keys pack tightly (the common case — ObjKeys allocate
+/// sequentially), a hash set otherwise. Building and probing the bitmap is
+/// several times cheaper than a hash set of the same keys.
+class VectorCandidates {
+public:
+    explicit VectorCandidates(std::vector<uint64_t> keys);
+
+    bool contains(uint64_t key) const noexcept
+    {
+        if (m_dense) {
+            if (key < m_min || key > m_max)
+                return false;
+            uint64_t bit = key - m_min;
+            return (m_bits[size_t(bit >> 6)] >> (bit & 63)) & 1;
+        }
+        return m_sparse.count(key) != 0;
+    }
+    size_t size() const noexcept
+    {
+        return m_count;
+    }
+    // Visit every key. Only worth calling on small sets (the tiny-view search
+    // path) — the dense walk is a per-bit scan.
+    template <typename Fn>
+    void for_each(Fn&& fn) const
+    {
+        if (!m_dense) {
+            for (uint64_t key : m_sparse)
+                fn(key);
+            return;
+        }
+        for (size_t w = 0; w < m_bits.size(); ++w) {
+            uint64_t bits = m_bits[w];
+            for (unsigned b = 0; bits; ++b, bits >>= 1) {
+                if (bits & 1)
+                    fn(m_min + (uint64_t(w) << 6) + b);
+            }
+        }
+    }
+
+private:
+    std::vector<uint64_t> m_bits;      // dense: bit (key - m_min)
+    std::unordered_set<uint64_t> m_sparse;
+    uint64_t m_min = 0, m_max = 0;
+    size_t m_count = 0;
+    bool m_dense = false;
+};
+
 /// Build/search parameters for a vector index. Persisted with the index (except
 /// build_threads), so a reopened index keeps the metric and graph shape it was
 /// built with.
@@ -129,13 +178,14 @@ public:
     // Query the index. Returns up to `k` object keys closest to `query`, closest
     // first, restricted to `candidates` when given (pass nullptr for an unfiltered
     // search — cheaper: no candidate set to build; results are validated against
-    // the table instead). In a write transaction this first absorbs any unindexed
-    // data changes into the graph. `ef` overrides the configured search beam for
-    // this query (0 = use config).
+    // the table instead). A tiny candidate set skips the graph entirely and is
+    // ranked exactly from live table data. In a write transaction a graph search
+    // first absorbs any unindexed data changes. `ef` overrides the configured
+    // search beam for this query (0 = use config).
     std::vector<ObjKey> search(const Table& table, const std::vector<float>& query, size_t k,
-                               const std::unordered_set<uint64_t>* candidates, size_t ef = 0);
+                               const VectorCandidates* candidates, size_t ef = 0);
     std::vector<ObjKey> search(const Table& table, const std::vector<float>& query, size_t k,
-                               const std::unordered_set<uint64_t>& candidates, size_t ef = 0)
+                               const VectorCandidates& candidates, size_t ef = 0)
     {
         return search(table, query, k, &candidates, ef);
     }

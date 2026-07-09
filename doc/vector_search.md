@@ -38,7 +38,10 @@ Measured on Yandex Deep1B (96-dim, real queries): at 100k vectors a 64-wide beam
 answers in ~0.2 ms at 98.5% recall@10; ef=128 gives 99.6% at ~0.4 ms. Distance
 math runs on SIMD (NEON on ARM, SSE on x86) and vectors are read from the file
 in whole leaf chunks. A whole-table view skips candidate-set construction
-entirely; filtered views pay one pass over the view's keys.
+entirely; filtered views pay one pass over the view's keys, packed into a
+bitmap when the keys sit densely (a hash set otherwise). A view smaller than
+~max(2k, 128) skips the graph altogether: its objects are ranked exactly,
+straight from live table data.
 
 Without an index, `knnsearch` still works (brute force / ephemeral graph).
 

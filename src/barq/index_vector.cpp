@@ -1241,6 +1241,36 @@ size_t effective_build_threads(size_t configured)
 
 } // anonymous namespace
 
+// ---- VectorCandidates -------------------------------------------------------------
+
+VectorCandidates::VectorCandidates(std::vector<uint64_t> keys)
+{
+    m_count = keys.size();
+    if (m_count == 0)
+        return;
+    m_min = m_max = keys[0];
+    for (uint64_t key : keys) {
+        if (key < m_min)
+            m_min = key;
+        if (key > m_max)
+            m_max = key;
+    }
+    // Dense enough when the bitmap costs at most ~8 bytes per key — the break-even
+    // against a hash set entry; sequentially allocated keys sit far below it.
+    uint64_t range = m_max - m_min + 1;
+    m_dense = range <= 64 * uint64_t(m_count);
+    if (m_dense) {
+        m_bits.assign(size_t((range + 63) >> 6), 0);
+        for (uint64_t key : keys) {
+            uint64_t bit = key - m_min;
+            m_bits[size_t(bit >> 6)] |= uint64_t(1) << (bit & 63);
+        }
+    }
+    else {
+        m_sparse.insert(keys.begin(), keys.end());
+    }
+}
+
 // ---- VectorIndex ----------------------------------------------------------------
 
 void VectorIndex::create_persisted_state(Allocator& alloc)
@@ -2185,18 +2215,15 @@ void VectorIndex::ensure_synced(const Table& table)
 }
 
 std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<float>& query, size_t k,
-                                        const std::unordered_set<uint64_t>* candidates, size_t ef_override)
+                                        const VectorCandidates* candidates, size_t ef_override)
 {
     std::vector<ObjKey> out;
-    if (query.empty() || k == 0 || (candidates && candidates->empty()))
+    if (query.empty() || k == 0 || (candidates && candidates->size() == 0))
         return out;
 
     std::lock_guard<std::mutex> lock(m_cache->mutex);
-    ensure_synced(table);
 
-    Trees& t = *m_trees;
-    size_t d = dim();
-    if (d != 0 && query.size() != d)
+    if (size_t d0 = dim(); d0 != 0 && query.size() != d0)
         throw IllegalOperation("Query vector dimension does not match the vector index");
 
     const float* q = query.data();
@@ -2206,6 +2233,40 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
         normalize_vec(qnorm.data(), qnorm.size());
         q = qnorm.data();
     }
+
+    // A tiny candidate set is ranked exactly, straight from live table data —
+    // cheaper than a graph walk that must keep expanding until it has found
+    // enough admissible nodes, exact by construction, and needs no sync at all.
+    if (candidates && candidates->size() <= std::max<size_t>(2 * k, 128)) {
+        std::vector<GraphOps::Hit> best;
+        std::vector<float> buf(query.size());
+        candidates->for_each([&](uint64_t key) {
+            if (!table.is_valid(ObjKey(int64_t(key))))
+                return;
+            auto lst = table.get_object(ObjKey(int64_t(key))).get_list<float>(m_column);
+            if (lst.size() != query.size())
+                return;
+            lst.get_tree().get_range(0, buf.size(), buf.data());
+            if (m_config.metric == VectorMetric::Cosine)
+                normalize_vec(buf.data(), buf.size());
+            best.emplace_back(metric_dist(m_config.metric, q, buf.data(), buf.size()), int64_t(key));
+        });
+        std::sort(best.begin(), best.end());
+        out.reserve(std::min(k, best.size()));
+        for (auto& h : best) {
+            if (out.size() >= k)
+                break;
+            out.push_back(ObjKey(h.second));
+        }
+        return out;
+    }
+
+    ensure_synced(table);
+
+    Trees& t = *m_trees;
+    size_t d = dim();
+    if (d != 0 && query.size() != d)
+        throw IllegalOperation("Query vector dimension does not match the vector index");
 
     std::vector<GraphOps::Hit> hits; // (distance, ObjKey value)
 
@@ -2237,7 +2298,7 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
                 return false; // tombstone
             if (m_cache->stale.count(key))
                 return false; // outdated copy; the overlay answers for this key
-            return !candidates || candidates->count(uint64_t(key)) != 0;
+            return !candidates || candidates->contains(uint64_t(key));
         };
         // Unfiltered: over-fetch a little so hits dropped by the validity check
         // below (objects deleted but not absorbed yet) still leave k results.
@@ -2278,7 +2339,7 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
     if (!m_cache->overlay.empty()) {
         std::vector<float> buf(query.size());
         for (int64_t key : m_cache->overlay) {
-            if (candidates && !candidates->count(uint64_t(key)))
+            if (candidates && !candidates->contains(uint64_t(key)))
                 continue;
             Obj obj = table.get_object(ObjKey(key));
             auto lst = obj.get_list<float>(m_column);

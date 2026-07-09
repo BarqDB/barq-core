@@ -349,14 +349,15 @@ int main(int argc, char** argv)
 
         // Index-only path: candidate set built once (the e2e number below includes
         // rebuilding it per query, which is what TableView::knnsearch does today).
-        std::unordered_set<uint64_t> all_keys;
-        all_keys.reserve(ds.n);
+        std::vector<uint64_t> all_key_values;
+        all_key_values.reserve(ds.n);
         std::unordered_map<uint64_t, int64_t> key_to_id; // ObjKey value -> base row
         key_to_id.reserve(ds.n);
         for (auto obj : *t) {
-            all_keys.insert(uint64_t(obj.get_key().value));
+            all_key_values.push_back(uint64_t(obj.get_key().value));
             key_to_id[uint64_t(obj.get_key().value)] = obj.get<Int>(col_id);
         }
+        VectorCandidates all_keys(std::move(all_key_values));
         VectorIndex* vindex = t->get_vector_index(col_vec);
         if (!vindex)
             fail("index missing after build");
@@ -406,8 +407,24 @@ int main(int argc, char** argv)
             }
             Stats s = stats_from(ms);
             std::printf("\n[e2e]     find_all+knnsearch (default beam, %zu queries): p50 %.2f ms, p95 %.2f ms "
-                        "(candidate-set build dominates)\n",
+                        "(view construction dominates)\n",
                         reps, s.p50, s.p95);
+        }
+
+        // 6b. Filtered e2e: a view of half the table — pays the query scan plus
+        // the candidate bitmap, then a filtered graph search.
+        {
+            std::vector<double> ms;
+            size_t reps = std::min<size_t>(ds.q, 50);
+            for (size_t qi = 0; qi < reps; ++qi) {
+                std::vector<float> qv(ds.queries.data() + qi * DIM, ds.queries.data() + (qi + 1) * DIM);
+                auto q0 = Clock::now();
+                TableView v = t->where().less(col_id, int64_t(ds.n / 2)).find_all();
+                v.knnsearch(col_vec, qv, K);
+                ms.push_back(sec_since(q0) * 1000.0);
+            }
+            Stats s = stats_from(ms);
+            std::printf("[e2e-half] filtered knnsearch over n/2 view: p50 %.2f ms, p95 %.2f ms\n", s.p50, s.p95);
         }
     }
 
