@@ -72,7 +72,10 @@ if [[ -n $BUILD ]]; then
     )
     for os in "${device_platforms[@]}"; do
         for bt in "${BUILD_TYPES[@]}"; do
-            ./tools/build-apple-device.sh -p "${os}" -c "${bt}" -f "${CMAKE_FLAGS}"
+            # Pass -v so device tarballs use the same version as macOS. Without it
+            # they fall back to `git describe` (e.g. v20.1.5-5-gHASH), which breaks
+            # the platform-name extraction in the merge/assembly step below.
+            ./tools/build-apple-device.sh -p "${os}" -c "${bt}" -v "${VERSION}" -f "${CMAKE_FLAGS}"
         done
     done
 fi
