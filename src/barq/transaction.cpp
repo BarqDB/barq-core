@@ -226,8 +226,14 @@ DB::version_type Transaction::commit()
 
     db->end_write_on_correct_thread();
 
+    DBRef db_ref = db; // do_end_read() drops our DB reference; the epilogue needs it
+
     do_end_read();
     m_read_lock = lock_after_commit;
+
+    // The transaction just ended — a quiet moment for any compaction that
+    // in-transaction maintenance (e.g. a vector-index rebuild) asked for.
+    db_ref->try_hinted_compaction();
 
     return new_version;
 }

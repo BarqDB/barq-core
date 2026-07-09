@@ -110,6 +110,12 @@ and a pending list). Because it is regular barq storage:
   against a full table diff.
 - Tombstones from deletions compact via a full rebuild once they reach half the
   graph.
+- A full (re)build strands the previous graph as dead file space (copy-on-write).
+  Later writes reuse it, and the rebuild also flags the DB for an opportunistic
+  compaction: at the next quiet moment (end of a plain commit, or an explicit
+  close) the file is compacted when more than half of it is free — handing the
+  space back to the OS. Best effort: concurrent transactions or other open DB
+  handles simply defer it.
 
 ## Sync
 

@@ -34,6 +34,7 @@
 #include <barq/query_conditions_tpl.hpp>
 #include <barq/replication.hpp>
 #include <barq/table_view.hpp>
+#include <barq/transaction.hpp>
 #include <barq/util/features.h>
 #include <barq/util/serializer.hpp>
 
@@ -2251,6 +2252,17 @@ void Table::do_add_vector_index(ColKey col_key, const VectorIndexConfig& config)
     m_index_refs.set(column_ndx, index->get_ref());
     m_vector_index_accessors[column_ndx] = std::move(index);
     m_has_any_vector_index = true;
+    hint_compaction_after_index_rebuild();
+}
+
+// A full (re)build rewrites the whole graph, leaving the previous copy as dead
+// space in the file (copy-on-write). The space gets reused by later writes, but
+// ask the DB to also hand it back to the OS at the next quiet moment (right
+// after this transaction commits, in the common case).
+void Table::hint_compaction_after_index_rebuild() const noexcept
+{
+    if (auto tr = dynamic_cast<Transaction*>(get_parent_group()))
+        tr->request_opportunistic_compaction();
 }
 
 void Table::add_vector_index(ColKey col_key, const VectorIndexConfig& config)
@@ -2316,6 +2328,7 @@ void Table::rebuild_vector_index(ColKey col_key)
     auto& index = m_vector_index_accessors[column_ndx.val];
     index->rebuild(*this);
     m_index_refs.set(column_ndx.val, index->get_ref());
+    hint_compaction_after_index_rebuild();
 }
 
 bool Table::has_vector_index(ColKey col_key) const noexcept

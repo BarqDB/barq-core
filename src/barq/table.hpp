@@ -768,6 +768,7 @@ private:
     void erase_from_search_indexes(ObjKey key);
     void update_indexes(ObjKey key, const FieldValues& values);
     void clear_indexes();
+    void hint_compaction_after_index_rebuild() const noexcept;
     template <typename T>
     void do_populate_index(StringIndex* index, ColKey::Idx col_ndx);
 

@@ -1609,6 +1609,43 @@ void DB::create_new_history(std::unique_ptr<Replication> repl)
 // Unmapping (during close()) while transactions are live, is not considered an error. There
 // is a potential race between unmapping during close() and any operation carried out by a live
 // transaction. The user must ensure that this race never happens if she uses DB::close().
+bool DB::compact_if_wasteful(double min_wasted_ratio)
+{
+    if (m_fake_read_lock_if_immutable || !is_attached())
+        return false;
+    size_t free_space = 0, used_space = 0;
+    get_stats(free_space, used_space);
+    size_t total = free_space + used_space;
+    if (total == 0 || double(free_space) < min_wasted_ratio * double(total))
+        return false;
+    return compact();
+}
+
+void DB::try_hinted_compaction() noexcept
+{
+    if (!m_compact_hint.load(std::memory_order_relaxed))
+        return;
+    // Compaction opens its own transaction, which needs a live shared_ptr to
+    // this DB — off the table when we got here from ~DB.
+    if (weak_from_this().expired())
+        return;
+    m_compact_hint.store(false, std::memory_order_relaxed);
+    try {
+        if (m_fake_read_lock_if_immutable || !is_attached())
+            return;
+        size_t free_space = 0, used_space = 0;
+        get_stats(free_space, used_space);
+        size_t total = free_space + used_space;
+        if (total == 0 || double(free_space) < 0.5 * double(total))
+            return; // compact enough: the hint is spent
+        if (!compact())
+            m_compact_hint.store(true, std::memory_order_relaxed); // busy — retry at the next opportunity
+    }
+    catch (...) {
+        // Maintenance must never turn a commit or close into an error.
+    }
+}
+
 bool DB::compact(bool bump_version_number, std::optional<const char*> output_encryption_key)
     NO_THREAD_SAFETY_ANALYSIS // this would work except for a known limitation: "No alias analysis" where clang cannot
                               // tell that tr->db->m_mutex is the same thing as m_mutex
@@ -1976,6 +2013,7 @@ void DB::close(bool allow_open_read_transactions)
         m_fake_read_lock_if_immutable.reset();
     }
     else {
+        try_hinted_compaction(); // no-op unless maintenance flagged dead space
         close_internal(std::unique_lock<InterprocessMutex>(m_controlmutex, std::defer_lock),
                        allow_open_read_transactions);
     }

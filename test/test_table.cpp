@@ -6382,6 +6382,75 @@ TEST(Table_VectorIndexAutoBeam)
     CHECK_EQUAL(31, v[0].get<Int>(col_id));
 }
 
+// A full index (re)build rewrites the whole graph and strands the previous copy
+// as dead file space. The rebuild flags it, and the tail of its own commit
+// compacts the file — best effort, only when most of the file is waste.
+TEST(Table_VectorIndexOpportunisticCompaction)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 2000;
+    ColKey col_id, col_vec;
+
+    DBRef sg = DB::create(path);
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec, exact_cfg(N));
+        wt.commit();
+    }
+    size_t size_fat = size_t(util::File(path).get_size());
+
+    // Shrink the live data to a sliver, then rebuild: most of the file is now
+    // dead space (old graph + old data). The commit's tail runs the hinted
+    // compaction.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        std::vector<ObjKey> gone;
+        for (Obj o : *t) {
+            if (o.get<Int>(col_id) >= 50)
+                gone.push_back(o.get_key());
+        }
+        for (ObjKey k : gone)
+            t->remove_object(k);
+        t->rebuild_vector_index(col_vec);
+        wt.commit();
+    }
+    size_t size_compacted = size_t(util::File(path).get_size());
+    CHECK_LESS(size_compacted, size_fat / 2);
+
+    // The compacted file answers as before, in this session and after reopen.
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        CHECK_EQUAL(50, t->size());
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(17), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(17, v[0].get<Int>(col_id));
+    }
+    sg->close();
+    {
+        DBRef sg2 = DB::create(path);
+        ReadTransaction rt(sg2);
+        ConstTableRef t = rt.get_table("vectors");
+        CHECK_EQUAL(50, t->size());
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(33), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(33, v[0].get<Int>(col_id));
+    }
+}
+
 // Filtered searches: a tiny view is ranked exactly straight from live table
 // data (no graph walk, no absorb — so it is exact even over changes the graph
 // has not seen), and sparse key ranges fall back from the candidate bitmap to
