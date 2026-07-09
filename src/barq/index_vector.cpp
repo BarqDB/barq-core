@@ -167,6 +167,10 @@ struct VectorIndex::Cache {
     std::unordered_set<int64_t> stale; // keys whose graph copy is outdated (pending edits)
     uint64_t synced_version = uint64_t(-1);
 
+    // Keys already recorded in the persisted pending list — keeps per-element list
+    // writes (one touch per lst.add) from rescanning it.
+    std::unordered_set<int64_t> pending_seen;
+
     // A frozen table (and thus this accessor) may be shared across threads.
     std::mutex mutex;
 
@@ -177,6 +181,7 @@ struct VectorIndex::Cache {
         overlay.clear();
         stale.clear();
         synced_version = uint64_t(-1);
+        pending_seen.clear();
     }
 };
 
@@ -762,7 +767,28 @@ void VectorIndex::rebuild(const Table& table)
     do_rebuild(table);
     m_cache->overlay.clear();
     m_cache->stale.clear();
+    m_cache->pending_seen.clear();
     m_cache->synced_version = table.get_content_version();
+}
+
+void VectorIndex::mark_dirty(ObjKey key)
+{
+    std::lock_guard<std::mutex> lock(m_cache->mutex);
+    int64_t k = key.value;
+    if (m_cache->pending_seen.count(k))
+        return;
+    // Dedupe against entries persisted by earlier transactions (the list is small;
+    // it is consumed by the next absorb).
+    size_t n = m_trees->pending.size();
+    for (size_t i = 0; i < n; ++i) {
+        if (m_trees->pending.get(i) == k) {
+            m_cache->pending_seen.insert(k);
+            return;
+        }
+    }
+    m_trees->pending.add(k);
+    m_cache->pending_seen.insert(k);
+    m_cache->synced_version = uint64_t(-1); // re-sync on the next search
 }
 
 // Absorb (write transaction) or compute the read-only overlay: the set of keys the

@@ -276,6 +276,16 @@ protected:
 
 private:
     T do_get(size_t ndx, const char* msg) const;
+
+    // List-of-floats columns can carry a vector index; tell it the vector changed.
+    // Compiles to nothing for every other element type.
+    void notify_vector_index() const
+    {
+        if constexpr (std::is_same_v<T, float>) {
+            if (auto table = Base::get_table())
+                table->vector_index_touch(Base::m_col_key, Base::get_owner_key());
+        }
+    }
 };
 
 template <>
@@ -936,6 +946,7 @@ void Lst<T>::clear()
         }
         do_clear();
         bump_content_version();
+        notify_vector_index();
     }
 }
 
@@ -1104,6 +1115,7 @@ void Lst<T>::move(size_t from, size_t to)
         m_tree->erase(from);
 
         bump_content_version();
+        notify_vector_index();
     }
 }
 
@@ -1120,6 +1132,7 @@ void Lst<T>::swap(size_t ndx1, size_t ndx2)
         }
         m_tree->swap(ndx1, ndx2);
         bump_content_version();
+        notify_vector_index();
     }
 }
 
@@ -1138,6 +1151,7 @@ T Lst<T>::set(size_t ndx, T value)
     if (old != value) {
         do_set(ndx, value);
         bump_content_version();
+        notify_vector_index();
     }
     return old;
 }
@@ -1157,6 +1171,7 @@ void Lst<T>::insert(size_t ndx, T value)
     }
     do_insert(ndx, value);
     bump_content_version();
+    notify_vector_index();
 }
 
 template <class T>
@@ -1170,6 +1185,7 @@ T Lst<T>::remove(size_t ndx)
 
     do_remove(ndx);
     bump_content_version();
+    notify_vector_index();
     return old;
 }
 

@@ -260,6 +260,10 @@ public:
     void rebuild_vector_index(ColKey col_key);
     bool has_vector_index(ColKey col_key) const noexcept;
     VectorIndex* get_vector_index(ColKey col_key) const noexcept;
+    /// Called from the list-of-floats write path: records that `key`'s vector was
+    /// edited in place so the index re-ranks it (const: only index bookkeeping is
+    /// touched). No-op when the column has no vector index.
+    void vector_index_touch(ColKey col_key, ObjKey key) const;
 
     void enumerate_string_column(ColKey col_key);
     bool is_enumerated(ColKey col_key) const noexcept;

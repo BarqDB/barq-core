@@ -5591,18 +5591,18 @@ TEST(Table_VectorIndexRemoveRebuild)
         wt.commit();
     }
 
-    // Stale: key-based maintenance did not see the edit — the graph still holds the
-    // old vector, so a query for the old position still returns the victim.
+    // The write hook records the edit, so the index re-ranks the victim right away
+    // (no rebuild needed) — see Table_VectorIndexInPlaceEdit for the full matrix.
     {
         ReadTransaction rt(sg);
         ConstTableRef t = rt.get_table("vectors");
         TableView v = t->where().find_all();
-        v.knnsearch(col_vec, knn_test_vec(victim), 1);
+        v.knnsearch(col_vec, knn_test_vec(newpos), 1);
         CHECK_EQUAL(1, v.size());
         CHECK_EQUAL(victim, v[0].get<Int>(col_id));
     }
 
-    // Rebuild: the index now reflects the edited vector.
+    // An explicit rebuild also folds the edit into the graph itself.
     {
         WriteTransaction wt(sg);
         TableRef t = wt.get_table("vectors");
@@ -5751,6 +5751,116 @@ TEST(Table_VectorIndexConfig)
     {
         DBRef sg2 = DB::create(path);
         CHECK_EQUAL(3, top1(sg2));
+    }
+}
+
+// In-place vector edits: the list-of-floats write path records the touched key in
+// the index's persisted pending list; searches re-rank it from live data at once,
+// and the next write-transaction search folds it into the graph.
+TEST(Table_VectorIndexInPlaceEdit)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 300;
+    const int victim = 123;
+    const int newpos = 1700; // unique vector position, no collision with 0..N
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec);
+        wt.commit();
+    }
+
+    // Edit the victim's vector in place. No rebuild, no write-transaction search.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        for (Obj o : *t) {
+            if (o.get<Int>(col_id) == victim) {
+                Lst<float> lst = o.get_list<float>(col_vec);
+                auto nv = knn_test_vec(newpos);
+                for (size_t i = 0; i < nv.size(); ++i)
+                    lst.set(i, nv[i]);
+                break;
+            }
+        }
+        wt.commit();
+    }
+
+    // Read transaction: the victim ranks at its new position, not the old one.
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(newpos), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(victim, v[0].get<Int>(col_id));
+
+        TableView v2 = t->where().find_all();
+        v2.knnsearch(col_vec, knn_test_vec(victim), 1);
+        CHECK_EQUAL(1, v2.size());
+        CHECK_NOT_EQUAL(victim, v2[0].get<Int>(col_id));
+    }
+
+    // The pending edit is persisted: a fresh session sees it too.
+    {
+        DBRef sg2 = DB::create(path);
+        ReadTransaction rt(sg2);
+        ConstTableRef t = rt.get_table("vectors");
+        auto cid = t->get_column_key("id");
+        auto cvec = t->get_column_key("embedding");
+        TableView v = t->where().find_all();
+        v.knnsearch(cvec, knn_test_vec(newpos), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(victim, v[0].get<Int>(cid));
+    }
+
+    // A write-transaction search absorbs the edit into the graph proper.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(newpos), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(victim, v[0].get<Int>(col_id));
+        // Tombstone + re-insert: all N objects stay live in the index.
+        CHECK_EQUAL(size_t(N), t->get_vector_index(col_vec)->count());
+        wt.commit();
+    }
+
+    // A second edit after the absorb is tracked just the same.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        for (Obj o : *t) {
+            if (o.get<Int>(col_id) == victim) {
+                Lst<float> lst = o.get_list<float>(col_vec);
+                auto nv = knn_test_vec(victim); // move it back home
+                for (size_t i = 0; i < nv.size(); ++i)
+                    lst.set(i, nv[i]);
+                break;
+            }
+        }
+        wt.commit();
+    }
+    {
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(victim), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(victim, v[0].get<Int>(col_id));
     }
 }
 

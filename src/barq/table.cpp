@@ -2305,6 +2305,12 @@ VectorIndex* Table::get_vector_index(ColKey col_key) const noexcept
     return nullptr;
 }
 
+void Table::vector_index_touch(ColKey col_key, ObjKey key) const
+{
+    if (VectorIndex* index = get_vector_index(col_key))
+        index->mark_dirty(key);
+}
+
 bool Table::is_cross_table_link_target() const noexcept
 {
     auto is_cross_link = [this](ColKey col_key) {

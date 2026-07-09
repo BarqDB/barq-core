@@ -92,6 +92,11 @@ public:
     // Build the graph from `table` and persist it. Must run in a write transaction.
     void rebuild(const Table& table);
 
+    // Record that `key`'s vector was edited in place (write transactions only —
+    // called from the list-of-floats write path). The key joins the persisted
+    // pending list; searches re-rank it from live data until the graph absorbs it.
+    void mark_dirty(ObjKey key);
+
     // Query the index. Returns up to `k` object keys closest to `query`, restricted
     // to `candidates`, closest first. In a write transaction this first absorbs any
     // unindexed data changes into the graph.
