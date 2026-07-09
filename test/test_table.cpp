@@ -37,6 +37,7 @@ using namespace std::chrono;
 #include <barq/array_bool.hpp>
 #include <barq/array_string.hpp>
 #include <barq/array_timestamp.hpp>
+#include <barq/history.hpp>
 #include <barq/index_string.hpp>
 #include <barq/index_vector.hpp>
 
@@ -5859,6 +5860,94 @@ TEST(Table_VectorIndexInPlaceEdit)
         ConstTableRef t = rt.get_table("vectors");
         TableView v = t->where().find_all();
         v.knnsearch(col_vec, knn_test_vec(victim), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(victim, v[0].get<Int>(col_id));
+    }
+}
+
+// Local-only: the vector index is a derived structure — building, maintaining and
+// absorbing it writes NO replication instructions. With a history installed, a
+// pinned reader advances across every kind of index write by replaying the
+// transaction log; if any index op leaked an instruction the replay would fail,
+// and the index must appear on the reader purely through the accessor refresh.
+TEST(Table_VectorIndexLocalOnly)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    std::unique_ptr<Replication> hist(make_in_barq_history());
+    DBRef sg = DB::create(*hist, path);
+
+    auto rt = sg->start_read(); // pinned before any vector-index work
+    const int N = 300;
+    const int victim = 55;
+    const int newpos = 1900;
+    ColKey col_id, col_vec;
+
+    // Build: schema + data + index in one logged transaction.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        t->add_vector_index(col_vec);
+        wt.commit();
+    }
+    rt->advance_read();
+    {
+        ConstTableRef t = rt->get_table("vectors");
+        CHECK(t->has_vector_index(col_vec));
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(200), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(200, v[0].get<Int>(col_id));
+    }
+
+    // In-place edit: the write hook records the pending key with history active.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        for (Obj o : *t) {
+            if (o.get<Int>(col_id) == victim) {
+                Lst<float> lst = o.get_list<float>(col_vec);
+                auto nv = knn_test_vec(newpos);
+                for (size_t i = 0; i < nv.size(); ++i)
+                    lst.set(i, nv[i]);
+                break;
+            }
+        }
+        wt.commit();
+    }
+    rt->advance_read();
+    {
+        ConstTableRef t = rt->get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(newpos), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(victim, v[0].get<Int>(col_id));
+    }
+
+    // Absorb: a write-transaction search folds the edit into the graph, again with
+    // the history recording the transaction.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(newpos), 1);
+        CHECK_EQUAL(1, v.size());
+        CHECK_EQUAL(size_t(N), t->get_vector_index(col_vec)->count());
+        wt.commit();
+    }
+    rt->advance_read();
+    {
+        ConstTableRef t = rt->get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, knn_test_vec(newpos), 1);
         CHECK_EQUAL(1, v.size());
         CHECK_EQUAL(victim, v[0].get<Int>(col_id));
     }
