@@ -69,8 +69,8 @@ public:
     {
         return m_count;
     }
-    // Visit every key. Only worth calling on small sets (the tiny-view search
-    // path) — the dense walk is a per-bit scan.
+    // Visit every key. Used by exact candidate scans; the dense walk is a
+    // per-bit scan.
     template <typename Fn>
     void for_each(Fn&& fn) const
     {
@@ -181,7 +181,8 @@ public:
     // the table instead). A tiny candidate set skips the graph entirely and is
     // ranked exactly from live table data. In a write transaction a graph search
     // first absorbs any unindexed data changes. `ef` overrides the configured
-    // search beam for this query (0 = use config).
+    // search beam for this query (0 = use config). An explicit `ef` at least as
+    // large as the live candidate count performs a flat exact scan.
     std::vector<ObjKey> search(const Table& table, const std::vector<float>& query, size_t k,
                                const VectorCandidates* candidates, size_t ef = 0);
     std::vector<ObjKey> search(const Table& table, const std::vector<float>& query, size_t k,

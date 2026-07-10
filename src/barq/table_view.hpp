@@ -153,6 +153,7 @@ public:
     void create()
     {
         m_attached = true;
+        m_unique_direct_table_results = false;
     }
     bool is_attached() const
     {
@@ -166,6 +167,14 @@ public:
     {
         return operator[](n);
     }
+    void set_unique_direct_table_results(bool value) noexcept
+    {
+        m_unique_direct_table_results = value;
+    }
+    bool has_unique_direct_table_results() const noexcept
+    {
+        return m_unique_direct_table_results;
+    }
     size_t find_first(ObjKey k) const
     {
         auto it = std::find(begin(), end(), k);
@@ -177,6 +186,10 @@ public:
 
 private:
     bool m_attached = false;
+    // True only when these keys came from a direct-table query.
+    // Such query results contain each live table row at most once, so matching
+    // table.size() proves that the set covers the whole table.
+    bool m_unique_direct_table_results = false;
 };
 
 class TableView : public ObjList {

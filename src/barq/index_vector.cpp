@@ -130,6 +130,15 @@ void normalize_vec(float* v, size_t dim)
     }
 }
 
+bool is_finite_vector(const float* v, size_t dim) noexcept
+{
+    for (size_t i = 0; i < dim; ++i) {
+        if (!std::isfinite(v[i]))
+            return false;
+    }
+    return true;
+}
+
 // ---- SQ8 scalar quantization ----------------------------------------------------
 //
 // Per-dimension linear codes, centered so they store as 8-bit array leaves:
@@ -1245,8 +1254,7 @@ size_t effective_build_threads(size_t configured)
 
 VectorCandidates::VectorCandidates(std::vector<uint64_t> keys)
 {
-    m_count = keys.size();
-    if (m_count == 0)
+    if (keys.empty())
         return;
     m_min = m_max = keys[0];
     for (uint64_t key : keys) {
@@ -1255,19 +1263,37 @@ VectorCandidates::VectorCandidates(std::vector<uint64_t> keys)
         if (key > m_max)
             m_max = key;
     }
-    // Dense enough when the bitmap costs at most ~8 bytes per key — the break-even
-    // against a hash set entry; sequentially allocated keys sit far below it.
-    uint64_t range = m_max - m_min + 1;
-    m_dense = range <= 64 * uint64_t(m_count);
+    // Dense enough when the bitmap costs at most ~8 bytes per input key — the
+    // break-even against a hash set entry; sequentially allocated keys sit far
+    // below it. The inclusive range does not fit when the keys span the entire
+    // uint64 domain (notably a real key plus null_key/UINT64_MAX), so that case
+    // must use the sparse representation.
+    uint64_t span = m_max - m_min;
+    bool range_fits = span != std::numeric_limits<uint64_t>::max();
+    uint64_t range = range_fits ? span + 1 : 0;
+    m_dense = range_fits && ((range - 1) / 64 < uint64_t(keys.size()));
     if (m_dense) {
-        m_bits.assign(size_t((range + 63) >> 6), 0);
+        m_bits.assign(size_t((range - 1) / 64 + 1), 0);
         for (uint64_t key : keys) {
             uint64_t bit = key - m_min;
-            m_bits[size_t(bit >> 6)] |= uint64_t(1) << (bit & 63);
+            uint64_t mask = uint64_t(1) << (bit & 63);
+            uint64_t& word = m_bits[size_t(bit >> 6)];
+            if (!(word & mask)) {
+                word |= mask;
+                ++m_count;
+            }
+        }
+        // Duplicates can make a set much sparser than the raw input suggested.
+        // Keep the compact representation chosen from the unique count.
+        if ((range - 1) / 64 >= uint64_t(m_count)) {
+            m_sparse.insert(keys.begin(), keys.end());
+            std::vector<uint64_t>().swap(m_bits);
+            m_dense = false;
         }
     }
     else {
         m_sparse.insert(keys.begin(), keys.end());
+        m_count = m_sparse.size();
     }
 }
 
@@ -1893,6 +1919,8 @@ void VectorIndex::event_absorb(const Table& table)
         lst.get_tree().get_range(0, d, buf.data());
         if (m_config.metric == VectorMetric::Cosine)
             normalize_vec(buf.data(), d);
+        if (!is_finite_vector(buf.data(), d))
+            continue;
         delta.add(key, buf.data());
     }
 
@@ -1983,6 +2011,8 @@ void VectorIndex::scan_absorb(const Table& table)
         lst.get_tree().get_range(0, d, buf.data());
         if (m_config.metric == VectorMetric::Cosine)
             normalize_vec(buf.data(), d);
+        if (!is_finite_vector(buf.data(), d))
+            continue;
         delta.add(key, buf.data());
     }
 
@@ -2032,9 +2062,15 @@ void VectorIndex::verify_matches_table(const Table& table)
     ensure_key_map();
     size_t d = dim();
     size_t expected = 0;
+    std::vector<float> buf(d);
     for (auto obj : table) {
         auto lst = obj.get_list<float>(m_column);
         if (d != 0 && lst.size() == d) {
+            lst.get_tree().get_range(0, d, buf.data());
+            if (m_config.metric == VectorMetric::Cosine)
+                normalize_vec(buf.data(), d);
+            if (!is_finite_vector(buf.data(), d))
+                continue;
             ++expected;
             BARQ_ASSERT_RELEASE(m_cache->key2id.count(obj.get_key().value));
         }
@@ -2083,10 +2119,10 @@ void VectorIndex::do_rebuild(const Table& table)
             lst.get_tree().get_range(0, d, buf.data());
             if (m_config.metric == VectorMetric::Cosine)
                 normalize_vec(buf.data(), d);
+            if (!is_finite_vector(buf.data(), d))
+                continue;
             for (size_t i = 0; i < d; ++i) {
                 float x = buf[i];
-                if (!std::isfinite(x))
-                    continue;
                 if (x < mn[i])
                     mn[i] = x;
                 if (x > mx[i])
@@ -2110,6 +2146,8 @@ void VectorIndex::do_rebuild(const Table& table)
         lst.get_tree().get_range(0, d, buf.data());
         if (m_config.metric == VectorMetric::Cosine)
             normalize_vec(buf.data(), d);
+        if (!is_finite_vector(buf.data(), d))
+            continue;
         builder.add(obj.get_key().value, buf.data());
     }
     bulk_rebuild(t, *m_cache, m_config.build_threads, builder);
@@ -2218,7 +2256,14 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
                                         const VectorCandidates* candidates, size_t ef_override)
 {
     std::vector<ObjKey> out;
-    if (query.empty() || k == 0 || (candidates && candidates->size() == 0))
+    if (query.empty() || k == 0)
+        return out;
+    if (!std::all_of(query.begin(), query.end(), [](float value) {
+            return std::isfinite(value);
+        })) {
+        throw InvalidArgument("Query vector must contain only finite values");
+    }
+    if (candidates && candidates->size() == 0)
         return out;
 
     std::lock_guard<std::mutex> lock(m_cache->mutex);
@@ -2237,26 +2282,57 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
     // A tiny candidate set is ranked exactly, straight from live table data —
     // cheaper than a graph walk that must keep expanding until it has found
     // enough admissible nodes, exact by construction, and needs no sync at all.
-    if (candidates && candidates->size() <= std::max<size_t>(2 * k, 128)) {
-        std::vector<GraphOps::Hit> best;
+    // An explicit beam covering the live candidate universe means the caller is
+    // asking for exhaustive results. Do a real flat scan in that case: walking
+    // every reachable graph node is not an exact operation for a quantized graph.
+    const size_t candidate_universe = candidates ? candidates->size() : table.size();
+    const bool exact_override = ef_override != 0 && ef_override >= candidate_universe;
+    const bool tiny_candidates = candidates && candidate_universe <= std::max<size_t>(2 * k, 128);
+    if (exact_override || tiny_candidates) {
+        // Tiny views intentionally read live data without maintaining the graph.
+        // A full exact search still has normal search semantics in a write
+        // transaction: fold queued changes into the index before answering.
+        if (exact_override && !tiny_candidates) {
+            ensure_synced(table);
+            if (size_t d = dim(); d != 0 && query.size() != d)
+                throw IllegalOperation("Query vector dimension does not match the vector index");
+        }
+        std::priority_queue<GraphOps::Hit> best; // max-heap: worst exact hit on top
         std::vector<float> buf(query.size());
-        candidates->for_each([&](uint64_t key) {
-            if (!table.is_valid(ObjKey(int64_t(key))))
-                return;
-            auto lst = table.get_object(ObjKey(int64_t(key))).get_list<float>(m_column);
+        auto consider = [&](Obj obj) {
+            auto lst = obj.get_list<float>(m_column);
             if (lst.size() != query.size())
                 return;
             lst.get_tree().get_range(0, buf.size(), buf.data());
             if (m_config.metric == VectorMetric::Cosine)
                 normalize_vec(buf.data(), buf.size());
-            best.emplace_back(metric_dist(m_config.metric, q, buf.data(), buf.size()), int64_t(key));
-        });
-        std::sort(best.begin(), best.end());
-        out.reserve(std::min(k, best.size()));
-        for (auto& h : best) {
-            if (out.size() >= k)
-                break;
-            out.push_back(ObjKey(h.second));
+            float distance = metric_dist(m_config.metric, q, buf.data(), buf.size());
+            if (!std::isfinite(distance))
+                return;
+            GraphOps::Hit hit(distance, obj.get_key().value);
+            if (best.size() < k) {
+                best.push(hit);
+            }
+            else if (hit < best.top()) {
+                best.pop();
+                best.push(hit);
+            }
+        };
+        if (candidates) {
+            candidates->for_each([&](uint64_t key) {
+                ObjKey obj_key{int64_t(key)};
+                if (table.is_valid(obj_key))
+                    consider(table.get_object(obj_key));
+            });
+        }
+        else {
+            for (Obj obj : table)
+                consider(obj);
+        }
+        out.resize(best.size());
+        for (size_t i = out.size(); i-- > 0;) {
+            out[i] = ObjKey(best.top().second);
+            best.pop();
         }
         return out;
     }
@@ -2307,14 +2383,10 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
             hits.emplace_back(h.first, t.keys.get(size_t(h.second)));
 
         if (m_config.encoding == VectorEncoding::SQ8 && !hits.empty()) {
-            // The beam ranked by quantized distances; re-rank its best hits
+            // The beam ranked by quantized distances; re-rank every graph hit
             // against the exact vectors in the table (the source of truth — the
-            // index stores only codes). This is what keeps SQ8 recall close to
-            // full precision, and it makes the ordering consistent with the
-            // overlay's exact distances below.
-            std::sort(hits.begin(), hits.end());
-            size_t rerank = std::min(hits.size(), std::max(3 * k, k + 32));
-            hits.resize(rerank);
+            // index stores only codes). Truncating the quantized ordering before
+            // this pass creates a hard recall cap which a wider beam cannot fix.
             std::vector<float> exact(d);
             for (auto& h : hits) {
                 ObjKey key(h.second);
@@ -2352,6 +2424,12 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
         }
     }
 
+    // Stored vectors can contain NaN/Inf. They are not valid neighbours and
+    // must be removed before std::sort, whose comparator requires an ordering.
+    hits.erase(std::remove_if(hits.begin(), hits.end(), [](const GraphOps::Hit& hit) {
+                   return !std::isfinite(hit.first);
+               }),
+               hits.end());
     std::sort(hits.begin(), hits.end());
     out.reserve(std::min(k, hits.size()));
     for (auto& h : hits) {

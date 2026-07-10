@@ -32,7 +32,14 @@ v.knnsearch(col_embedding, query_vec, 10); // v now holds the 10 closest, closes
 // Results are approximate (that is what makes them fast). The beam can be
 // widened per query when one search needs better recall:
 v.knnsearch(col_embedding, query_vec, 10, /*ef=*/256);
+
+// An explicit beam covering the whole view requests an exact flat scan. Using
+// max() is convenient when the caller does not want to count the view first.
+v.knnsearch(col_embedding, query_vec, 10, std::numeric_limits<size_t>::max());
 ```
+
+Query values must be finite. Rows whose embedding contains `NaN` or infinity
+are not indexed or returned as neighbours.
 
 Measured on Yandex Deep1B (96-dim, real queries): at 100k vectors a 64-wide beam
 answers in ~0.2 ms at 98.5% recall@10; ef=128 gives 99.6% at ~0.4 ms. Distance
@@ -67,12 +74,14 @@ is persisted, so the peak never holds the whole builder plus its file copy.
 `cfg.encoding = VectorEncoding::SQ8` stores the index's copy of each vector as
 one byte per dimension instead of four: a per-dimension linear code, with the
 scale learned from the data at build time. The graph is walked on quantized
-distances and the best candidates are re-ranked against the exact vectors in
-the table (which the index no longer duplicates), so recall stays at full
-precision — measured on Deep1B at 100k, recall@10 matches Float32 at every
-beam width while the index's vector store shrinks 4x (whole index: 52 MB ->
-24 MB per 100k), builds run ~20% faster on ~30% less transient RAM, and
-queries cost ~20% extra (the decode plus the re-rank).
+distances and every hit in the selected beam is re-ranked against the exact
+vectors in the table (which the index no longer duplicates). A wider beam can
+therefore recover from lossy SQ8 ordering instead of hitting a fixed re-rank
+shortlist. The index is still approximate unless the exact flat-scan mode above
+is requested. On Deep1B at 100k, SQ8 recall@10 closely tracks Float32 while the
+index's vector store shrinks 4x (whole index: 52 MB -> 24 MB per 100k). Builds
+run ~20% faster on ~30% less transient RAM; query cost grows with the beam
+because all beam hits are re-ranked exactly.
 
 The encoding is fixed when the index is created; params re-learn on every full
 rebuild, and vectors added in between clamp to the learned range (drift far

@@ -6528,6 +6528,103 @@ TEST(Table_VectorIndexFilteredViews)
     }
 }
 
+// Candidate sets are mathematical sets even when their source view contains
+// duplicate or detached keys. The uint64 representation of null_key is also
+// UINT64_MAX, which must not wrap the dense bitmap's inclusive range.
+TEST(Table_VectorIndexCandidateSetSafety)
+{
+    const uint64_t null_value = uint64_t(null_key.value);
+    CHECK_EQUAL(std::numeric_limits<uint64_t>::max(), null_value);
+    VectorCandidates extremes({0, 0, null_value, null_value});
+    CHECK_EQUAL(size_t(2), extremes.size());
+    CHECK(extremes.contains(0));
+    CHECK(extremes.contains(null_value));
+    CHECK_NOT(extremes.contains(1));
+    std::vector<uint64_t> seen;
+    extremes.for_each([&](uint64_t key) {
+        seen.push_back(key);
+    });
+    std::sort(seen.begin(), seen.end());
+    CHECK_EQUAL(size_t(2), seen.size());
+    CHECK_EQUAL(uint64_t(0), seen[0]);
+    CHECK_EQUAL(null_value, seen[1]);
+
+    VectorCandidates dense_duplicates({7, 7, 8, 8});
+    CHECK_EQUAL(size_t(2), dense_duplicates.size());
+
+    // A duplicate link-list view has four rows, matching the target table's
+    // size, but contains only objects 0 and 1. Object 2 is the exact query match
+    // and must not leak in through the unfiltered full-table shortcut. Object 3
+    // also verifies that a non-finite stored distance is never sorted/returned.
+    SHARED_GROUP_TEST_PATH(path);
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec, col_links;
+    std::vector<ObjKey> keys;
+    {
+        WriteTransaction wt(sg);
+        TableRef vectors = wt.add_table("vectors");
+        col_id = vectors->add_column(type_Int, "id");
+        col_vec = vectors->add_column_list(type_Float, "embedding");
+        const float values[] = {1.0f, 2.0f, 0.0f, std::numeric_limits<float>::infinity()};
+        for (int i = 0; i < 4; ++i) {
+            Obj obj = vectors->create_object();
+            keys.push_back(obj.get_key());
+            obj.set(col_id, i);
+            obj.get_list<float>(col_vec).add(values[i]);
+        }
+        VectorIndexConfig cfg = exact_cfg(4);
+        cfg.metric = VectorMetric::L2;
+        cfg.encoding = VectorEncoding::SQ8;
+        vectors->add_vector_index(col_vec, cfg);
+
+        TableRef owners = wt.add_table("owners");
+        col_links = owners->add_column_list(*vectors, "links");
+        LnkLst links = owners->create_object().get_linklist(col_links);
+        links.add(keys[0]);
+        links.add(keys[0]);
+        links.add(keys[1]);
+        links.add(keys[1]);
+        wt.commit();
+    }
+
+    ReadTransaction rt(sg);
+    ConstTableRef vectors = rt.get_table("vectors");
+    ConstTableRef owners = rt.get_table("owners");
+    CHECK_EQUAL(size_t(3), vectors->get_vector_index(col_vec)->count());
+    LnkLst links = owners->begin()->get_linklist(col_links);
+    TableView duplicate_view = links.get_sorted_view(col_id);
+    CHECK_EQUAL(size_t(4), duplicate_view.size());
+    duplicate_view.knnsearch(col_vec, {0.0f}, 1);
+    CHECK_EQUAL(size_t(1), duplicate_view.size());
+    CHECK_EQUAL(0, duplicate_view[0].get<Int>(col_id));
+
+    TableView exact_with_inf = vectors->where().find_all();
+    exact_with_inf.knnsearch(col_vec, {0.0f}, 2, /*ef=*/vectors->size());
+    CHECK_EQUAL(size_t(2), exact_with_inf.size());
+    CHECK_EQUAL(2, exact_with_inf[0].get<Int>(col_id));
+    CHECK_EQUAL(0, exact_with_inf[1].get<Int>(col_id));
+
+    // The descriptor also drops null and stale keys before constructing the
+    // persisted index's VectorCandidates set.
+    KeyValues raw;
+    raw.create();
+    raw.add(null_key);
+    raw.add(keys[0]);
+    raw.add(keys[0]);
+    raw.add(ObjKey(999999));
+    SemanticSearchDescriptor(col_vec, {0.0f}, 1).execute(*vectors, raw, nullptr);
+    CHECK_EQUAL(size_t(1), raw.size());
+    CHECK_EQUAL(keys[0], raw.get(0));
+
+    // NaN/Inf distances do not define a strict ordering for the graph heaps.
+    // Reject such queries before either the persisted or fallback search runs.
+    TableView nan_view = vectors->where().find_all();
+    CHECK_THROW(nan_view.knnsearch(col_vec, {std::numeric_limits<float>::quiet_NaN()}, 1), InvalidArgument);
+    CHECK_THROW(vectors->get_vector_index(col_vec)->search(
+                    *vectors, {std::numeric_limits<float>::infinity()}, 1, nullptr),
+                InvalidArgument);
+}
+
 // SQ8 encoding: the index stores 1-byte quantized codes and re-ranks the best
 // beam hits against the exact table data. The test vectors use two distinct
 // values per dimension, which the quantizer represents exactly — so winners
@@ -6630,6 +6727,94 @@ TEST(Table_VectorIndexSQ8)
     }
 }
 
+// SQ8's graph ordering is lossy. More than the old fixed re-rank shortlist can
+// collapse to one code even though their exact distances differ. The exact
+// winners are deliberately created after all of those lower-key collisions:
+// they must survive the quantized beam and win the exact re-rank. An explicit
+// beam covering a filtered candidate universe must take the flat exact path too.
+TEST(Table_VectorIndexSQ8LossyRerankAndExactMode)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    constexpr int decoys = 130; // more than the old k=10 shortlist and tiny-view cutoff
+    constexpr int winners = 10;
+    constexpr int total = decoys + winners + 2; // plus min/max quantizer anchors
+
+    DBRef sg = DB::create(path);
+    ColKey col_id, col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_id = t->add_column(type_Int, "id");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        auto add = [&](int id, float value) {
+            Obj obj = t->create_object();
+            obj.set(col_id, id);
+            obj.get_list<float>(col_vec).add(value);
+        };
+
+        // The anchors make SQ8's scale exactly 1 and offset 0. The decoys and
+        // all ten exact winners then quantize to code 0. The winners are created
+        // last, so all of their keys fall beyond the old quantized top-42 cut.
+        for (int i = 0; i < decoys; ++i)
+            add(i, 0.49f);
+        for (int i = 0; i < winners; ++i)
+            add(decoys + i, 0.01f * float(i + 1));
+        add(1000, -128.0f);
+        add(1001, 127.0f);
+
+        VectorIndexConfig cfg = exact_cfg(total);
+        cfg.metric = VectorMetric::L2;
+        cfg.encoding = VectorEncoding::SQ8;
+        t->add_vector_index(col_vec, cfg);
+        wt.commit();
+    }
+
+    // Exact mode still performs normal write-transaction maintenance before
+    // doing its flat scan. The added point is deliberately far from the query.
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        Obj obj = t->create_object();
+        obj.set(col_id, 2000);
+        obj.get_list<float>(col_vec).add(50.0f);
+        CHECK_EQUAL(size_t(total), t->get_vector_index(col_vec)->count());
+
+        TableView exact = t->where().find_all();
+        exact.knnsearch(col_vec, {0.0f}, winners, /*ef=*/t->size());
+        CHECK_EQUAL(size_t(t->size()), t->get_vector_index(col_vec)->count());
+        for (int i = 0; i < winners; ++i)
+            CHECK_EQUAL(decoys + i, exact[size_t(i)].get<Int>(col_id));
+        wt.commit();
+    }
+
+    ReadTransaction rt(sg);
+    ConstTableRef t = rt.get_table("vectors");
+
+    // Configured exhaustive graph beam: exercises exact re-ranking of every
+    // quantized graph hit (the old top-42 truncation returned only decoys).
+    TableView graph = t->where().find_all();
+    graph.knnsearch(col_vec, {0.0f}, winners);
+    CHECK_EQUAL(winners, graph.size());
+    for (int i = 0; i < winners; ++i)
+        CHECK_EQUAL(decoys + i, graph[size_t(i)].get<Int>(col_id));
+
+    // An explicit beam equal to the unfiltered live table size is exact too.
+    TableView exact_all = t->where().find_all();
+    exact_all.knnsearch(col_vec, {0.0f}, winners, /*ef=*/t->size());
+    CHECK_EQUAL(winners, exact_all.size());
+    for (int i = 0; i < winners; ++i)
+        CHECK_EQUAL(decoys + i, exact_all[size_t(i)].get<Int>(col_id));
+
+    // The anchors are filtered out. ef equals the 140 live candidates, which is
+    // the public exact-mode contract and must use a flat scan of the view.
+    TableView exact = t->where().less(col_id, 1000).find_all();
+    CHECK_EQUAL(size_t(decoys + winners), exact.size());
+    exact.knnsearch(col_vec, {0.0f}, winners, /*ef=*/size_t(decoys + winners));
+    CHECK_EQUAL(winners, exact.size());
+    for (int i = 0; i < winners; ++i)
+        CHECK_EQUAL(decoys + i, exact[size_t(i)].get<Int>(col_id));
+}
+
 // SQ8 with the cosine metric: quantization params are learned over the
 // normalized vectors and queries normalize before ranking.
 TEST(Table_VectorIndexSQ8Cosine)
@@ -6665,6 +6850,16 @@ TEST(Table_VectorIndexSQ8Cosine)
         CHECK_EQUAL(1, v.size());
         CHECK_EQUAL(probe, v[0].get<Int>(col_id));
     }
+
+    // Explicit flat-exact mode normalizes both the non-unit query and the
+    // scaled live table vectors before comparing cosine distance.
+    std::vector<float> query = knn_test_vec(77);
+    for (float& x : query)
+        x *= 7.0f;
+    TableView exact = t->where().find_all();
+    exact.knnsearch(col_vec, query, 1, /*ef=*/t->size());
+    CHECK_EQUAL(1, exact.size());
+    CHECK_EQUAL(77, exact[0].get<Int>(col_id));
 }
 
 // Event-driven maintenance: inserts, erases and in-place edits are recorded as

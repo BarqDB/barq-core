@@ -444,6 +444,7 @@ void TableView::do_sync()
 
     if (m_collection_source) {
         m_key_values.clear();
+        m_key_values.set_unique_direct_table_results(false);
         auto sz = m_collection_source->size();
         for (size_t i = 0; i < sz; i++) {
             m_key_values.add(m_collection_source->get_key(i));
@@ -451,6 +452,7 @@ void TableView::do_sync()
     }
     else if (m_source_column_key) {
         m_key_values.clear();
+        m_key_values.set_unique_direct_table_results(false);
         if (m_table && m_linked_obj.is_valid()) {
             if (m_table->valid_column(m_source_column_key)) { // return empty result, if column has been removed
                 ColKey backlink_col = m_table->get_opposite_column(m_source_column_key);
@@ -486,6 +488,7 @@ void TableView::do_sync()
         }
         QueryStateFindAll<std::vector<ObjKey>> st(m_key_values, limit);
         m_query->do_find_all(st);
+        m_key_values.set_unique_direct_table_results(m_query->produces_results_in_table_order());
     }
 
     apply_descriptors(m_descriptor_ordering);

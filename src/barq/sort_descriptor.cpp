@@ -26,6 +26,7 @@
 #include <barq/dictionary.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -406,6 +407,7 @@ void FilterDescriptor::execute(const Table& table, KeyValues& key_values, const 
 {
     KeyValues filtered;
     filtered.create();
+    filtered.set_unique_direct_table_results(key_values.has_unique_direct_table_results());
     auto sz = key_values.size();
     for (size_t i = 0; i < sz; i++) {
         auto key = key_values.get(i);
@@ -796,26 +798,34 @@ std::string SemanticSearchDescriptor::get_description(ConstTableRef) const
 void SemanticSearchDescriptor::execute(const Table& table, KeyValues& key_values, const BaseDescriptor*) const
 {
     const size_t dim = m_query_data.size();
-    const size_t candidates = key_values.size();
-    if (dim == 0 || candidates == 0) {
+    const size_t candidate_rows = key_values.size();
+    if (dim == 0 || candidate_rows == 0) {
         key_values.clear();
         return;
+    }
+    if (!std::all_of(m_query_data.begin(), m_query_data.end(), [](float value) {
+            return std::isfinite(value);
+        })) {
+        throw InvalidArgument("Query vector must contain only finite values");
     }
 
     // If a persisted vector index exists on this column, use it — it survives reopen
     // without a rebuild and is maintained through the table.
     if (VectorIndex* vindex = table.get_vector_index(m_column)) {
         std::vector<ObjKey> ordered;
-        if (candidates == table.size()) {
+        if (key_values.has_unique_direct_table_results() && candidate_rows == table.size()) {
             // The view covers the whole table: skip building a candidate set (it
             // costs O(view) per query); the index validates results instead.
             ordered = vindex->search(table, m_query_data, m_k, nullptr, m_ef);
         }
         else {
             std::vector<uint64_t> keys;
-            keys.reserve(candidates);
-            for (size_t i = 0; i < candidates; ++i)
-                keys.push_back(uint64_t(key_values.get(i).value));
+            keys.reserve(candidate_rows);
+            for (size_t i = 0; i < candidate_rows; ++i) {
+                ObjKey key = key_values.get(i);
+                if (key != null_key && table.is_valid(key))
+                    keys.push_back(uint64_t(key.value));
+            }
             VectorCandidates cand(std::move(keys)); // a bitmap for dense key ranges
             ordered = vindex->search(table, m_query_data, m_k, &cand, m_ef);
         }
@@ -828,9 +838,12 @@ void SemanticSearchDescriptor::execute(const Table& table, KeyValues& key_values
     // Otherwise fall back to an ad-hoc in-memory graph (no persisted index required).
     // Only objects that passed the preceding query are eligible neighbours.
     std::unordered_set<hnswlib::labeltype> allowed;
-    allowed.reserve(candidates);
-    for (size_t i = 0; i < candidates; ++i)
-        allowed.insert(hnswlib::labeltype(key_values.get(i).value));
+    allowed.reserve(candidate_rows);
+    for (size_t i = 0; i < candidate_rows; ++i) {
+        ObjKey key = key_values.get(i);
+        if (key != null_key && table.is_valid(key))
+            allowed.insert(hnswlib::labeltype(key.value));
+    }
 
     std::vector<ObjKey> ordered;
     {
