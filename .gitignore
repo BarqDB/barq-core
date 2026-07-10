@@ -111,3 +111,10 @@ ssh_agent_commands.sh
 # release script artifacts
 extracted_changelog.md
 pr-body.txt
+
+# CMake build directories
+cmake-build-*
+
+# xcframework build artifacts
+*.xcframework/
+barq-monorepo-xcframework-*.tar.xz
