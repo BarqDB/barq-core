@@ -6698,6 +6698,51 @@ TEST(Table_VectorIndexDeclaredDimensions)
     }
 }
 
+// Re-adding a vector index is idempotent for an identical config, but a changed
+// config is rejected (silently keeping the old index would be wrong), so the SDK
+// can reconcile by removing and re-creating. The stored config is readable.
+TEST(Table_VectorIndexConfigReconcile)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    DBRef sg = DB::create(path);
+    WriteTransaction wt(sg);
+    TableRef t = wt.add_table("v");
+    ColKey col_id = t->add_column(type_Int, "id");
+    ColKey col_vec = t->add_column_list(type_Float, "embedding");
+    for (int i = 0; i < 10; ++i) {
+        Obj o = t->create_object();
+        o.set(col_id, i);
+        for (int d = 0; d < 3; ++d)
+            o.get_list<float>(col_vec).add(float(i) + float(d));
+    }
+    VectorIndexConfig cfg;
+    cfg.metric = VectorMetric::Cosine;
+    cfg.dimensions = 3;
+    t->add_vector_index(col_vec, cfg);
+
+    // Stored config is readable.
+    CHECK(t->get_vector_index(col_vec)->config().metric == VectorMetric::Cosine);
+    CHECK_EQUAL(size_t(3), t->get_vector_index(col_vec)->config().dimensions);
+
+    // Identical config: idempotent no-op.
+    t->add_vector_index(col_vec, cfg);
+    CHECK(t->has_vector_index(col_vec));
+
+    // A changed metric or dimension is rejected, not silently ignored.
+    VectorIndexConfig other = cfg;
+    other.metric = VectorMetric::L2;
+    CHECK_THROW(t->add_vector_index(col_vec, other), IllegalOperation);
+    VectorIndexConfig other_dim = cfg;
+    other_dim.dimensions = 4;
+    CHECK_THROW(t->add_vector_index(col_vec, other_dim), IllegalOperation);
+
+    // Reconcile by removing then re-creating with the new config.
+    t->remove_vector_index(col_vec);
+    t->add_vector_index(col_vec, other);
+    CHECK(t->get_vector_index(col_vec)->config().metric == VectorMetric::L2);
+    wt.commit();
+}
+
 // The exact flag runs a flat scan over live data regardless of the beam, so it
 // returns the true nearest neighbours even when the configured beam is tiny.
 TEST(Table_VectorIndexExactFlag)

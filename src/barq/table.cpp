@@ -2265,6 +2265,15 @@ void Table::hint_compaction_after_index_rebuild() const noexcept
         tr->request_opportunistic_compaction();
 }
 
+// Two vector index configs can share the same persisted graph when the settings
+// that shape it match. ef_search is a query-time beam floor (it may differ without
+// a rebuild) and build_threads is not persisted, so both are excluded.
+static bool vector_config_compatible(const VectorIndexConfig& a, const VectorIndexConfig& b)
+{
+    return a.metric == b.metric && a.encoding == b.encoding && a.dimensions == b.dimensions && a.m == b.m &&
+           a.ef_construction == b.ef_construction;
+}
+
 void Table::add_vector_index(ColKey col_key, const VectorIndexConfig& config)
 {
     check_column(col_key);
@@ -2275,8 +2284,19 @@ void Table::add_vector_index(ColKey col_key, const VectorIndexConfig& config)
 
     auto spec_ndx = leaf_ndx2spec_ndx(col_key.get_index());
     auto attr = m_spec.get_column_attr(spec_ndx);
-    if (attr.test(col_attr_Vector_Indexed))
-        return; // already indexed
+    if (attr.test(col_attr_Vector_Indexed)) {
+        // Already indexed: an identical request is an idempotent no-op, but a
+        // different configuration is rejected rather than silently ignored, so the
+        // wrong index can't be left in place. The caller reconciles by removing it.
+        if (VectorIndex* existing = get_vector_index(col_key)) {
+            if (!vector_config_compatible(existing->config(), config))
+                throw IllegalOperation(
+                    util::format("A vector index already exists on '%1' with a different configuration; "
+                                 "remove it before re-creating with new settings",
+                                 get_column_name(col_key)));
+        }
+        return;
+    }
 
     do_add_vector_index(col_key, config);
 
