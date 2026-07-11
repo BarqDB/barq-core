@@ -589,7 +589,7 @@ size_t Results::index_of(Mixed const& value)
 
 size_t Results::index_of(Query&& q)
 {
-    if (m_descriptor_ordering.will_apply_sort()) {
+    if (m_descriptor_ordering.will_apply_sort() || m_descriptor_ordering.will_apply_knn()) {
         Results filtered(filter(std::move(q)));
         filtered.assert_unlocked();
         auto first = filtered.first();
@@ -1120,7 +1120,10 @@ bool Results::is_in_table_order() const NO_THREAD_SAFETY_ANALYSIS
         case Mode::Collection:
             return false;
         case Mode::Query:
-            return m_query.produces_results_in_table_order() && !m_descriptor_ordering.will_apply_sort();
+            // A knn descriptor orders by distance, so like a sort it takes the
+            // results out of table order (notifications must then compute moves).
+            return m_query.produces_results_in_table_order() && !m_descriptor_ordering.will_apply_sort() &&
+                   !m_descriptor_ordering.will_apply_knn();
         case Mode::TableView:
             return m_table_view.is_in_table_order();
     }

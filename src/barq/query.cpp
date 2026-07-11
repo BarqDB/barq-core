@@ -1331,7 +1331,8 @@ ObjKey Query::find() const
     init();
 
     // ordering could change the way in which objects are returned, in this case we need to run find_all()
-    if (m_ordering && (m_ordering->will_apply_sort() || m_ordering->will_apply_distinct())) {
+    if (m_ordering &&
+        (m_ordering->will_apply_sort() || m_ordering->will_apply_distinct() || m_ordering->will_apply_knn())) {
         auto table_view = find_all();
         if (table_view.size() > 0) {
             // we just need to find the first.

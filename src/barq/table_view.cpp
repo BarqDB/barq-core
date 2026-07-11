@@ -588,7 +588,8 @@ bool TableView::is_in_table_order() const
     }
     else {
         m_query->m_table.check();
-        return m_query->produces_results_in_table_order() && !m_descriptor_ordering.will_apply_sort();
+        return m_query->produces_results_in_table_order() && !m_descriptor_ordering.will_apply_sort() &&
+               !m_descriptor_ordering.will_apply_knn();
     }
 }
 

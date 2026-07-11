@@ -3733,6 +3733,7 @@ TEST_CASE("results: knnsearch", "[results]") {
         lst.add(0.020f);
         lst.add(0.100f);
     }
+    table->add_vector_index(col_lst); // semantic search requires a persisted index
     r->commit_transaction();
 
     SECTION("Single knn query") {
@@ -3749,6 +3750,32 @@ TEST_CASE("results: knnsearch", "[results]") {
         REQUIRE(v2.size() == 2);
         REQUIRE(v2.get(0).get<Int>(col_id) == 4);
         REQUIRE(v2.get(1).get<Int>(col_id) == 1);
+    }
+
+    SECTION("Live notifications on a knn result set") {
+        Results base(r, table->where());
+        Results knn = base.knn_search(col_lst, {0.003f, 0.005f, 0.010f, 0.020f, 0.100f}, 3);
+
+        int calls = 0;
+        auto token = knn.add_notification_callback([&](CollectionChangeSet) {
+            ++calls;
+        });
+        advance_and_notify(*r);
+        REQUIRE(calls == 1);
+        REQUIRE(knn.size() == 3);
+        ObjKey was_nearest = knn.get(0).get_key();
+
+        // Remove the current nearest neighbour. The knn set reorders (a knn result
+        // is distance-ordered, not table-ordered), the gap is filled, and the
+        // callback fires with a well-formed change set.
+        r->begin_transaction();
+        table->remove_object(was_nearest);
+        r->commit_transaction();
+        advance_and_notify(*r);
+
+        REQUIRE(calls == 2);
+        REQUIRE(knn.size() == 3);
+        REQUIRE(knn.get(0).get_key() != was_nearest);
     }
 }
 
