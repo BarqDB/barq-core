@@ -6625,6 +6625,81 @@ TEST(Table_VectorIndexCandidateSetSafety)
                 InvalidArgument);
 }
 
+// A declared dimension is persisted and enforced. It survives reopen, a stored
+// vector of any other non-empty length is rejected (not silently dropped, which
+// would be invisible data loss), empty vectors are skipped, and a query of the
+// wrong length is rejected. Infer mode (dimensions == 0) keeps the legacy skip.
+TEST(Table_VectorIndexDeclaredDimensions)
+{
+    // 1. Declared dimension persists, survives reopen, and gates queries.
+    {
+        SHARED_GROUP_TEST_PATH(path);
+        DBRef sg = DB::create(path);
+        ColKey col_id, col_vec;
+        {
+            WriteTransaction wt(sg);
+            TableRef t = wt.add_table("v");
+            col_id = t->add_column(type_Int, "id");
+            col_vec = t->add_column_list(type_Float, "embedding");
+            for (int i = 0; i < 5; ++i) {
+                Obj o = t->create_object();
+                o.set(col_id, i);
+                Lst<float> lst = o.get_list<float>(col_vec);
+                for (int d = 0; d < 4; ++d)
+                    lst.add(float(i) + 0.1f * float(d));
+            }
+            t->create_object().set(col_id, 99); // empty vector: skipped, not rejected
+
+            VectorIndexConfig cfg;
+            cfg.metric = VectorMetric::L2;
+            cfg.dimensions = 4;
+            t->add_vector_index(col_vec, cfg);
+            CHECK_EQUAL(size_t(4), t->get_vector_index(col_vec)->config().dimensions);
+            wt.commit();
+        }
+        {
+            ReadTransaction rt(sg);
+            ConstTableRef t = rt.get_table("v");
+            // Declared dimension survives reopen (restored from the header flag).
+            CHECK_EQUAL(size_t(4), t->get_vector_index(col_vec)->config().dimensions);
+
+            TableView v = t->where().find_all();
+            std::vector<float> q{0.0f, 0.1f, 0.2f, 0.3f};
+            v.knnsearch(col_vec, q, 1);
+            CHECK_EQUAL(1, v.size());
+            CHECK_EQUAL(0, v[0].get<Int>(col_id));
+
+            TableView v2 = t->where().find_all();
+            std::vector<float> bad{0.0f, 0.1f}; // wrong length
+            CHECK_THROW(v2.knnsearch(col_vec, bad, 1), IllegalOperation);
+        }
+    }
+
+    // 2. Building over data that contains a wrong-size vector is rejected, rather
+    //    than silently dropping that row from the index.
+    {
+        SHARED_GROUP_TEST_PATH(path2);
+        DBRef sg = DB::create(path2);
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("v");
+        ColKey cid = t->add_column(type_Int, "id");
+        ColKey cv = t->add_column_list(type_Float, "embedding");
+        Obj a = t->create_object();
+        a.set(cid, 0);
+        for (int d = 0; d < 4; ++d)
+            a.get_list<float>(cv).add(float(d));
+        Obj b = t->create_object();
+        b.set(cid, 1);
+        b.get_list<float>(cv).add(1.0f);
+        b.get_list<float>(cv).add(2.0f); // length 2 != declared 4
+
+        VectorIndexConfig cfg;
+        cfg.metric = VectorMetric::L2;
+        cfg.dimensions = 4;
+        CHECK_THROW(t->add_vector_index(cv, cfg), IllegalOperation);
+    }
+}
+
 // SQ8 encoding: the index stores 1-byte quantized codes and re-ranks the best
 // beam hits against the exact table data. The test vectors use two distinct
 // values per dimension, which the quantizer represents exactly — so winners

@@ -102,6 +102,10 @@ private:
 struct VectorIndexConfig {
     VectorMetric metric = VectorMetric::InnerProduct;
     VectorEncoding encoding = VectorEncoding::Float32; // vector storage; fixed at creation
+    size_t dimensions = 0;        // declared vector length. 0 = infer from the first vector
+                                  // (legacy: other sizes are silently skipped). When > 0 the
+                                  // dimension is enforced — a stored or query vector of any
+                                  // other non-empty length is rejected, not dropped.
     size_t m = 16;                // HNSW out-degree (graph connectivity)
     size_t ef_construction = 200; // build-time beam width (higher = better graph, slower build)
     size_t ef_search = 0;         // query-time beam width floor (higher = better recall, slower query).

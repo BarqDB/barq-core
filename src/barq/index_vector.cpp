@@ -101,6 +101,7 @@ constexpr size_t h_count = 13;
 constexpr int64_t s_format_legacy = 3;  // native graph, synced by table diff
 constexpr int64_t s_format = 4;         // + event lists: synced in O(changes)
 constexpr int64_t f_events_overflowed = 1; // h_flags bit: recording gave up, diff by scan
+constexpr int64_t f_dim_declared = 2;       // h_flags bit: dimension came from config, enforce it
 
 // Recording stops (and the next absorb falls back to one table-diff scan) once the
 // event lists reach this many entries — bounds file growth when a huge write burst
@@ -137,6 +138,21 @@ bool is_finite_vector(const float* v, size_t dim) noexcept
             return false;
     }
     return true;
+}
+
+// A vector column is fixed-dimension. An empty (unset) list never participates in
+// the index. Any other length is a data error when the dimension was declared in
+// the config (`declared` true) — surfaced instead of silently dropping the row —
+// and a legacy silent-skip only in infer mode. Returns true when the vector should
+// be indexed at length `d`.
+bool admit_vector_dim(size_t sz, size_t d, bool declared)
+{
+    if (sz == d)
+        return true;
+    if (sz != 0 && declared)
+        throw IllegalOperation("Vector index expects dimension " + std::to_string(d) +
+                               ", but a stored vector has length " + std::to_string(sz));
+    return false;
 }
 
 // ---- SQ8 scalar quantization ----------------------------------------------------
@@ -1311,6 +1327,11 @@ void VectorIndex::create_persisted_state(Allocator& alloc)
     header.set(h_efc, int64_t(m_config.ef_construction));
     header.set(h_efs, int64_t(m_config.ef_search));
     header.set(h_encoding, int64_t(m_config.encoding));
+    if (m_config.dimensions > 0) {
+        // A declared dimension is fixed at creation and enforced from here on.
+        header.set(h_dim, int64_t(m_config.dimensions));
+        header.set(h_flags, f_dim_declared);
+    }
     std::random_device rd;
     header.set(h_salt, int64_t((uint64_t(rd()) << 32) ^ rd()));
     m_top.add(from_ref(header.get_ref()));
@@ -1490,6 +1511,9 @@ void VectorIndex::load_config_from_header()
     m_config.m = size_t(header_field(h_m));
     m_config.ef_construction = size_t(header_field(h_efc));
     m_config.ef_search = size_t(header_field(h_efs));
+    // A declared dimension is remembered so a later rebuild keeps enforcing it
+    // instead of re-inferring; an inferred index reports dimensions == 0.
+    m_config.dimensions = (int64_t(header_field(h_flags)) & f_dim_declared) ? size_t(header_field(h_dim)) : 0;
 }
 
 size_t VectorIndex::dim() const
@@ -1874,23 +1898,29 @@ void VectorIndex::event_absorb(const Table& table)
 
     size_t d = dim();
     if (d == 0) {
-        // Dimension is discovered from the first candidate with a vector.
-        for (int64_t key : cand) {
-            Obj obj = table.try_get_object(ObjKey(key));
-            if (!obj)
-                continue;
-            auto lst = obj.get_list<float>(m_column);
-            if (lst.size() > 0) {
-                d = lst.size();
-                break;
+        // Header has no dimension yet: use the declared width, or infer it from
+        // the first candidate carrying a vector.
+        d = m_config.dimensions;
+        if (d == 0) {
+            for (int64_t key : cand) {
+                Obj obj = table.try_get_object(ObjKey(key));
+                if (!obj)
+                    continue;
+                auto lst = obj.get_list<float>(m_column);
+                if (lst.size() > 0) {
+                    d = lst.size();
+                    break;
+                }
             }
         }
-        if (d == 0) { // none of the changes carry vector data
+        if (d == 0) { // nothing declared and no change carries vector data
             clear_events();
             done();
             return;
         }
         t.set_hdr(h_dim, int64_t(d));
+        if (m_config.dimensions > 0)
+            t.set_hdr(h_flags, t.hdr(h_flags) | f_dim_declared);
     }
 
     int64_t live = t.hdr(h_total) - t.hdr(h_deleted);
@@ -1914,7 +1944,7 @@ void VectorIndex::event_absorb(const Table& table)
         if (!obj)
             continue;
         auto lst = obj.get_list<float>(m_column);
-        if (lst.size() != d)
+        if (!admit_vector_dim(lst.size(), d, m_config.dimensions > 0))
             continue;
         lst.get_tree().get_range(0, d, buf.data());
         if (m_config.metric == VectorMetric::Cosine)
@@ -1961,12 +1991,16 @@ void VectorIndex::scan_absorb(const Table& table)
 
     size_t d = dim();
     if (d == 0) {
-        // Dimension is discovered from the first non-empty vector.
-        for (auto obj : table) {
-            auto lst = obj.get_list<float>(m_column);
-            if (lst.size() > 0) {
-                d = lst.size();
-                break;
+        // Header has no dimension yet: use the declared width, or infer it from
+        // the first non-empty vector.
+        d = m_config.dimensions;
+        if (d == 0) {
+            for (auto obj : table) {
+                auto lst = obj.get_list<float>(m_column);
+                if (lst.size() > 0) {
+                    d = lst.size();
+                    break;
+                }
             }
         }
         if (d == 0) {
@@ -1975,6 +2009,8 @@ void VectorIndex::scan_absorb(const Table& table)
             return;
         }
         t.set_hdr(h_dim, int64_t(d));
+        if (m_config.dimensions > 0)
+            t.set_hdr(h_flags, t.hdr(h_flags) | f_dim_declared);
     }
 
     // Pending in-place edits: tombstone the stale copy; the delta pass below
@@ -2002,7 +2038,7 @@ void VectorIndex::scan_absorb(const Table& table)
     std::unordered_set<int64_t> present;
     for (auto obj : table) {
         auto lst = obj.get_list<float>(m_column);
-        if (lst.size() != d)
+        if (!admit_vector_dim(lst.size(), d, m_config.dimensions > 0))
             continue;
         int64_t key = obj.get_key().value;
         present.insert(key);
@@ -2093,17 +2129,30 @@ void VectorIndex::do_rebuild(const Table& table)
     m_cache->key2id.clear();
     m_cache->key2id_valid = true;
 
-    size_t d = 0;
+    // A declared dimension is authoritative; otherwise infer it from the first
+    // vector present. A declared dimension with no data yet still builds a valid
+    // empty index that already knows its width — the bootstrap/fill case.
+    const bool declared = m_config.dimensions > 0;
+    size_t d = m_config.dimensions;
+    bool have_data = false;
     for (auto obj : table) {
         auto lst = obj.get_list<float>(m_column);
-        if (lst.size() > 0) {
+        if (lst.size() == 0)
+            continue;
+        if (d == 0)
             d = lst.size();
+        if (lst.size() == d) {
+            have_data = true;
             break;
         }
     }
     if (d == 0)
-        return;
+        return; // no declaration and no vectors: nothing to build
     t.set_hdr(h_dim, int64_t(d));
+    if (declared)
+        t.set_hdr(h_flags, t.hdr(h_flags) | f_dim_declared);
+    if (!have_data)
+        return; // dimension known, no vectors yet — empty index, ready to fill
 
     const bool sq8 = m_config.encoding == VectorEncoding::SQ8;
     std::vector<float> buf(d);
@@ -2114,7 +2163,7 @@ void VectorIndex::do_rebuild(const Table& table)
         std::vector<float> mx(d, -std::numeric_limits<float>::infinity());
         for (auto obj : table) {
             auto lst = obj.get_list<float>(m_column);
-            if (lst.size() != d)
+            if (!admit_vector_dim(lst.size(), d, m_config.dimensions > 0))
                 continue;
             lst.get_tree().get_range(0, d, buf.data());
             if (m_config.metric == VectorMetric::Cosine)
@@ -2141,7 +2190,7 @@ void VectorIndex::do_rebuild(const Table& table)
     builder.reserve(table.size());
     for (auto obj : table) {
         auto lst = obj.get_list<float>(m_column);
-        if (lst.size() != d)
+        if (!admit_vector_dim(lst.size(), d, m_config.dimensions > 0))
             continue;
         lst.get_tree().get_range(0, d, buf.data());
         if (m_config.metric == VectorMetric::Cosine)
