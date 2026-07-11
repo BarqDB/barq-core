@@ -6700,6 +6700,41 @@ TEST(Table_VectorIndexDeclaredDimensions)
     }
 }
 
+// The exact flag runs a flat scan over live data regardless of the beam, so it
+// returns the true nearest neighbours even when the configured beam is tiny.
+TEST(Table_VectorIndexExactFlag)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    DBRef sg = DB::create(path);
+    WriteTransaction wt(sg);
+    TableRef t = wt.add_table("v");
+    ColKey col_id = t->add_column(type_Int, "id");
+    ColKey col_vec = t->add_column_list(type_Float, "embedding");
+    for (int i = 0; i < 200; ++i) {
+        Obj o = t->create_object();
+        o.set(col_id, i);
+        o.get_list<float>(col_vec).add(float(i)); // 1-D vectors 0..199
+    }
+    VectorIndexConfig cfg;
+    cfg.metric = VectorMetric::L2;
+    cfg.dimensions = 1;
+    cfg.ef_search = 2; // deliberately tiny beam
+    t->add_vector_index(col_vec, cfg);
+
+    // exact=true must return the true nearest (id 137 for query 137.4).
+    TableView v = t->where().find_all();
+    v.knnsearch(col_vec, std::vector<float>{137.4f}, 1, /*ef=*/0, /*exact=*/true);
+    CHECK_EQUAL(1, v.size());
+    CHECK_EQUAL(137, v[0].get<Int>(col_id));
+
+    // A filtered view still routes exact through a flat scan of the view.
+    TableView half = t->where().less(col_id, 100).find_all();
+    half.knnsearch(col_vec, std::vector<float>{90.6f}, 1, /*ef=*/0, /*exact=*/true);
+    CHECK_EQUAL(1, half.size());
+    CHECK_EQUAL(91, half[0].get<Int>(col_id));
+    wt.commit();
+}
+
 // SQ8 encoding: the index stores 1-byte quantized codes and re-ranks the best
 // beam hits against the exact table data. The test vectors use two distinct
 // values per dimension, which the quantizer represents exactly — so winners

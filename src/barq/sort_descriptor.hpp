@@ -316,11 +316,15 @@ private:
 class SemanticSearchDescriptor : public BaseDescriptor {
 public:
     // `ef` overrides the index's persisted ef_search beam for this query only
-    // (0 = use the index config). Larger = better recall, slower.
-    SemanticSearchDescriptor(ColKey column, const std::vector<float>& query_data, size_t k, size_t ef = 0)
+    // (0 = use the index config). Larger = better recall, slower. `exact` requests
+    // a true flat scan over live table data (mutually exclusive with a custom ef,
+    // which it overrides): the exact nearest neighbours, no graph approximation.
+    SemanticSearchDescriptor(ColKey column, const std::vector<float>& query_data, size_t k, size_t ef = 0,
+                             bool exact = false)
         : m_query_data(query_data)
         , m_k(k)
         , m_ef(ef)
+        , m_exact(exact)
         , m_column(column)
     {
         if (!(column.get_type() == col_type_Float && column.is_list())) {
@@ -360,11 +364,16 @@ public:
     {
         return m_ef;
     }
+    bool get_exact() const
+    {
+        return m_exact;
+    }
 
 private:
     std::vector<float> m_query_data;
     size_t m_k;
     size_t m_ef = 0;
+    bool m_exact = false;
     ColKey m_column;
 };
 

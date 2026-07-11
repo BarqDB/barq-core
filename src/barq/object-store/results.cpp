@@ -966,13 +966,14 @@ Results Results::apply_ordering(DescriptorOrdering&& ordering)
     return Results(m_barq, do_get_query(), std::move(new_order));
 }
 
-Results Results::knn_search(ColKey column, const std::vector<float>& query_data, size_t k) const
+Results Results::knn_search(ColKey column, const std::vector<float>& query_data, size_t k, size_t ef,
+                            bool exact) const
 {
     if (!m_table->is_list(column) || m_table->get_column_type(column) != type_Float)
         throw IllegalOperation("Semantic knn search can only be done on lists of floats");
 
     auto new_order = m_descriptor_ordering;
-    new_order.append_knn(SemanticSearchDescriptor(column, query_data, k));
+    new_order.append_knn(SemanticSearchDescriptor(column, query_data, k, ef, exact));
     util::CheckedUniqueLock lock(m_mutex);
     if (m_mode == Mode::Collection)
         return Results(m_barq, m_collection, std::move(new_order));

@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -813,10 +814,13 @@ void SemanticSearchDescriptor::execute(const Table& table, KeyValues& key_values
     // without a rebuild and is maintained through the table.
     if (VectorIndex* vindex = table.get_vector_index(m_column)) {
         std::vector<ObjKey> ordered;
+        // Exact mode asks the index for a beam that covers the whole candidate
+        // universe, which it answers with a flat scan over live table data.
+        const size_t ef = m_exact ? std::numeric_limits<size_t>::max() : m_ef;
         if (key_values.has_unique_direct_table_results() && candidate_rows == table.size()) {
             // The view covers the whole table: skip building a candidate set (it
             // costs O(view) per query); the index validates results instead.
-            ordered = vindex->search(table, m_query_data, m_k, nullptr, m_ef);
+            ordered = vindex->search(table, m_query_data, m_k, nullptr, ef);
         }
         else {
             std::vector<uint64_t> keys;
@@ -827,7 +831,7 @@ void SemanticSearchDescriptor::execute(const Table& table, KeyValues& key_values
                     keys.push_back(uint64_t(key.value));
             }
             VectorCandidates cand(std::move(keys)); // a bitmap for dense key ranges
-            ordered = vindex->search(table, m_query_data, m_k, &cand, m_ef);
+            ordered = vindex->search(table, m_query_data, m_k, &cand, ef);
         }
         key_values.clear();
         for (ObjKey key : ordered)
