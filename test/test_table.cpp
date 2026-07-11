@@ -5559,7 +5559,7 @@ TEST(Table_VectorIndexRemoveRebuild)
         wt.commit();
     }
 
-    // Remove: index gone, search still works (brute-force fallback), remove is idempotent.
+    // Remove: index gone; knn without an index is now rejected, remove is idempotent.
     {
         WriteTransaction wt(sg);
         TableRef t = wt.get_table("vectors");
@@ -5573,9 +5573,7 @@ TEST(Table_VectorIndexRemoveRebuild)
         ConstTableRef t = rt.get_table("vectors");
         CHECK_NOT(t->has_vector_index(col_vec));
         TableView v = t->where().find_all();
-        v.knnsearch(col_vec, knn_test_vec(50), 1);
-        CHECK_EQUAL(1, v.size());
-        CHECK_EQUAL(50, v[0].get<Int>(col_id));
+        CHECK_THROW(v.knnsearch(col_vec, knn_test_vec(50), 1), IllegalOperation);
     }
 
     // Re-add, then edit `victim`'s vector in place.

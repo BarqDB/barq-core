@@ -2475,6 +2475,8 @@ TEST(TableView_VectorSearch)
     }
 
     // Test single knn query
+    table.add_vector_index(col_lst); // semantic search now requires a persisted index
+
     TableView v = table.where().find_all();
     v.knnsearch(col_lst, {0.003f, 0.005f, 0.010f, 0.020f, 0.100f}, 2);
     CHECK_EQUAL(2, v.size());
@@ -2537,6 +2539,8 @@ TEST(TableView_VectorSearch_Index)
 
     // Querying with an object's own embedding must return that object first: proof
     // the graph search locates the exact neighbour among 2000, not by luck.
+    table.add_vector_index(col_vec); // semantic search now requires a persisted index
+
     const int target = 1234;
     TableView v = table.where().find_all();
     v.knnsearch(col_vec, make_vec(target), 10);

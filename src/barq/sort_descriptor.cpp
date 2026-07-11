@@ -28,29 +28,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <unordered_set>
-
-// hnswlib is vendored third-party (Apache 2.0); silence its internal warnings so
-// they do not leak into our build. Only this translation unit needs the full
-// algorithm header (HierarchicalNSW) — the public descriptor API stays hnswlib-free.
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wshorten-64-to-32"
-#pragma clang diagnostic ignored "-Wsign-compare"
-#pragma clang diagnostic ignored "-Wreorder-ctor"
-#pragma clang diagnostic ignored "-Wconditional-uninitialized"
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#endif
-#include <external/hnswlib/hnswlib.h>
-#if defined(__clang__)
-#pragma clang diagnostic pop
-// The index cache below is guarded by a plain global std::mutex rather than a
-// capability-annotated one, so opt out of the thread-safety negative-capability check.
-#pragma clang diagnostic ignored "-Wthread-safety-negative"
-#endif
 
 using namespace barq;
 
@@ -708,88 +687,6 @@ void DescriptorOrdering::get_versions(const Group* group, TableVersions& version
     }
 }
 
-namespace {
-
-// ---------------------------------------------------------------------------
-// In-memory HNSW index backing SemanticSearchDescriptor.
-//
-// realm-core's prototype scanned every object linearly. Instead we build a real
-// hnswlib HNSW graph over the column's vectors and reuse it across queries.
-//
-// The graph lives in process memory, keyed by the live (table, column) identity
-// plus the table's content version, and is rebuilt lazily whenever the data
-// changes. It is not yet persisted to the database file, so the first query
-// after a write pays a one-off rebuild; later queries are served from the cache.
-// Access is serialized by a single mutex for now (correctness over concurrency).
-// ---------------------------------------------------------------------------
-struct HnswEntry {
-    TableKey table_key;
-    uint_fast64_t content_version = uint_fast64_t(-1);
-    size_t dim = 0;
-    size_t count = 0;
-    std::unique_ptr<hnswlib::InnerProductSpace> space;
-    std::unique_ptr<hnswlib::HierarchicalNSW<float>> index;
-};
-
-std::mutex g_hnsw_mutex;
-std::map<std::pair<const Table*, int64_t>, HnswEntry> g_hnsw_cache;
-
-// Build, or reuse a cached, HNSW graph over `column` for the objects in `table`.
-// Returns nullptr when there is nothing to index. Call with g_hnsw_mutex held.
-hnswlib::HierarchicalNSW<float>* get_or_build_index(const Table& table, ColKey column, size_t dim)
-{
-    HnswEntry& entry = g_hnsw_cache[std::make_pair(&table, column.value)];
-
-    const uint_fast64_t version = table.get_content_version();
-    const size_t count = table.size();
-
-    const bool fresh = entry.index && entry.table_key == table.get_key() &&
-                       entry.content_version == version && entry.dim == dim && entry.count == count;
-    if (fresh)
-        return entry.index->cur_element_count > 0 ? entry.index.get() : nullptr;
-
-    // Stale or missing: rebuild from scratch.
-    entry = HnswEntry{};
-    entry.table_key = table.get_key();
-    entry.content_version = version;
-    entry.dim = dim;
-    entry.count = count;
-    if (count == 0)
-        return nullptr;
-
-    entry.space = std::make_unique<hnswlib::InnerProductSpace>(dim);
-    entry.index = std::make_unique<hnswlib::HierarchicalNSW<float>>(entry.space.get(), count);
-
-    std::vector<float> buf(dim);
-    for (auto obj : table) {
-        Lst<float> lst = obj.get_list<float>(column);
-        if (lst.size() != dim)
-            continue; // only index vectors of the query's dimension
-        for (size_t i = 0; i < dim; ++i)
-            buf[i] = lst.get(i);
-        entry.index->addPoint(buf.data(), hnswlib::labeltype(obj.get_key().value));
-    }
-
-    return entry.index->cur_element_count > 0 ? entry.index.get() : nullptr;
-}
-
-// Restricts an HNSW search to the object keys that survived the preceding query.
-class CandidateFilter : public hnswlib::BaseFilterFunctor {
-public:
-    explicit CandidateFilter(const std::unordered_set<hnswlib::labeltype>& allowed)
-        : m_allowed(allowed)
-    {
-    }
-    bool operator()(hnswlib::labeltype id) override
-    {
-        return m_allowed.find(id) != m_allowed.end();
-    }
-
-private:
-    const std::unordered_set<hnswlib::labeltype>& m_allowed;
-};
-
-} // namespace
 
 std::string SemanticSearchDescriptor::get_description(ConstTableRef) const
 {
@@ -839,33 +736,10 @@ void SemanticSearchDescriptor::execute(const Table& table, KeyValues& key_values
         return;
     }
 
-    // Otherwise fall back to an ad-hoc in-memory graph (no persisted index required).
-    // Only objects that passed the preceding query are eligible neighbours.
-    std::unordered_set<hnswlib::labeltype> allowed;
-    allowed.reserve(candidate_rows);
-    for (size_t i = 0; i < candidate_rows; ++i) {
-        ObjKey key = key_values.get(i);
-        if (key != null_key && table.is_valid(key))
-            allowed.insert(hnswlib::labeltype(key.value));
-    }
-
-    std::vector<ObjKey> ordered;
-    {
-        std::lock_guard<std::mutex> lock(g_hnsw_mutex);
-        hnswlib::HierarchicalNSW<float>* index = get_or_build_index(table, m_column, dim);
-        if (index) {
-            const size_t k = std::min({m_k, allowed.size(), size_t(index->cur_element_count)});
-            // ef trades recall for speed; keep it above k (and above the element
-            // count for small data, which makes the graph search effectively exact).
-            index->setEf(std::max({k, allowed.size(), size_t(64)}));
-            CandidateFilter filter(allowed);
-            for (auto& hit : index->searchKnnCloserFirst(m_query_data.data(), k, &filter))
-                ordered.push_back(ObjKey(int64_t(hit.second)));
-        }
-    }
-
-    // Rewrite the result set to the neighbours, closest first.
-    key_values.clear();
-    for (ObjKey key : ordered)
-        key_values.add(key);
+    // No persisted vector index on this column. Refuse rather than silently
+    // building a throwaway in-memory graph: that ignored the model's configured
+    // metric (wrong for cosine/L2 data), was never persisted, and was rebuilt on
+    // every reopen. Semantic search requires an index on the column.
+    throw IllegalOperation(
+        "Semantic search requires a vector index on this property (create one with add_vector_index)");
 }
