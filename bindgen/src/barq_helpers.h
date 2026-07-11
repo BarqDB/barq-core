@@ -4,6 +4,7 @@
 #include "barq/object-store/object_store.hpp"
 #include "barq/object-store/sync/sync_session.hpp"
 #include "barq/object_id.hpp"
+#include "barq/index_vector.hpp"
 #include "barq/query.hpp"
 #include "barq/sync/client_base.hpp"
 #include "barq/sync/protocol.hpp"
@@ -277,6 +278,17 @@ struct Helpers {
     static bool needs_file_format_upgrade(const BarqConfig& config)
     {
         return config.needs_file_format_upgrade();
+    }
+
+    // Read back a vector index's persisted configuration. Used by the SDK's
+    // open-time index reconcile to detect a config that no longer matches the
+    // schema. Throws if the column has no vector index.
+    static VectorIndexConfig get_vector_index_config(const ConstTableRef& table, ColKey column)
+    {
+        VectorIndex* index = table->get_vector_index(column);
+        if (!index)
+            throw std::runtime_error("No vector index on the requested column");
+        return index->config();
     }
 };
 

@@ -8,6 +8,7 @@ headers:
   - "barq/object-store/object_store.hpp"
   - "barq/object-store/object_schema.hpp"
   - "barq/object-store/results.hpp"
+  - "barq/index_vector.hpp"
   - "barq/object-store/thread_safe_reference.hpp"
   - "barq/object-store/util/scheduler.hpp"
   - "barq/object-store/collection_notifications.hpp"
@@ -284,6 +285,21 @@ enums:
       - HTTP
       - HTTPS
 
+  # Distance metric for a vector (knn) index. The integer values are the wire
+  # contract and must match barq::VectorMetric in barq/index_vector.hpp.
+  VectorMetric:
+    values:
+      InnerProduct: 0
+      L2: 1
+      Cosine: 2
+
+  # How a vector index stores its copy of the vectors. Must match
+  # barq::VectorEncoding in barq/index_vector.hpp.
+  VectorEncoding:
+    values:
+      Float32: 0
+      SQ8: 1
+
 # These types are handled specially. They must be structs with a single fields named "value".
 keyTypes:
   ColKey: int64_t
@@ -317,6 +333,28 @@ records:
       column_key:
         type: ColKey
         default: {}
+  # Build/search parameters for a vector (knn) index. Mirrors
+  # barq::VectorIndexConfig; build_threads is intentionally omitted (it is not
+  # persisted and is never set from the SDK). metric/encoding have no default so
+  # the SDK must always state them explicitly.
+  VectorIndexConfig:
+    fields:
+      metric:
+        type: VectorMetric
+      encoding:
+        type: VectorEncoding
+      dimensions:
+        type: count_t
+        default: 0
+      m:
+        type: count_t
+        default: 16
+      ef_construction:
+        type: count_t
+        default: 200
+      ef_search:
+        type: count_t
+        default: 0
   VersionID:
     fields:
       version:
@@ -640,6 +678,9 @@ classes:
       # TODO: Consider making preverify_ok a bool.
       make_ssl_verify_callback: '(callback: (server_address: const std::string&, server_port: int, pem_data: std::string_view, preverify_ok: int, depth: int) off_thread -> bool) -> SSLVerifyCallback'
       needs_file_format_upgrade: '(config: const BarqConfig&) -> bool'
+      # Read back a vector index's persisted config (for the SDK's open-time
+      # reconcile / mismatch check). Throws if the column has no vector index.
+      get_vector_index_config: '(table: ConstTableRef, column: ColKey) -> VectorIndexConfig'
 
   LogCategoryRef:
     cppName: util::LogCategoryRef
@@ -674,6 +715,8 @@ classes:
       try_get_object: '(key: ObjKey) const -> Nullable<Obj>'
       query: '(query_string: std::string, args: std::vector<QueryArg>, mapping: KeyPathMapping) const -> Query'
       find_primary_key: '(pk: Mixed) -> ObjKey'
+      get_column_key: '(name: StringData) const -> ColKey'
+      has_vector_index: '(column: ColKey) const -> bool'
 
   TableRef:
     base: ConstTableRef
@@ -685,6 +728,12 @@ classes:
       get_link_target: '(column: ColKey) -> TableRef'
       clear: ()
       get_primary_key_column: '() -> ColKey'
+      # Vector (knn) index management. Purely local — never written to sync
+      # changesets. add_vector_index is idempotent on an identical config and
+      # throws on a conflicting one, so the SDK can call it to reconcile.
+      add_vector_index: '(column: ColKey, config: VectorIndexConfig)'
+      remove_vector_index: '(column: ColKey)'
+      rebuild_vector_index: '(column: ColKey)'
 
   Obj:
     properties:
@@ -814,6 +863,11 @@ classes:
         - sig: '(order: std::vector<std::pair<std::string, bool>>) const -> Results'
           suffix: by_names
       limit: '(max_count: count_t) const -> Results'
+      # k-nearest-neighbour search over a list-of-floats (vector-indexed) column.
+      # ef = 0 uses the index's persisted search beam; exact = true runs a flat
+      # scan for the true neighbours (and overrides ef). Returns the k nearest
+      # ordered closest first.
+      knn_search: '(column: ColKey, query_data: std::vector<float>, k: count_t, ef: count_t, exact: bool) const -> Results'
       snapshot: '() const -> Results'
       freeze: '(frozen_barq: SharedBarq) const -> Results'
       max: '(column: ColKey) -> std::optional<Mixed>'
