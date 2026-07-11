@@ -1423,6 +1423,22 @@ void VectorIndex::reset_caches()
         m_cache->reset();
 }
 
+void VectorIndex::refresh_if_stale()
+{
+    // m_top caches the ref it was last attached to. After a write transaction
+    // that created or grew this index commits, the persisted ref differs from
+    // that cache; the same happens mid-transaction when a sibling search index
+    // rewrites the shared m_index_refs array we hang off. Either way the parent
+    // slot already holds the current ref, so re-read and re-attach before we
+    // touch the trees — writing through the stale ref corrupts freed memory.
+    if (m_top.is_attached() && m_top.get_ref() != m_top.get_ref_from_parent()) {
+        m_top.init_from_parent();
+        attach_trees();
+        load_config_from_header();
+        reset_caches();
+    }
+}
+
 VectorIndex::VectorIndex(ColKey column, Allocator& alloc, const VectorIndexConfig& config)
     : m_column(column)
     , m_top(alloc)
@@ -2216,6 +2232,7 @@ void VectorIndex::rebuild(const Table& table)
 void VectorIndex::mark_dirty(ObjKey key)
 {
     std::lock_guard<std::mutex> lock(m_cache->mutex);
+    refresh_if_stale();
     // pending_seen mirrors the persisted list (primed from it on first use, kept
     // in step by every path that mutates it), so dedup is one hash probe instead
     // of a list rescan per new key.
@@ -2234,6 +2251,7 @@ void VectorIndex::mark_dirty(ObjKey key)
 // persisted graph does not reflect yet, answered by brute force at query time.
 void VectorIndex::ensure_synced(const Table& table)
 {
+    refresh_if_stale();
     uint64_t cur = table.get_content_version();
     if (m_cache->synced_version == cur)
         return;

@@ -213,6 +213,11 @@ private:
     void attach_trees();
     void reset_caches();
     void load_config_from_header();
+    // Re-read m_top from its parent slot (and re-attach the trees) when the two
+    // have diverged — which happens after a write that created/changed this index
+    // commits, or when a sibling search index modifies the shared m_index_refs
+    // array. Callers must hold m_cache->mutex.
+    void refresh_if_stale();
     uint64_t header_field(size_t index) const;
 
     // Maintenance (write transactions only). Full builds (do_rebuild, and absorb

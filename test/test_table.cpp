@@ -5399,6 +5399,71 @@ static VectorIndexConfig exact_cfg(int n)
     return cfg;
 }
 
+// Empty-then-fill: create the index on an empty column, then insert vectors. This is
+// how the SDK bootstraps (create index at open, then write rows) and how sync fills a
+// freshly-created index. It drives the event-driven incremental insert path, which the
+// build-then-index tests above never reach.
+TEST(Table_VectorIndexEmptyThenInsertSameTxn)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 50;
+    DBRef sg = DB::create(path);
+    ColKey col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        VectorIndexConfig cfg = exact_cfg(N);
+        cfg.dimensions = 16; // declared dimensions, as the SDK reconcile does
+        t->add_vector_index(col_vec, cfg);
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        wt.commit();
+    }
+    ReadTransaction rt(sg);
+    ConstTableRef t = rt.get_table("vectors");
+    TableView v = t->where().find_all();
+    v.knnsearch(col_vec, knn_test_vec(3), 5);
+    CHECK_EQUAL(5, v.size());
+}
+
+TEST(Table_VectorIndexEmptyThenInsertTwoTxns)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 50;
+    DBRef sg = DB::create(path);
+    ColKey col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        VectorIndexConfig cfg = exact_cfg(N);
+        cfg.dimensions = 16; // declared dimensions, as the SDK reconcile does
+        t->add_vector_index(col_vec, cfg);
+        wt.commit();
+    }
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : knn_test_vec(i))
+                lst.add(x);
+        }
+        wt.commit();
+    }
+    ReadTransaction rt(sg);
+    ConstTableRef t = rt.get_table("vectors");
+    TableView v = t->where().find_all();
+    v.knnsearch(col_vec, knn_test_vec(3), 5);
+    CHECK_EQUAL(5, v.size());
+}
+
 // Stage 1 persistence: a vector index built in one session must survive a reopen and
 // answer queries by loading the persisted graph — no rebuild from the raw vectors.
 TEST(Table_VectorIndexPersistence)
@@ -6182,7 +6247,9 @@ TEST(Table_VectorIndexBulkAbsorb)
         TableRef t = wt.add_table("vectors");
         col_id = t->add_column(type_Int, "id");
         col_vec = t->add_column_list(type_Float, "embedding");
-        t->add_vector_index(col_vec, exact_cfg(N)); // nothing to index yet
+        VectorIndexConfig cfg = exact_cfg(N);
+        cfg.dimensions = 16; // declared dimensions, as the SDK reconcile does
+        t->add_vector_index(col_vec, cfg); // nothing to index yet
         CHECK(t->has_vector_index(col_vec));
         wt.commit();
     }

@@ -36,6 +36,7 @@
 
 #include <barq/db.hpp>
 #include <barq/group.hpp>
+#include <barq/index_vector.hpp>
 #include <barq/query_expression.hpp>
 
 #if BARQ_ENABLE_SYNC
@@ -3664,6 +3665,47 @@ TEST_CASE("results: snapshots", "[results]") {
         REQUIRE_FALSE(snapshot.first()->is_valid());
         REQUIRE_FALSE(snapshot.last()->is_valid());
     }
+}
+
+TEST_CASE("results: knn empty-then-insert reconcile pattern", "[results]") {
+    TestFile config;
+    config.cache = true; // the SDK opens with the coordinator cache on
+    auto r = Barq::get_shared_barq(config);
+    // Match the SDK's VectorDoc layout: a string column sits between the id and
+    // the embedding, so the embedding is the third column.
+    r->update_schema(
+        {{"object",
+          {{"id", PropertyType::Int, Property::IsPrimary{true}},
+           {"text", PropertyType::String},
+           {"embedding", PropertyType::Array | PropertyType::Float}}}});
+    auto table = r->read_group().get_table("class_object");
+    ColKey col_id = table->get_column_key("id");
+    ColKey col_lst = table->get_column_key("embedding");
+
+    // Reconcile: create the index on the empty column in its own transaction,
+    // exactly as the SDK does at open time.
+    r->begin_transaction();
+    VectorIndexConfig cfg;
+    cfg.dimensions = 4;
+    cfg.metric = VectorMetric::Cosine; // the SDK default
+    table->add_vector_index(col_lst, cfg);
+    r->commit_transaction();
+
+    // A later write inserts a vector into the now-indexed column.
+    // A single write both inserts the primary key (touching the PK's search
+    // index, which rewrites the shared m_index_refs) and writes the embedding —
+    // exactly what the SDK's add() does. This used to corrupt the vector index.
+    r->begin_transaction();
+    {
+        Obj o = table->create_object_with_primary_key(Mixed(int64_t(1)));
+        o.set_list_values(col_lst, std::vector<float>{1.0f, 0.0f, 0.0f, 0.0f});
+    }
+    r->commit_transaction();
+
+    Results results(r, table);
+    auto v = results.knn_search(col_lst, {1.0f, 0.0f, 0.0f, 0.0f}, 1);
+    REQUIRE(v.size() == 1);
+    REQUIRE(v.get(0).get<Int>(col_id) == 1);
 }
 
 TEST_CASE("results: knnsearch", "[results]") {
