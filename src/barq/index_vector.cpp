@@ -1489,10 +1489,23 @@ size_t VectorIndex::get_ndx_in_parent() const noexcept
 void VectorIndex::update_from_parent() noexcept
 {
     std::lock_guard<std::mutex> lock(m_cache->mutex);
+    // Pointer freshness is unconditional: after a commit the slab blocks are
+    // released and the ref translation may have moved, so the top and tree
+    // accessors must re-anchor even when the ref value is unchanged.
+    bool content_changed = !m_top.is_attached() || m_top.get_ref() != m_top.get_ref_from_parent();
     m_top.init_from_parent();
     attach_trees();
-    load_config_from_header();
-    reset_caches();
+    // The logical caches (key2id, overlay, sync memoization, qparams) track
+    // index CONTENT, and this runs on every commit-and-continue. When this
+    // accessor produced the committed writes itself, its ref still matches the
+    // parent slot and the caches are exactly in step — dropping them here
+    // would put an O(n) key-map rebuild on the first search after every
+    // commit. Only a ref this accessor did not produce (another transaction
+    // rewrote the index) invalidates them.
+    if (content_changed) {
+        load_config_from_header();
+        reset_caches();
+    }
 }
 
 void VectorIndex::refresh_accessor_tree()
