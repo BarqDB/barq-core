@@ -919,6 +919,22 @@ private:
         return buf.data();
     }
 
+    // Warm the cache lines holding element `id`'s stored vector. Neighbour ids
+    // land randomly across a multi-GB array, so without this every distance
+    // evaluation in the beam search starts with a full memory stall.
+    void prefetch_elem(int64_t id) const
+    {
+#if defined(__GNUC__) || defined(__clang__)
+        const char* p = m_enc == VectorEncoding::Float32
+                            ? reinterpret_cast<const char*>(m_vecs.data() + size_t(id) * m_dim)
+                            : reinterpret_cast<const char*>(m_codes.data() + size_t(id) * m_dim);
+        __builtin_prefetch(p);
+        __builtin_prefetch(p + 64);
+#else
+        static_cast<void>(id);
+#endif
+    }
+
     std::mutex& stripe(int64_t id)
     {
         return m_locks[size_t(id) & (kStripes - 1)];
@@ -983,6 +999,11 @@ private:
             cands.pop();
 
             copy_links(c.second, layer, scr.nbrs);
+            // Issue the loads for every neighbour's vector before the distance
+            // loop so the (random, multi-GB-spread) reads overlap instead of
+            // stalling one after another.
+            for (int64_t n : scr.nbrs)
+                prefetch_elem(n);
             for (int64_t n : scr.nbrs) {
                 if (scr.visited.test_and_set(n))
                     continue;
