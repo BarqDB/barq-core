@@ -21,6 +21,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <string>
 #include <fstream>
@@ -7628,6 +7630,295 @@ TEST(Table_VectorIndexEventOverflow)
     }
 
     VectorIndex::_max_events_for_testing = 0;
+}
+
+// The build path's code-domain SQ8 L2 must agree with decode-then-L2 everywhere
+// it is used: random codes, odd tail dimensions, constant (scale 0) dimensions,
+// and the quantization clamp extremes. Also pins the early-out contract: a bound
+// above the true distance never changes the result, a bound below it may return
+// a truncated value but never one below the bound.
+TEST(VectorIndex_SQ8CodeDistanceKernel)
+{
+    const float inf = std::numeric_limits<float>::infinity();
+    auto ref_dist = [](const std::vector<int8_t>& a, const std::vector<int8_t>& b, const std::vector<float>& scl) {
+        double s = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            // decode as ofs + scl * code on both sides; the offsets cancel
+            double d = double(scl[i]) * (double(a[i]) - double(b[i]));
+            s += d * d;
+        }
+        return s;
+    };
+    uint32_t h = 0x9e3779b9; // deterministic xorshift, no <random> needed
+    auto next = [&h] {
+        h ^= h << 13;
+        h ^= h >> 17;
+        h ^= h << 5;
+        return h;
+    };
+    for (size_t dim : {size_t(1), size_t(3), size_t(7), size_t(8), size_t(15), size_t(31), size_t(32), size_t(33),
+                       size_t(63), size_t(64), size_t(95), size_t(96), size_t(97), size_t(128), size_t(257)}) {
+        std::vector<int8_t> a(dim), b(dim);
+        std::vector<float> scl(dim), scl2(dim);
+        for (size_t i = 0; i < dim; ++i) {
+            a[i] = int8_t(next() & 0xff);
+            b[i] = int8_t(next() & 0xff);
+            scl[i] = (i % 7 == 3) ? 0.0f : float(next() & 0xffff) / 65536.0f * 0.2f; // some constant dims
+            scl2[i] = scl[i] * scl[i];
+        }
+        if (dim >= 2) { // quantization limits
+            a[0] = -128;
+            b[0] = 127;
+            a[1] = 127;
+            b[1] = -128;
+        }
+        float exact = barq::_impl::sq8_l2_sq_codes(a.data(), b.data(), scl2.data(), dim, inf);
+        double want = ref_dist(a, b, scl);
+        CHECK(std::abs(double(exact) - want) <= 1e-3 * (std::abs(want) + 1));
+        // Bound above the true distance: identical result.
+        CHECK_EQUAL(exact, barq::_impl::sq8_l2_sq_codes(a.data(), b.data(), scl2.data(), dim, exact * 1.01f + 1));
+        // Bound below it: possibly truncated, never below the bound.
+        if (exact > 0)
+            CHECK_GREATER_EQUAL(barq::_impl::sq8_l2_sq_codes(a.data(), b.data(), scl2.data(), dim, exact * 0.25f),
+                                exact * 0.25f);
+        // Identical codes are distance zero.
+        CHECK_EQUAL(0.0f, barq::_impl::sq8_l2_sq_codes(a.data(), a.data(), scl2.data(), dim, inf));
+    }
+}
+
+// A parallel bulk build must match a single-threaded one in quality: k results
+// come back, and recall against an exact scan stays near 1 on an easy uniform
+// set. SQ8+L2 routes both through the code-domain kernel; debug builds also run
+// the builder's structural graph validation and the connectivity sweep assert.
+TEST(Table_VectorIndexBuildThreads)
+{
+    const int N = 4000;
+    const size_t dim = 24;
+    auto data_vec = [&](int i) {
+        std::vector<float> v(dim);
+        uint32_t h = uint32_t(i) * 2654435761u + 1;
+        for (size_t j = 0; j < dim; ++j) {
+            h ^= h << 13;
+            h ^= h >> 17;
+            h ^= h << 5;
+            v[j] = float(h & 0xffff) / 65536.0f - 0.5f;
+        }
+        return v;
+    };
+    for (size_t threads : {size_t(1), size_t(8)}) {
+        SHARED_GROUP_TEST_PATH(path);
+        DBRef sg = DB::create(path);
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        ColKey col_id = t->add_column(type_Int, "id");
+        ColKey col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < N; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : data_vec(i))
+                lst.add(x);
+        }
+        VectorIndexConfig cfg;
+        cfg.metric = VectorMetric::L2;
+        cfg.encoding = VectorEncoding::SQ8;
+        cfg.dimensions = dim;
+        cfg.ef_construction = 80;
+        cfg.ef_search = 64;
+        cfg.build_threads = threads;
+        t->add_vector_index(col_vec, cfg);
+
+        const size_t k = 10;
+        double hits = 0, total = 0;
+        for (int probe = 0; probe < 20; ++probe) {
+            std::vector<float> q = data_vec(probe * 37);
+            TableView approx = t->where().find_all();
+            approx.knnsearch(col_vec, q, k);
+            CHECK_EQUAL(k, approx.size());
+            TableView exact = t->where().find_all();
+            exact.knnsearch(col_vec, q, k, 0, /*exact=*/true);
+            std::set<int64_t> want;
+            for (size_t i = 0; i < exact.size(); ++i)
+                want.insert(exact[i].get<Int>(col_id));
+            for (size_t i = 0; i < approx.size(); ++i)
+                hits += double(want.count(approx[i].get<Int>(col_id)));
+            total += double(k);
+        }
+        CHECK_GREATER(hits / total, 0.85);
+        wt.commit();
+    }
+}
+
+// Full-build benchmark over a pre-baked file — opt-in via env vars:
+//   BENCH_VECTOR_FILE  .barq with table "vectors" {id: int, embedding: list<float>}
+//   BENCH_EFC / BENCH_THREADS / BENCH_EFS  build config (defaults 200 / 0 / 64)
+//   BENCH_QUERIES      raw file of dim*f32 per query
+//   BENCH_GT           raw file of BENCH_K*i32 per query, values = `id` column
+//   BENCH_SELF_GT=1    compute ground truth with an exact scan instead (subset files)
+// The existing index (if any) answers one search first (old files must keep
+// opening), is removed, and rebuilt with the current code; per-phase timings,
+// recall@k and warm query latency are printed.
+TEST_IF(Table_VectorIndexBuildBench, getenv("BENCH_VECTOR_FILE") != nullptr)
+{
+    auto env_num = [](const char* name, size_t dflt) {
+        const char* v = getenv(name);
+        return v ? size_t(strtoull(v, nullptr, 10)) : dflt;
+    };
+    const std::string file = getenv("BENCH_VECTOR_FILE");
+    const size_t efc = env_num("BENCH_EFC", 200);
+    const size_t threads = env_num("BENCH_THREADS", 0);
+    const size_t efs = env_num("BENCH_EFS", 64);
+    const size_t k = env_num("BENCH_K", 10);
+    using clock = std::chrono::steady_clock;
+    auto secs = [](clock::time_point a, clock::time_point b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
+
+    DBRef sg = DB::create(file);
+    ColKey col_id, col_vec;
+    size_t dim = 0;
+    std::vector<std::vector<float>> queries;
+
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.get_table("vectors");
+        CHECK(t);
+        col_id = t->get_column_key("id");
+        col_vec = t->get_column_key("embedding");
+        dim = t->begin()->get_list<float>(col_vec).size();
+
+        if (const char* qf = getenv("BENCH_QUERIES")) {
+            std::ifstream f(qf, std::ios::binary | std::ios::ate);
+            CHECK(f.good());
+            size_t nq = size_t(f.tellg()) / (dim * 4);
+            f.seekg(0);
+            queries.resize(nq, std::vector<float>(dim));
+            for (auto& q : queries)
+                f.read(reinterpret_cast<char*>(q.data()), std::streamsize(dim * 4));
+        }
+
+        if (t->get_vector_index(col_vec)) { // pre-change file: must open and search as-is
+            if (!queries.empty()) {
+                TableView v = t->where().find_all();
+                v.knnsearch(col_vec, queries[0], k);
+                CHECK_EQUAL(k, v.size());
+                std::cout << "old index: opened and answered a search\n";
+            }
+            t->remove_vector_index(col_vec);
+        }
+
+        VectorIndexConfig cfg;
+        cfg.metric = VectorMetric::L2;
+        cfg.encoding = VectorEncoding::SQ8;
+        cfg.dimensions = dim;
+        cfg.m = 16;
+        cfg.ef_construction = efc;
+        cfg.ef_search = efs;
+        cfg.build_threads = threads;
+
+        std::cout << "build: rows=" << t->size() << " dim=" << dim << " efc=" << efc << " threads=" << threads
+                  << " efs=" << efs << "\n";
+        auto b0 = clock::now();
+        t->add_vector_index(col_vec, cfg);
+        auto b1 = clock::now();
+        auto stats = t->get_vector_index(col_vec)->last_build_stats();
+        std::cout << "phases: learn=" << stats.learn_seconds << "s feed=" << stats.feed_seconds
+                  << "s graph=" << stats.graph_seconds << "s persist=" << stats.persist_seconds
+                  << "s elements=" << stats.elements << "\n";
+        std::cout << "add_vector_index: " << secs(b0, b1) << "s\n";
+        auto c0 = clock::now();
+        wt.commit();
+        std::cout << "commit: " << secs(c0, clock::now()) << "s\n";
+    }
+
+    if (queries.empty())
+        return;
+
+    ReadTransaction rt(sg);
+    ConstTableRef t = rt.get_table("vectors");
+    const bool self_gt = env_num("BENCH_SELF_GT", 0) != 0;
+    std::vector<std::set<int64_t>> gt(queries.size());
+    if (self_gt) {
+        for (size_t qi = 0; qi < queries.size(); ++qi) {
+            TableView v = t->where().find_all();
+            v.knnsearch(col_vec, queries[qi], k, 0, /*exact=*/true);
+            for (size_t i = 0; i < v.size(); ++i)
+                gt[qi].insert(v[i].get<Int>(col_id));
+        }
+    }
+    else if (const char* gf = getenv("BENCH_GT")) {
+        std::ifstream f(gf, std::ios::binary);
+        CHECK(f.good());
+        std::vector<int32_t> row(k);
+        for (auto& g : gt) {
+            f.read(reinterpret_cast<char*>(row.data()), std::streamsize(k * 4));
+            g.insert(row.begin(), row.end());
+        }
+    }
+    else {
+        return;
+    }
+
+    auto run_all = [&] { // returns (recall, avg seconds per query)
+        double hits = 0;
+        auto q0 = clock::now();
+        for (size_t qi = 0; qi < queries.size(); ++qi) {
+            TableView v = t->where().find_all();
+            v.knnsearch(col_vec, queries[qi], k);
+            for (size_t i = 0; i < v.size(); ++i)
+                hits += double(gt[qi].count(v[i].get<Int>(col_id)));
+        }
+        double dt = secs(q0, clock::now()) / double(queries.size());
+        return std::make_pair(hits / double(queries.size() * k), dt);
+    };
+    run_all(); // warm the mmap
+    auto [recall, avg] = run_all();
+    std::cout << "recall@" << k << ": " << recall << "  warm query: " << avg * 1000 << "ms x" << queries.size()
+              << "\n";
+}
+
+// Carve the first BENCH_SUBSET_N rows of a bench file into a fresh one with no
+// index (the 1M smoke set comes out of the 10M file this way). Opt-in via env.
+TEST_IF(Table_VectorIndexBenchSubset, getenv("BENCH_SUBSET_SRC") != nullptr)
+{
+    const std::string src = getenv("BENCH_SUBSET_SRC");
+    const char* out = getenv("BENCH_SUBSET_OUT");
+    const char* n_str = getenv("BENCH_SUBSET_N");
+    CHECK(out && n_str);
+    const size_t n = size_t(strtoull(n_str, nullptr, 10));
+
+    DBRef in = DB::create(src);
+    ReadTransaction rt(in);
+    ConstTableRef s = rt.get_table("vectors");
+    CHECK(s);
+    ColKey s_id = s->get_column_key("id");
+    ColKey s_vec = s->get_column_key("embedding");
+
+    DBRef od = DB::create(out);
+    WriteTransaction wt(od);
+    TableRef d = wt.get_or_add_table("vectors");
+    CHECK_EQUAL(0, d->size());
+    ColKey d_id = d->get_column_key("id") ? d->get_column_key("id") : d->add_column(type_Int, "id");
+    ColKey d_vec =
+        d->get_column_key("embedding") ? d->get_column_key("embedding") : d->add_column_list(type_Float, "embedding");
+
+    size_t copied = 0;
+    std::vector<float> buf;
+    for (auto obj : *s) {
+        if (copied == n)
+            break;
+        auto lst = obj.get_list<float>(s_vec);
+        buf.resize(lst.size());
+        lst.get_tree().get_range(0, lst.size(), buf.data());
+        Obj o = d->create_object();
+        o.set(d_id, obj.get<Int>(s_id));
+        Lst<float> dl = o.get_list<float>(d_vec);
+        for (float x : buf)
+            dl.add(x);
+        ++copied;
+    }
+    wt.commit();
+    std::cout << "subset: copied " << copied << " rows to " << out << "\n";
 }
 
 #endif // TEST_TABLE

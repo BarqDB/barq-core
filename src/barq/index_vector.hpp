@@ -47,6 +47,17 @@ enum class VectorEncoding : uint8_t {
                  // exactly against the table data, so recall stays near full precision.
 };
 
+namespace _impl {
+/// L2 distance computed directly on SQ8 codes (the bulk-build fast path; exposed
+/// here for tests). Both sides decode as ofs_i + scl_i * code_i, so the offsets
+/// cancel in the difference and the distance is sum_i(scl_i^2 * (a_i - b_i)^2);
+/// `scl2` holds the precomputed scl_i^2. The caller only consumes distances
+/// strictly below `bound` — once a partial sum reaches it the kernel may return
+/// that partial early (any value >= bound reads as "not closer"). The result is
+/// exact whenever it is < bound; pass infinity to force the exact distance.
+float sq8_l2_sq_codes(const int8_t* a, const int8_t* b, const float* scl2, size_t dim, float bound) noexcept;
+} // namespace _impl
+
 /// The admissible keys of a filtered vector search: a dense bitmap over the key
 /// range when the keys pack tightly (the common case — ObjKeys allocate
 /// sequentially), a hash set otherwise. Building and probing the bitmap is
@@ -204,6 +215,20 @@ public:
     size_t dim() const;
     size_t count() const; // live (non-tombstoned) elements
 
+    // Wall-clock breakdown of the last full rebuild performed through this
+    // accessor (diagnostics/benchmarks; all zeros until a rebuild has run).
+    struct BuildStats {
+        double learn_seconds = 0;   // SQ8 quantization-range scan over the table
+        double feed_seconds = 0;    // table scan collecting/encoding the vectors
+        double graph_seconds = 0;   // parallel HNSW construction in RAM
+        double persist_seconds = 0; // appending the finished graph to the file arrays
+        size_t elements = 0;        // vectors indexed
+    };
+    BuildStats last_build_stats() const noexcept
+    {
+        return m_build_stats;
+    }
+
     // Strip the event lists and downgrade the persisted format to the legacy
     // (pre-tracking) layout. Exercises the lazy upgrade path in tests.
     void _downgrade_to_legacy_format_for_testing();
@@ -254,6 +279,7 @@ private:
     VectorIndexConfig m_config;
     std::unique_ptr<Trees> m_trees;
     std::unique_ptr<Cache> m_cache;
+    BuildStats m_build_stats;
     bool m_tracked = false; // persisted layout has event lists (set by attach_trees)
 };
 

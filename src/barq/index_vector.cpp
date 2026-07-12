@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <mutex>
@@ -417,6 +418,111 @@ struct VisitedTags {
 
 } // anonymous namespace
 
+// L2 on SQ8 codes without decoding — see the header comment. The int16 code
+// difference and its int32 square are exact, each 4-lane chunk converts to float
+// and scales by scl2, so only the float rounding/accumulation order differs from
+// decoding both sides and running l2_sq. Every 32 dims the partial sum is checked
+// against `bound`, letting far-away candidates skip the rest of the work; the
+// final block skips the check (nothing left to save), and completing the loop
+// yields the same value regardless of `bound`.
+float barq::_impl::sq8_l2_sq_codes(const int8_t* a, const int8_t* b, const float* scl2, size_t dim,
+                                   float bound) noexcept
+{
+#if BARQ_VECTOR_SIMD_NEON
+    float32x4_t s0 = vdupq_n_f32(0), s1 = vdupq_n_f32(0);
+    size_t i = 0;
+    while (i + 32 < dim) {
+        for (size_t stop = i + 32; i < stop; i += 8) {
+            int16x8_t d = vsubl_s8(vld1_s8(a + i), vld1_s8(b + i));
+            int16x4_t lo = vget_low_s16(d), hi = vget_high_s16(d);
+            s0 = vfmaq_f32(s0, vcvtq_f32_s32(vmull_s16(lo, lo)), vld1q_f32(scl2 + i));
+            s1 = vfmaq_f32(s1, vcvtq_f32_s32(vmull_s16(hi, hi)), vld1q_f32(scl2 + i + 4));
+        }
+        float partial = vaddvq_f32(vaddq_f32(s0, s1));
+        if (partial >= bound)
+            return partial;
+    }
+    for (; i + 8 <= dim; i += 8) {
+        int16x8_t d = vsubl_s8(vld1_s8(a + i), vld1_s8(b + i));
+        int16x4_t lo = vget_low_s16(d), hi = vget_high_s16(d);
+        s0 = vfmaq_f32(s0, vcvtq_f32_s32(vmull_s16(lo, lo)), vld1q_f32(scl2 + i));
+        s1 = vfmaq_f32(s1, vcvtq_f32_s32(vmull_s16(hi, hi)), vld1q_f32(scl2 + i + 4));
+    }
+    float sum = vaddvq_f32(vaddq_f32(s0, s1));
+    for (; i < dim; ++i) {
+        float d = float(int(a[i]) - int(b[i]));
+        sum += scl2[i] * d * d;
+    }
+    return sum;
+#elif BARQ_VECTOR_SIMD_SSE
+    // SSE2-only ops, like the other kernels. The code difference is widened to
+    // int32 and squared as floats (exact: |diff| <= 255).
+    __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps();
+    size_t i = 0;
+    auto accumulate8 = [&](size_t at) {
+        __m128i a8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(a + at));
+        __m128i b8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + at));
+        __m128i a16 = _mm_srai_epi16(_mm_unpacklo_epi8(a8, a8), 8); // sign-extend to 16
+        __m128i b16 = _mm_srai_epi16(_mm_unpacklo_epi8(b8, b8), 8);
+        __m128i d16 = _mm_sub_epi16(a16, b16);
+        __m128 flo = _mm_cvtepi32_ps(_mm_srai_epi32(_mm_unpacklo_epi16(d16, d16), 16)); // ... and to 32
+        __m128 fhi = _mm_cvtepi32_ps(_mm_srai_epi32(_mm_unpackhi_epi16(d16, d16), 16));
+        s0 = _mm_add_ps(s0, _mm_mul_ps(_mm_mul_ps(flo, flo), _mm_loadu_ps(scl2 + at)));
+        s1 = _mm_add_ps(s1, _mm_mul_ps(_mm_mul_ps(fhi, fhi), _mm_loadu_ps(scl2 + at + 4)));
+    };
+    auto horizontal = [&] {
+        alignas(16) float lanes[4];
+        _mm_store_ps(lanes, _mm_add_ps(s0, s1));
+        return (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    };
+    while (i + 32 < dim) {
+        for (size_t stop = i + 32; i < stop; i += 8)
+            accumulate8(i);
+        float partial = horizontal();
+        if (partial >= bound)
+            return partial;
+    }
+    for (; i + 8 <= dim; i += 8)
+        accumulate8(i);
+    float sum = horizontal();
+    for (; i < dim; ++i) {
+        float d = float(int(a[i]) - int(b[i]));
+        sum += scl2[i] * d * d;
+    }
+    return sum;
+#else
+    float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    size_t i = 0;
+    while (i + 32 < dim) {
+        for (size_t stop = i + 32; i < stop; i += 4) {
+            float d0 = float(int(a[i]) - int(b[i])), d1 = float(int(a[i + 1]) - int(b[i + 1]));
+            float d2 = float(int(a[i + 2]) - int(b[i + 2])), d3 = float(int(a[i + 3]) - int(b[i + 3]));
+            s0 += scl2[i] * d0 * d0;
+            s1 += scl2[i + 1] * d1 * d1;
+            s2 += scl2[i + 2] * d2 * d2;
+            s3 += scl2[i + 3] * d3 * d3;
+        }
+        float partial = (s0 + s1) + (s2 + s3);
+        if (partial >= bound)
+            return partial;
+    }
+    for (; i + 4 <= dim; i += 4) {
+        float d0 = float(int(a[i]) - int(b[i])), d1 = float(int(a[i + 1]) - int(b[i + 1]));
+        float d2 = float(int(a[i + 2]) - int(b[i + 2])), d3 = float(int(a[i + 3]) - int(b[i + 3]));
+        s0 += scl2[i] * d0 * d0;
+        s1 += scl2[i + 1] * d1 * d1;
+        s2 += scl2[i + 2] * d2 * d2;
+        s3 += scl2[i + 3] * d3 * d3;
+    }
+    float sum = (s0 + s1) + (s2 + s3);
+    for (; i < dim; ++i) {
+        float d = float(int(a[i]) - int(b[i]));
+        sum += scl2[i] * d * d;
+    }
+    return sum;
+#endif
+}
+
 // ---- accessors for the persisted graph -----------------------------------------
 
 struct VectorIndex::Trees {
@@ -735,8 +841,18 @@ public:
         , m_salt(salt)
         , m_enc(encoding)
     {
-        if (m_enc == VectorEncoding::SQ8)
+        if (m_enc == VectorEncoding::SQ8) {
             m_qparams.assign(sq8_params, sq8_params + 2 * dim);
+            if (m_cfg.metric == VectorMetric::L2) {
+                // Fast path: L2 offsets cancel between two codes, so distances
+                // run code-to-code (sq8_l2_sq_codes) on precomputed scl^2 —
+                // no per-distance decode.
+                m_sq8_l2 = true;
+                m_scl2.resize(dim);
+                for (size_t i = 0; i < dim; ++i)
+                    m_scl2[i] = sq8_params[dim + i] * sq8_params[dim + i];
+            }
+        }
     }
 
     size_t size() const
@@ -838,6 +954,9 @@ public:
                 std::rethrow_exception(first_error);
         }
         repair_connectivity(scr);
+#ifdef BARQ_DEBUG
+        validate_graph();
+#endif
     }
 
     // Append the finished graph to the (empty) persisted trees and set the
@@ -884,12 +1003,20 @@ public:
 private:
     using Hit = std::pair<float, int64_t>; // (distance, id)
 
+    // Per-worker reusable state: one Scratch per build thread, so the millions
+    // of searches an insert loop runs never allocate after warm-up.
     struct Scratch {
         VisitedTags visited;
         std::vector<int64_t> nbrs;
+        std::vector<int64_t> unseen;   // nbrs minus already-visited, in prefetch order
         std::vector<int64_t> selected;
-        // SQ8 decode staging: query side, distance side, candidate side.
-        std::vector<float> qvec, dvec, cvec;
+        std::vector<int64_t> keep;
+        std::vector<Hit> heap_cands;   // search_layer's min-heap (std::greater)
+        std::vector<Hit> heap_results; // search_layer's max-heap; sorted ascending on return
+        std::vector<Hit> merged;       // pass-2 overflow re-selection
+        std::vector<std::vector<int64_t>> sel_layers; // insert_one's per-layer picks
+        // SQ8 decode staging: query side, distance side, candidate side, neighbour side.
+        std::vector<float> qvec, dvec, cvec, nvec;
     };
 
     size_t stride0() const
@@ -917,6 +1044,41 @@ private:
         sq8_decode8(m_codes.data() + size_t(id) * m_dim, m_qparams.data(), m_qparams.data() + m_dim, m_dim,
                     buf.data());
         return buf.data();
+    }
+
+    // The build path only ever measures stored-element-vs-stored-element
+    // distances, so a "query" is a stored id plus its cached representation:
+    // the raw codes on the SQ8/L2 fast path (compared code-to-code, no decode),
+    // decoded/raw floats for every other encoding+metric combination.
+    struct QueryRef {
+        const int8_t* codes = nullptr;
+        const float* fvec = nullptr;
+    };
+    static constexpr float kNoBound = std::numeric_limits<float>::infinity();
+
+    QueryRef query(int64_t id, std::vector<float>& buf) const
+    {
+        if (m_sq8_l2)
+            return {m_codes.data() + size_t(id) * m_dim, nullptr};
+        return {nullptr, elem(id, buf)};
+    }
+
+    // Distance from a query to stored element `id`. The caller only consumes
+    // values strictly below `bound`, which lets the codes kernel stop early;
+    // the result is exact whenever it is < bound (always, with kNoBound).
+    float dist_to(QueryRef q, int64_t id, std::vector<float>& buf, float bound = kNoBound) const
+    {
+        if (m_sq8_l2)
+            return _impl::sq8_l2_sq_codes(q.codes, m_codes.data() + size_t(id) * m_dim, m_scl2.data(), m_dim,
+                                          bound);
+        return dist(q.fvec, elem(id, buf));
+    }
+
+    float dist_qq(QueryRef a, QueryRef b) const
+    {
+        if (m_sq8_l2)
+            return _impl::sq8_l2_sq_codes(a.codes, b.codes, m_scl2.data(), m_dim, kNoBound);
+        return dist(a.fvec, b.fvec);
     }
 
     // Warm the cache lines holding element `id`'s stored vector. Neighbour ids
@@ -962,15 +1124,19 @@ private:
             p[1 + i] = int32_t(list[i]);
     }
 
-    int64_t greedy(const float* q, int64_t curr, int layer, Scratch& scr)
+    int64_t greedy(QueryRef q, int64_t curr, int layer, Scratch& scr)
     {
-        float best = dist(q, elem(curr, scr.dvec));
+        float best = dist_to(q, curr, scr.dvec);
         bool changed = true;
         while (changed) {
             changed = false;
             copy_links(curr, layer, scr.nbrs);
+            for (int64_t n : scr.nbrs)
+                prefetch_elem(n);
             for (int64_t n : scr.nbrs) {
-                float d = dist(q, elem(n, scr.dvec));
+                // `best` as the bound: a distance that is not an improvement
+                // may come back truncated, an improvement is always exact.
+                float d = dist_to(q, n, scr.dvec, best);
                 if (d < best) {
                     best = d;
                     curr = n;
@@ -981,48 +1147,62 @@ private:
         return curr;
     }
 
-    std::vector<Hit> search_layer(const float* q, int64_t entry_point, size_t ef, int layer, Scratch& scr)
+    // Beam search over one layer. Returns the up-to-ef closest ids, ascending by
+    // distance, as a reference into `scr` — valid until the next search_layer
+    // call on the same Scratch.
+    const std::vector<Hit>& search_layer(QueryRef q, int64_t entry_point, size_t ef, int layer, Scratch& scr)
     {
-        std::priority_queue<Hit> results;
-        std::priority_queue<Hit, std::vector<Hit>, std::greater<>> cands;
+        auto& results = scr.heap_results; // max-heap: results.front() = current worst
+        auto& cands = scr.heap_cands;     // min-heap: cands.front() = current best
+        results.clear();
+        cands.clear();
         scr.visited.begin(m_keys.size());
 
-        float d0 = dist(q, elem(entry_point, scr.dvec));
-        cands.emplace(d0, entry_point);
+        float d0 = dist_to(q, entry_point, scr.dvec);
+        cands.emplace_back(d0, entry_point);
         scr.visited.test_and_set(entry_point);
-        results.emplace(d0, entry_point);
+        results.emplace_back(d0, entry_point);
 
         while (!cands.empty()) {
-            Hit c = cands.top();
-            if (results.size() >= ef && c.first > results.top().first)
+            Hit c = cands.front();
+            if (results.size() >= ef && c.first > results.front().first)
                 break;
-            cands.pop();
+            std::pop_heap(cands.begin(), cands.end(), std::greater<>());
+            cands.pop_back();
 
             copy_links(c.second, layer, scr.nbrs);
-            // Issue the loads for every neighbour's vector before the distance
+            // Drop already-visited neighbours first so only useful reads get
+            // prefetched, then issue the loads for the rest before the distance
             // loop so the (random, multi-GB-spread) reads overlap instead of
             // stalling one after another.
-            for (int64_t n : scr.nbrs)
-                prefetch_elem(n);
+            scr.unseen.clear();
             for (int64_t n : scr.nbrs) {
-                if (scr.visited.test_and_set(n))
-                    continue;
-                float d = dist(q, elem(n, scr.dvec));
-                if (results.size() < ef || d < results.top().first) {
-                    cands.emplace(d, n);
-                    results.emplace(d, n);
-                    if (results.size() > ef)
-                        results.pop();
+                if (!scr.visited.test_and_set(n))
+                    scr.unseen.push_back(n);
+            }
+            for (int64_t n : scr.unseen)
+                prefetch_elem(n);
+            for (int64_t n : scr.unseen) {
+                // Once the beam is full, only distances below the current worst
+                // matter — the kernel may give up (truncated, >= bound) on the
+                // rest; anything stored in the heaps is exact.
+                float bound = results.size() >= ef ? results.front().first : kNoBound;
+                float d = dist_to(q, n, scr.dvec, bound);
+                if (results.size() < ef || d < results.front().first) {
+                    cands.emplace_back(d, n);
+                    std::push_heap(cands.begin(), cands.end(), std::greater<>());
+                    results.emplace_back(d, n);
+                    std::push_heap(results.begin(), results.end());
+                    if (results.size() > ef) {
+                        std::pop_heap(results.begin(), results.end());
+                        results.pop_back();
+                    }
                 }
             }
         }
 
-        std::vector<Hit> out(results.size());
-        for (size_t i = out.size(); i-- > 0;) {
-            out[i] = results.top();
-            results.pop();
-        }
-        return out;
+        std::sort_heap(results.begin(), results.end()); // ascending (distance, id)
+        return results;
     }
 
     // Same spread-out heuristic as GraphOps::select_neighbors, on flat memory.
@@ -1038,10 +1218,12 @@ private:
         for (auto& c : cands_sorted) {
             if (result.size() >= m)
                 break;
-            const float* cv = elem(c.second, scr.cvec);
+            QueryRef cq = query(c.second, scr.cvec);
             bool good = true;
             for (int64_t r : result) {
-                if (dist(cv, elem(r, scr.dvec)) < c.first) {
+                // Only "closer than c.first" matters — a truncated (>= c.first)
+                // distance decides identically.
+                if (dist_to(cq, r, scr.dvec, c.first) < c.first) {
                     good = false;
                     break;
                 }
@@ -1050,6 +1232,31 @@ private:
                 result.push_back(c.second);
         }
     }
+
+#ifdef BARQ_DEBUG
+    // Structural invariants every finished build must satisfy: neighbour counts
+    // within the layer's degree bound, targets in range, no self-links, and
+    // upper-layer links only to nodes that exist on that layer.
+    void validate_graph() const
+    {
+        int64_t n = int64_t(m_keys.size());
+        for (int64_t id = 0; id < n; ++id) {
+            for (int layer = 0; layer <= m_levels[size_t(id)]; ++layer) {
+                const int32_t* p = layer == 0
+                                       ? m_links0.data() + size_t(id) * stride0()
+                                       : m_links_upper.data() + size_t(m_upper_ofs[size_t(id)] + layer - 1) * stride_up();
+                size_t max_m = layer == 0 ? 2 * m_cfg.m : m_cfg.m;
+                BARQ_ASSERT(size_t(p[0]) <= max_m);
+                for (int32_t i = 0; i < p[0]; ++i) {
+                    int64_t tgt = p[1 + i];
+                    BARQ_ASSERT(tgt >= 0 && tgt < n);
+                    BARQ_ASSERT(tgt != id);
+                    BARQ_ASSERT(m_levels[size_t(tgt)] >= layer);
+                }
+            }
+        }
+    }
+#endif
 
     // Concurrent inserts can strand nodes: two nearby elements inserted at the
     // same time cannot see each other, so both lean on the same busy neighbours,
@@ -1127,7 +1334,7 @@ private:
     // is itself reachable.
     bool anchor(int64_t x, std::vector<int32_t>& indeg, Scratch& scr, bool allow_evict)
     {
-        auto anchors = search_layer(elem(x, scr.qvec), m_entry, m_cfg.ef_construction, 0, scr);
+        const auto& anchors = search_layer(query(x, scr.qvec), m_entry, m_cfg.ef_construction, 0, scr);
         size_t max_m0 = 2 * m_cfg.m;
         for (auto& a : anchors) { // nearest first
             if (a.second == x)
@@ -1148,11 +1355,11 @@ private:
             if (a.second == x)
                 continue;
             int32_t* p = links(a.second, 0);
-            const float* av = elem(a.second, scr.cvec);
+            QueryRef aq = query(a.second, scr.cvec);
             int best = -1, fallback = -1;
             float best_d = -1, fallback_d = -1;
             for (int32_t i = 0; i < p[0]; ++i) {
-                float dd = dist(av, elem(p[1 + i], scr.dvec));
+                float dd = dist_to(aq, p[1 + i], scr.dvec);
                 if (dd > fallback_d) {
                     fallback_d = dd;
                     fallback = i;
@@ -1185,7 +1392,7 @@ private:
     // are final and never overwritten, so no concurrent append can be lost.
     void insert_one(int64_t id, Scratch& scr)
     {
-        const float* q = elem(id, scr.qvec);
+        QueryRef q = query(id, scr.qvec);
         int level = m_levels[size_t(id)];
 
         std::unique_lock<std::mutex> entry_lock(m_entry_mutex);
@@ -1206,23 +1413,22 @@ private:
 
         // Pass 1: pick and store this node's own neighbours on every layer.
         int top = std::min(level, max_level);
-        std::vector<std::vector<int64_t>> selected_per_layer(size_t(top) + 1);
+        auto& selected_per_layer = scr.sel_layers;
+        if (selected_per_layer.size() < size_t(top) + 1)
+            selected_per_layer.resize(size_t(top) + 1);
         for (int lc = top; lc >= 0; --lc) {
-            auto cands = search_layer(q, curr, m_cfg.ef_construction, lc, scr);
+            const auto& cands = search_layer(q, curr, m_cfg.ef_construction, lc, scr);
             select_neighbors(cands, m_cfg.m, scr.selected, scr);
             {
                 std::lock_guard<std::mutex> lock(stripe(id));
                 store_links(links(id, lc), scr.selected);
             }
-            selected_per_layer[size_t(lc)] = scr.selected;
+            selected_per_layer[size_t(lc)].assign(scr.selected.begin(), scr.selected.end());
             if (!scr.selected.empty())
                 curr = scr.selected.front();
         }
 
         // Pass 2: publish — connect the selected neighbours back to the node.
-        std::vector<int64_t> keep;
-        std::vector<Hit> merged;
-        std::vector<float> nvec;
         for (int lc = top; lc >= 0; --lc) {
             size_t max_m = (lc == 0) ? 2 * m_cfg.m : m_cfg.m;
             for (int64_t n : selected_per_layer[size_t(lc)]) {
@@ -1235,14 +1441,15 @@ private:
                 else {
                     // Overflow: re-select the neighbour's links with the heuristic,
                     // considering the new element too (as hnswlib does).
-                    const float* nv = elem(n, nvec);
+                    QueryRef nq = query(n, scr.nvec);
+                    auto& merged = scr.merged;
                     merged.clear();
-                    merged.emplace_back(dist(nv, q), id);
+                    merged.emplace_back(dist_qq(nq, q), id);
                     for (int32_t i = 0; i < p[0]; ++i)
-                        merged.emplace_back(dist(nv, elem(p[1 + i], scr.dvec)), int64_t(p[1 + i]));
+                        merged.emplace_back(dist_to(nq, p[1 + i], scr.dvec), int64_t(p[1 + i]));
                     std::sort(merged.begin(), merged.end());
-                    select_neighbors(merged, max_m, keep, scr);
-                    store_links(p, keep);
+                    select_neighbors(merged, max_m, scr.keep, scr);
+                    store_links(p, scr.keep);
                 }
             }
         }
@@ -1259,7 +1466,9 @@ private:
     size_t m_dim;
     uint64_t m_salt;
     VectorEncoding m_enc;
+    bool m_sq8_l2 = false;        // SQ8 + L2: distances run code-to-code
     std::vector<float> m_qparams; // SQ8: [ofs..., scl...], 2*dim
+    std::vector<float> m_scl2;    // SQ8/L2 fast path: per-dim scl^2
 
     std::vector<int64_t> m_keys;
     std::vector<float> m_vecs;   // Float32 storage
@@ -1846,9 +2055,13 @@ void clear_graph_arrays(VectorIndex::Trees& t)
 // Build the graph in RAM from the builder's collected elements, persist it, and
 // refresh the key map. The previous graph contents (if any) are discarded — but
 // only after the long, fallible build phase has succeeded.
-void bulk_rebuild(VectorIndex::Trees& t, VectorIndex::Cache& cache, size_t build_threads, BulkBuilder& builder)
+void bulk_rebuild(VectorIndex::Trees& t, VectorIndex::Cache& cache, size_t build_threads, BulkBuilder& builder,
+                  VectorIndex::BuildStats* stats = nullptr)
 {
+    using clock = std::chrono::steady_clock;
+    auto t0 = clock::now();
     builder.build(effective_build_threads(build_threads));
+    auto t1 = clock::now();
     clear_graph_arrays(t);
     cache.pending_seen.clear(); // mirrors the persisted pending list, emptied above
     // Invalidate the key map across the append: if write() throws and the caller
@@ -1860,6 +2073,11 @@ void bulk_rebuild(VectorIndex::Trees& t, VectorIndex::Cache& cache, size_t build
     for (size_t id = 0; id < builder.size(); ++id)
         cache.key2id[builder.key(id)] = int64_t(id);
     cache.key2id_valid = true;
+    if (stats) {
+        stats->graph_seconds = std::chrono::duration<double>(t1 - t0).count();
+        stats->persist_seconds = std::chrono::duration<double>(clock::now() - t1).count();
+        stats->elements = builder.size();
+    }
 }
 
 } // anonymous namespace
@@ -2175,6 +2393,8 @@ void VectorIndex::verify_matches_table(const Table& table)
 
 void VectorIndex::do_rebuild(const Table& table)
 {
+    using clock = std::chrono::steady_clock;
+    m_build_stats = {};
     Trees& t = *m_trees;
     clear_graph_arrays(t);
     t.set_hdr(h_dim, 0);
@@ -2209,6 +2429,7 @@ void VectorIndex::do_rebuild(const Table& table)
 
     const bool sq8 = m_config.encoding == VectorEncoding::SQ8;
     std::vector<float> buf(d);
+    auto t0 = clock::now();
     if (sq8) {
         // Learn the quantization range from the data (one extra pass — cheap
         // next to graph construction) and persist the decode params.
@@ -2237,6 +2458,8 @@ void VectorIndex::do_rebuild(const Table& table)
         t.qparams.add_range(mn.data(), mn.size());
         m_cache->qparams = std::move(mn);
     }
+    auto t1 = clock::now();
+    m_build_stats.learn_seconds = std::chrono::duration<double>(t1 - t0).count();
 
     BulkBuilder builder(m_config, d, uint64_t(t.hdr(h_salt)), m_config.encoding,
                         sq8 ? m_cache->qparams.data() : nullptr);
@@ -2252,7 +2475,8 @@ void VectorIndex::do_rebuild(const Table& table)
             continue;
         builder.add(obj.get_key().value, buf.data());
     }
-    bulk_rebuild(t, *m_cache, m_config.build_threads, builder);
+    m_build_stats.feed_seconds = std::chrono::duration<double>(clock::now() - t1).count();
+    bulk_rebuild(t, *m_cache, m_config.build_threads, builder, &m_build_stats);
 }
 
 void VectorIndex::rebuild(const Table& table)
