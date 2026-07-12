@@ -309,10 +309,10 @@ private:
 
 // Semantic (vector) nearest-neighbour search descriptor. Given a query embedding and a `k`,
 // keeps the `k` closest objects (by distance over a list-of-floats property) ordered closest first.
-// Persisted indexes use approximate graph search by default; for a persisted index, a nonzero
-// per-query ef override covering the full candidate universe requests an exact flat scan. The
-// no-index fallback and the persisted ef_search config do not request exact mode.
-// Distance defaults to Inner Product but is pluggable.
+// The property must carry a persisted vector index (there is no un-indexed fallback — execute
+// throws). Approximate graph search is the default; a nonzero per-query ef override covering the
+// full candidate universe requests an exact flat scan, while the persisted ef_search config never
+// does. Distance defaults to Inner Product but is pluggable.
 class SemanticSearchDescriptor : public BaseDescriptor {
 public:
     // `ef` overrides the index's persisted ef_search beam for this query only
