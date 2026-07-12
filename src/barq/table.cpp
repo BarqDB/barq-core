@@ -1990,6 +1990,14 @@ void Table::update_from_parent() noexcept
                 index->update_from_parent();
             }
         }
+        // Vector index accessors cache refs into the previous transaction's
+        // slab just like StringIndexes do; skipping them here would make the
+        // next notify/maintenance write go through freed memory.
+        for (auto&& index : m_vector_index_accessors) {
+            if (index) {
+                index->update_from_parent();
+            }
+        }
 
         m_opposite_table.init_from_parent();
         m_opposite_column.init_from_parent();
@@ -2340,9 +2348,13 @@ void Table::remove_vector_index(ColKey col_key)
     if (column_ndx.val >= m_vector_index_accessors.size() || !m_vector_index_accessors[column_ndx.val])
         return;
 
-    // Detach the graph from its parent first. This also makes the parent path
-    // writable before destroy_deep() starts returning the graph's blocks.
+    // Re-attach the accessor from the parent slot before touching anything:
+    // destroy_deep() through a ref cached from an earlier transaction would
+    // free stale (or since-reused) blocks.
     auto& index = m_vector_index_accessors[column_ndx.val];
+    index->update_from_parent();
+    // Detach the graph from its parent next. This also makes the parent path
+    // writable before destroy_deep() starts returning the graph's blocks.
     m_index_refs.set(column_ndx.val, 0);
     index->destroy();
     index.reset();

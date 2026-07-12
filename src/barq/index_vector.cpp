@@ -1598,12 +1598,14 @@ void VectorIndex::record_event(size_t slot, ObjKey key)
 void VectorIndex::object_inserted(ObjKey key)
 {
     std::lock_guard<std::mutex> lock(m_cache->mutex);
+    refresh_if_stale();
     record_event(t_added, key);
 }
 
 void VectorIndex::object_erased(ObjKey key)
 {
     std::lock_guard<std::mutex> lock(m_cache->mutex);
+    refresh_if_stale();
     record_event(t_removed, key);
 }
 
@@ -1617,6 +1619,7 @@ void clear_graph_arrays(VectorIndex::Trees& t); // defined below
 void VectorIndex::table_cleared()
 {
     std::lock_guard<std::mutex> lock(m_cache->mutex);
+    refresh_if_stale();
     Trees& t = *m_trees;
     clear_graph_arrays(t);
     t.set_hdr(h_dim, 0); // rediscovered from the next data
@@ -2221,6 +2224,7 @@ void VectorIndex::do_rebuild(const Table& table)
 void VectorIndex::rebuild(const Table& table)
 {
     std::lock_guard<std::mutex> lock(m_cache->mutex);
+    refresh_if_stale();
     do_rebuild(table);
     make_tracked(); // a full rebuild reconciles everything; upgrades legacy layouts
     m_cache->overlay.clear();
@@ -2343,6 +2347,7 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
         return out;
 
     std::lock_guard<std::mutex> lock(m_cache->mutex);
+    refresh_if_stale();
 
     if (size_t d0 = dim(); d0 != 0 && query.size() != d0)
         throw IllegalOperation("Query vector dimension does not match the vector index");

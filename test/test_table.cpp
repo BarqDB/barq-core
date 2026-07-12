@@ -6817,6 +6817,63 @@ TEST(Table_VectorIndexConfigReconcile)
     wt.commit();
 }
 
+// commit_and_continue re-anchors every table accessor onto the new file
+// version; the vector index accessor must be re-anchored too. Before the fix,
+// the next notify/maintenance write went through freed slab memory: an erase
+// event was lost (debug builds assert in verify_matches_table, release builds
+// keep ranking the deleted object) and a clear() never reached the persisted
+// graph.
+TEST(Table_VectorIndexStaleAccessorAfterCommitAndContinue)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    {
+        DBRef sg = DB::create(path);
+        auto wt = sg->start_write();
+        TableRef t = wt->add_table("v");
+        ColKey col_id = t->add_column(type_Int, "id");
+        ColKey col_vec = t->add_column_list(type_Float, "embedding");
+        VectorIndexConfig cfg;
+        cfg.metric = VectorMetric::L2;
+        cfg.dimensions = 3;
+        t->add_vector_index(col_vec, cfg);
+        std::vector<ObjKey> keys;
+        for (int i = 0; i < 10; ++i) {
+            Obj o = t->create_object();
+            o.set(col_id, i);
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (int d = 0; d < 3; ++d)
+                lst.add(float(i + d));
+            keys.push_back(o.get_key());
+        }
+        // Absorb everything into the graph, then commit keeping the transaction.
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, std::vector<float>{0.0f, 1.0f, 2.0f}, 1);
+        wt->commit_and_continue_writing();
+
+        // The erase notification must reach the re-anchored accessor…
+        t->remove_object(keys[0]);
+        // …and the next in-transaction search (which absorbs the event and, in
+        // debug builds, cross-checks the graph against the table) must agree.
+        TableView v2 = t->where().find_all();
+        v2.knnsearch(col_vec, std::vector<float>{0.0f, 1.0f, 2.0f}, 1);
+        CHECK_EQUAL(size_t(9), t->get_vector_index(col_vec)->count());
+        wt->commit_and_continue_writing();
+
+        // A wholesale clear after a commit boundary must empty the persisted
+        // graph, not vanish into a stale image.
+        t->clear();
+        wt->commit();
+    }
+    {
+        DBRef sg = DB::create(path);
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("v");
+        ColKey col_vec = t->get_column_key("embedding");
+        CHECK(t->has_vector_index(col_vec));
+        CHECK_EQUAL(size_t(0), t->get_vector_index(col_vec)->count());
+    }
+}
+
 // A config the graph math can't support is rejected at the Table layer, so the
 // bindgen and direct C++ paths (which skip the C API) are covered too. The
 // updated ef_search must also survive a reopen.
