@@ -2274,9 +2274,27 @@ static bool vector_config_compatible(const VectorIndexConfig& a, const VectorInd
            a.ef_construction == b.ef_construction;
 }
 
+// Reject a config the graph math can't support before anything is persisted.
+// This is the enforcement point every caller shares — the C API, the bindgen
+// SDKs and direct C++ users all funnel through Table::add_vector_index.
+static void validate_vector_config(const VectorIndexConfig& config)
+{
+    if (config.metric != VectorMetric::InnerProduct && config.metric != VectorMetric::L2 &&
+        config.metric != VectorMetric::Cosine)
+        throw InvalidArgument("Invalid vector metric");
+    if (config.encoding != VectorEncoding::Float32 && config.encoding != VectorEncoding::SQ8)
+        throw InvalidArgument("Invalid vector encoding");
+    // m == 1 would divide by log(1) == 0 in the HNSW level assignment.
+    if (config.m < 2)
+        throw InvalidArgument("Vector index m must be at least 2");
+    if (config.ef_construction == 0)
+        throw InvalidArgument("Vector index ef_construction must be greater than zero");
+}
+
 void Table::add_vector_index(ColKey col_key, const VectorIndexConfig& config)
 {
     check_column(col_key);
+    validate_vector_config(config);
     if (!(col_key.is_list() && col_key.get_type() == col_type_Float)) {
         throw IllegalOperation(
             util::format("Vector index requires a list-of-float property: %1", get_column_name(col_key)));
@@ -2286,7 +2304,7 @@ void Table::add_vector_index(ColKey col_key, const VectorIndexConfig& config)
     auto attr = m_spec.get_column_attr(spec_ndx);
     if (attr.test(col_attr_Vector_Indexed)) {
         // Already indexed: an identical request is an idempotent no-op, but a
-        // different configuration is rejected rather than silently ignored, so the
+        // different graph shape is rejected rather than silently ignored, so the
         // wrong index can't be left in place. The caller reconciles by removing it.
         if (VectorIndex* existing = get_vector_index(col_key)) {
             if (!vector_config_compatible(existing->config(), config))
@@ -2294,6 +2312,10 @@ void Table::add_vector_index(ColKey col_key, const VectorIndexConfig& config)
                     util::format("A vector index already exists on '%1' with a different configuration; "
                                  "remove it before re-creating with new settings",
                                  get_column_name(col_key)));
+            // Same graph shape: adopt a changed query-time beam in place —
+            // ef_search never requires a rebuild (write transactions only).
+            if (existing->config().ef_search != config.ef_search)
+                existing->set_ef_search(config.ef_search);
         }
         return;
     }

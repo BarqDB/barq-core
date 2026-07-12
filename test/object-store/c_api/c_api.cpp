@@ -4672,6 +4672,15 @@ TEST_CASE("C API - vector search", "[c_api][vector]")
         CHECK_ERR(BARQ_ERR_INVALID_ARGUMENT);
         REQUIRE(checked(barq_rollback(barq.get())));
 
+        // m == 1 would divide by log(1) == 0 in the level assignment.
+        invalid_config = index_config;
+        invalid_config.m = 1;
+        REQUIRE(checked(barq_begin_write(barq.get())));
+        CHECK_FALSE(barq_add_vector_index(barq.get(), document_class.key, embedding_property.key,
+                                          &invalid_config));
+        CHECK_ERR(BARQ_ERR_INVALID_ARGUMENT);
+        REQUIRE(checked(barq_rollback(barq.get())));
+
         invalid_config = index_config;
         invalid_config.metric = static_cast<barq_vector_metric_e>(99);
         REQUIRE(checked(barq_begin_write(barq.get())));
@@ -4694,6 +4703,27 @@ TEST_CASE("C API - vector search", "[c_api][vector]")
         CHECK(barq_get_last_error(nullptr));
         barq_clear_last_error();
         REQUIRE(checked(barq_rollback(barq.get())));
+    }
+
+    SECTION("ef_search-only change updates the persisted config in place")
+    {
+        auto retuned = index_config;
+        retuned.ef_search = 64;
+        REQUIRE(checked(barq_begin_write(barq.get())));
+        REQUIRE(checked(
+            barq_add_vector_index(barq.get(), document_class.key, embedding_property.key, &retuned)));
+        REQUIRE(checked(barq_commit(barq.get())));
+
+        barq_vector_index_config_t updated{};
+        REQUIRE(checked(
+            barq_get_vector_index_config(barq.get(), document_class.key, embedding_property.key, &updated)));
+        CHECK(updated.ef_search == 64);
+        // The graph-shaping settings are untouched.
+        CHECK(updated.metric == index_config.metric);
+        CHECK(updated.encoding == index_config.encoding);
+        CHECK(updated.dimensions == index_config.dimensions);
+        CHECK(updated.m == index_config.m);
+        CHECK(updated.ef_construction == index_config.ef_construction);
     }
 }
 

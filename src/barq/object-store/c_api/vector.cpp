@@ -27,8 +27,9 @@ void validate_config(const barq_vector_index_config_t& config)
         throw std::invalid_argument("Invalid vector metric");
     if (config.encoding < BARQ_VECTOR_ENCODING_FLOAT32 || config.encoding > BARQ_VECTOR_ENCODING_SQ8)
         throw std::invalid_argument("Invalid vector encoding");
-    if (config.m == 0)
-        throw std::invalid_argument("Vector index m must be greater than zero");
+    // m == 1 would divide by log(1) == 0 in the HNSW level assignment.
+    if (config.m < 2)
+        throw std::invalid_argument("Vector index m must be at least 2");
     if (config.ef_construction == 0)
         throw std::invalid_argument("Vector index ef_construction must be greater than zero");
 }

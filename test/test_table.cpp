@@ -6795,6 +6795,13 @@ TEST(Table_VectorIndexConfigReconcile)
     t->add_vector_index(col_vec, cfg);
     CHECK(t->has_vector_index(col_vec));
 
+    // A config differing only in ef_search is adopted in place — it is a
+    // query-time knob and must never fail the reconcile or force a rebuild.
+    VectorIndexConfig retuned = cfg;
+    retuned.ef_search = 77;
+    t->add_vector_index(col_vec, retuned);
+    CHECK_EQUAL(size_t(77), t->get_vector_index(col_vec)->config().ef_search);
+
     // A changed metric or dimension is rejected, not silently ignored.
     VectorIndexConfig other = cfg;
     other.metric = VectorMetric::L2;
@@ -6808,6 +6815,61 @@ TEST(Table_VectorIndexConfigReconcile)
     t->add_vector_index(col_vec, other);
     CHECK(t->get_vector_index(col_vec)->config().metric == VectorMetric::L2);
     wt.commit();
+}
+
+// A config the graph math can't support is rejected at the Table layer, so the
+// bindgen and direct C++ paths (which skip the C API) are covered too. The
+// updated ef_search must also survive a reopen.
+TEST(Table_VectorIndexConfigValidationAndEfSearchUpdate)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    {
+        DBRef sg = DB::create(path);
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("v");
+        ColKey col_vec = t->add_column_list(type_Float, "embedding");
+        for (int i = 0; i < 8; ++i) {
+            Obj o = t->create_object();
+            for (int d = 0; d < 3; ++d)
+                o.get_list<float>(col_vec).add(float(i + d));
+        }
+
+        VectorIndexConfig bad = {};
+        bad.m = 0;
+        CHECK_THROW(t->add_vector_index(col_vec, bad), InvalidArgument);
+        bad.m = 1; // 1/log(1) is UB in the level assignment
+        CHECK_THROW(t->add_vector_index(col_vec, bad), InvalidArgument);
+        bad = {};
+        bad.ef_construction = 0;
+        CHECK_THROW(t->add_vector_index(col_vec, bad), InvalidArgument);
+        bad = {};
+        bad.metric = VectorMetric(9);
+        CHECK_THROW(t->add_vector_index(col_vec, bad), InvalidArgument);
+        bad = {};
+        bad.encoding = VectorEncoding(7);
+        CHECK_THROW(t->add_vector_index(col_vec, bad), InvalidArgument);
+        CHECK_NOT(t->has_vector_index(col_vec));
+
+        VectorIndexConfig cfg;
+        cfg.metric = VectorMetric::L2;
+        cfg.dimensions = 3;
+        cfg.ef_search = 16;
+        t->add_vector_index(col_vec, cfg);
+
+        cfg.ef_search = 99;
+        t->add_vector_index(col_vec, cfg); // in-place update, no throw
+        CHECK_EQUAL(size_t(99), t->get_vector_index(col_vec)->config().ef_search);
+        wt.commit();
+    }
+    {
+        // The updated beam is persisted, not just cached on the accessor.
+        DBRef sg = DB::create(path);
+        ReadTransaction rt(sg);
+        ConstTableRef t = rt.get_table("v");
+        ColKey col_vec = t->get_column_key("embedding");
+        CHECK(t->has_vector_index(col_vec));
+        CHECK_EQUAL(size_t(99), t->get_vector_index(col_vec)->config().ef_search);
+    }
 }
 
 // The exact flag runs a flat scan over live data regardless of the beam, so it

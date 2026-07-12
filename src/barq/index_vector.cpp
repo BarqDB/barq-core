@@ -2247,6 +2247,15 @@ void VectorIndex::mark_dirty(ObjKey key)
     m_cache->synced_version = uint64_t(-1); // re-sync on the next search
 }
 
+void VectorIndex::set_ef_search(size_t ef_search)
+{
+    std::lock_guard<std::mutex> lock(m_cache->mutex);
+    refresh_if_stale();
+    if (m_trees->header.size() > h_efs)
+        m_trees->set_hdr(h_efs, int64_t(ef_search));
+    m_config.ef_search = ef_search;
+}
+
 // Absorb (write transaction) or compute the read-only overlay: the set of keys the
 // persisted graph does not reflect yet, answered by brute force at query time.
 void VectorIndex::ensure_synced(const Table& table)

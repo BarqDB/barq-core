@@ -1556,8 +1556,11 @@ BARQ_API barq_results_t* barq_object_find_all(const barq_t*, barq_class_key_t);
 
 /**
  * Add a vector (HNSW) index to a list-of-float column. Idempotent when an index
- * with an identical config already exists; throws on a conflicting config. Pass
- * a NULL @a config to use the engine defaults. Must run in a write transaction.
+ * with an identical config already exists; a config that differs only in
+ * ef_search updates the persisted ef_search in place (it is a query-time knob
+ * and never requires a rebuild); any other conflicting config throws. Requires
+ * m >= 2 and ef_construction >= 1. Pass a NULL @a config to use the engine
+ * defaults. Must run in a write transaction.
  *
  * @return True if no exception occurred.
  */

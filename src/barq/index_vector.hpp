@@ -171,6 +171,11 @@ public:
     // pending list; searches re-rank it from live data until the graph absorbs it.
     void mark_dirty(ObjKey key);
 
+    // Adopt a new query-time beam floor (write transactions only). ef_search
+    // shapes searches, not the persisted graph, so the header is patched in
+    // place and no rebuild happens.
+    void set_ef_search(size_t ef_search);
+
     // Change notifications from the owning table (write transactions only).
     // The keys queue up in persisted event lists consumed by the next absorb;
     // read transactions answer for them via the overlay. No-ops on a legacy
