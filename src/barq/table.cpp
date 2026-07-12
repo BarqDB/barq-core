@@ -2318,16 +2318,16 @@ void Table::remove_vector_index(ColKey col_key)
     if (column_ndx.val >= m_vector_index_accessors.size() || !m_vector_index_accessors[column_ndx.val])
         return;
 
-    // Destroy the persisted graph and drop the accessor
+    // Detach the graph from its parent first. This also makes the parent path
+    // writable before destroy_deep() starts returning the graph's blocks.
     auto& index = m_vector_index_accessors[column_ndx.val];
+    m_index_refs.set(column_ndx.val, 0);
     index->destroy();
     index.reset();
     m_has_any_vector_index =
         std::any_of(m_vector_index_accessors.begin(), m_vector_index_accessors.end(), [](auto& ptr) {
             return bool(ptr);
         });
-
-    m_index_refs.set(column_ndx.val, 0);
 
     // update spec
     auto spec_ndx = leaf_ndx2spec_ndx(column_ndx);

@@ -334,9 +334,9 @@ records:
         type: ColKey
         default: {}
   # Build/search parameters for a vector (knn) index. Mirrors
-  # barq::VectorIndexConfig; build_threads is intentionally omitted (it is not
-  # persisted and is never set from the SDK). metric/encoding have no default so
-  # the SDK must always state them explicitly.
+  # barq::VectorIndexConfig. build_threads controls only full builds/rebuilds and
+  # is not persisted. metric/encoding have no default so the SDK must always
+  # state them explicitly.
   VectorIndexConfig:
     fields:
       metric:
@@ -353,6 +353,9 @@ records:
         type: count_t
         default: 200
       ef_search:
+        type: count_t
+        default: 0
+      build_threads:
         type: count_t
         default: 0
   VersionID:

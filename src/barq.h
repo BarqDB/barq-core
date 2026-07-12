@@ -344,6 +344,9 @@ typedef struct barq_vector_index_config {
     size_t m;
     size_t ef_construction;
     size_t ef_search;
+    // Worker threads used for a full build/rebuild. 0 means one per core.
+    // This is a build-time setting and is not persisted with the index.
+    size_t build_threads;
 } barq_vector_index_config_t;
 
 

@@ -59,6 +59,7 @@ static inline VectorIndexConfig from_capi(const barq_vector_index_config_t& conf
     out.m = config.m;
     out.ef_construction = config.ef_construction;
     out.ef_search = config.ef_search;
+    out.build_threads = config.build_threads;
     return out;
 }
 
@@ -71,6 +72,7 @@ static inline barq_vector_index_config_t to_capi(const VectorIndexConfig& config
     out.m = config.m;
     out.ef_construction = config.ef_construction;
     out.ef_search = config.ef_search;
+    out.build_threads = config.build_threads;
     return out;
 }
 

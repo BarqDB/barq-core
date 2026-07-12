@@ -13,10 +13,27 @@
 #include <barq/index_vector.hpp>
 #include <barq/table.hpp>
 
+#include <cmath>
 #include <stdexcept>
 #include <vector>
 
 namespace barq::c_api {
+
+namespace {
+
+void validate_config(const barq_vector_index_config_t& config)
+{
+    if (config.metric < BARQ_VECTOR_METRIC_INNER_PRODUCT || config.metric > BARQ_VECTOR_METRIC_COSINE)
+        throw std::invalid_argument("Invalid vector metric");
+    if (config.encoding < BARQ_VECTOR_ENCODING_FLOAT32 || config.encoding > BARQ_VECTOR_ENCODING_SQ8)
+        throw std::invalid_argument("Invalid vector encoding");
+    if (config.m == 0)
+        throw std::invalid_argument("Vector index m must be greater than zero");
+    if (config.ef_construction == 0)
+        throw std::invalid_argument("Vector index ef_construction must be greater than zero");
+}
+
+} // namespace
 
 BARQ_API bool barq_add_vector_index(barq_t* barq, barq_class_key_t class_key, barq_property_key_t col_key,
                                     const barq_vector_index_config_t* config)
@@ -24,10 +41,13 @@ BARQ_API bool barq_add_vector_index(barq_t* barq, barq_class_key_t class_key, ba
     return wrap_err([&]() {
         auto& shared_barq = *barq;
         auto table = shared_barq->read_group().get_table(TableKey(class_key));
-        if (config)
+        if (config) {
+            validate_config(*config);
             table->add_vector_index(ColKey(col_key), from_capi(*config));
-        else
+        }
+        else {
             table->add_vector_index(ColKey(col_key));
+        }
         return true;
     });
 }
@@ -84,6 +104,19 @@ BARQ_API barq_results_t* barq_results_knn_search(const barq_results_t* results, 
                                                  bool exact)
 {
     return wrap_err([&]() {
+        if (!query_data)
+            throw std::invalid_argument("Query data must not be null");
+        for (size_t i = 0; i < query_size; ++i) {
+            if (!std::isfinite(query_data[i]))
+                throw std::invalid_argument("Query vector contains a non-finite value");
+        }
+        auto table = results->get_table();
+        auto* index = table->get_vector_index(ColKey(col_key));
+        if (!index)
+            throw IllegalOperation("The requested column has no vector index");
+        if (auto dimensions = index->config().dimensions; dimensions != 0 && query_size != dimensions) {
+            throw IllegalOperation("Query vector dimension does not match the vector index");
+        }
         std::vector<float> query(query_data, query_data + query_size);
         return new barq_results{results->knn_search(ColKey(col_key), query, k, ef, exact)};
     });

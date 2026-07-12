@@ -423,7 +423,10 @@ public:
         if (count == 0)
             return;
         std::vector<T> buf(std::min(count, size_t(BARQ_MAX_BPNODE_SIZE)));
-        if (m_size != 0) {
+        // Keep a single leaf in the tree's existing root. A one-leaf bulk
+        // replacement gives no speedup and needlessly churns the root while
+        // rebuilding several small trees back-to-back.
+        if (m_size != 0 || count <= BARQ_MAX_BPNODE_SIZE) {
             for (size_t offset = 0; offset < count;) {
                 size_t n = std::min(count - offset, size_t(BARQ_MAX_BPNODE_SIZE));
                 fill(offset, n, buf.data());
