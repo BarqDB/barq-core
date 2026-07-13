@@ -118,6 +118,13 @@ BARQ_API barq_results_t* barq_results_knn_search(const barq_results_t* results, 
         if (auto dimensions = index->config().dimensions; dimensions != 0 && query_size != dimensions) {
             throw IllegalOperation("Query vector dimension does not match the vector index");
         }
+        if (index->config().metric == VectorMetric::Cosine && query_size > 0) {
+            bool all_zero = true;
+            for (size_t i = 0; i < query_size && all_zero; ++i)
+                all_zero = query_data[i] == 0;
+            if (all_zero)
+                throw std::invalid_argument("Query vector must have a non-zero norm under the cosine metric");
+        }
         std::vector<float> query(query_data, query_data + query_size);
         return new barq_results{results->knn_search(ColKey(col_key), query, k, ef, exact)};
     });

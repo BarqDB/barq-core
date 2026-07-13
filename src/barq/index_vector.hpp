@@ -35,7 +35,11 @@ class Table;
 enum class VectorMetric : uint8_t {
     InnerProduct = 0, // dot product (higher = closer); embeddings pre-normalized upstream
     L2 = 1,           // squared euclidean distance (lower = closer)
-    Cosine = 2,       // inner product on vectors normalized at insert/query time
+    Cosine = 2,       // inner product on vectors normalized at insert/query time.
+                      // A zero vector has no direction, so cosine is undefined for it:
+                      // a zero-norm query is rejected (InvalidArgument) and a zero-norm
+                      // stored vector is never indexed or returned as a neighbour
+                      // (same treatment as vectors holding NaN/Inf).
 };
 
 /// How the index stores its copy of the vectors.
@@ -203,6 +207,9 @@ public:
     // first absorbs any unindexed data changes. `ef` overrides the configured
     // search beam for this query (0 = use config). An explicit `ef` at least as
     // large as the live candidate count performs a flat exact scan.
+    // Throws InvalidArgument for a query holding non-finite values, or for a
+    // zero-norm query under the cosine metric (cosine of a zero vector is
+    // undefined). Zero-norm stored vectors under cosine are excluded from results.
     std::vector<ObjKey> search(const Table& table, const std::vector<float>& query, size_t k,
                                const VectorCandidates* candidates, size_t ef = 0);
     std::vector<ObjKey> search(const Table& table, const std::vector<float>& query, size_t k,

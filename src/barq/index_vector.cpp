@@ -119,17 +119,19 @@ uint64_t splitmix64(uint64_t x)
     return x ^ (x >> 31);
 }
 
-// Normalize in place (cosine metric); zero vectors are left untouched.
+// Normalize in place (cosine metric). A zero vector has no direction — its cosine
+// against anything is 0/0 — so it becomes all-NaN here, and the non-finite checks
+// every caller already runs take over: stored zero vectors are never indexed or
+// returned as neighbours, exactly like vectors holding NaN/Inf. Query vectors are
+// rejected up front in search() and never reach this case.
 void normalize_vec(float* v, size_t dim)
 {
     double n = 0;
     for (size_t i = 0; i < dim; ++i)
         n += double(v[i]) * double(v[i]);
-    if (n > 0) {
-        float inv = float(1.0 / std::sqrt(n));
-        for (size_t i = 0; i < dim; ++i)
-            v[i] *= inv;
-    }
+    float inv = n > 0 ? float(1.0 / std::sqrt(n)) : std::numeric_limits<float>::quiet_NaN();
+    for (size_t i = 0; i < dim; ++i)
+        v[i] *= inv;
 }
 
 bool is_finite_vector(const float* v, size_t dim) noexcept
@@ -2607,6 +2609,15 @@ std::vector<ObjKey> VectorIndex::search(const Table& table, const std::vector<fl
             return std::isfinite(value);
         })) {
         throw InvalidArgument("Query vector must contain only finite values");
+    }
+    // A zero vector has no direction, so its cosine against anything is undefined
+    // (0/0). Refuse it up front instead of returning results in arbitrary order.
+    // norm == 0 is exactly "every component is ±0" (the norm accumulates in double,
+    // where squares of finite floats cannot underflow to zero).
+    if (m_config.metric == VectorMetric::Cosine && std::all_of(query.begin(), query.end(), [](float value) {
+            return value == 0;
+        })) {
+        throw InvalidArgument("Query vector must have a non-zero norm under the cosine metric");
     }
     if (candidates && candidates->size() == 0)
         return out;

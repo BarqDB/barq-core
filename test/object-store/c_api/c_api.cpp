@@ -4705,6 +4705,37 @@ TEST_CASE("C API - vector search", "[c_api][vector]")
         REQUIRE(checked(barq_rollback(barq.get())));
     }
 
+    SECTION("zero-norm vectors under the cosine metric")
+    {
+        // Swap the index for a cosine one. Document 1 stores {0, 0}: a zero
+        // vector has no direction under cosine, so it drops out of the index.
+        auto cosine_config = index_config;
+        cosine_config.metric = BARQ_VECTOR_METRIC_COSINE;
+        cosine_config.encoding = BARQ_VECTOR_ENCODING_FLOAT32;
+        REQUIRE(checked(barq_begin_write(barq.get())));
+        REQUIRE(checked(barq_remove_vector_index(barq.get(), document_class.key, embedding_property.key)));
+        REQUIRE(checked(
+            barq_add_vector_index(barq.get(), document_class.key, embedding_property.key, &cosine_config)));
+        REQUIRE(checked(barq_commit(barq.get())));
+
+        // A zero-norm query is rejected eagerly, approximate and exact alike.
+        const float zero_query[2] = {0.0f, 0.0f};
+        CHECK_FALSE(barq_results_knn_search(all.get(), embedding_property.key, zero_query, 2, 2, 0, false));
+        CHECK_ERR(BARQ_ERR_INVALID_ARGUMENT);
+        CHECK_FALSE(barq_results_knn_search(all.get(), embedding_property.key, zero_query, 2, 2, 0, true));
+        CHECK_ERR(BARQ_ERR_INVALID_ARGUMENT);
+
+        // A valid query never returns the zero-vector document.
+        auto nearest =
+            cptr_checked(barq_results_knn_search(all.get(), embedding_property.key, query, 2, 4, 0, true));
+        size_t count = 0;
+        REQUIRE(checked(barq_results_count(nearest.get(), &count)));
+        REQUIRE(count == 3);
+        CHECK(result_id(nearest.get(), 0) == 2);
+        CHECK(result_id(nearest.get(), 1) == 4);
+        CHECK(result_id(nearest.get(), 2) == 3);
+    }
+
     SECTION("ef_search-only change updates the persisted config in place")
     {
         auto retuned = index_config;

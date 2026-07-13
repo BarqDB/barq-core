@@ -7269,6 +7269,145 @@ TEST(Table_VectorIndexSQ8Cosine)
     CHECK_EQUAL(77, exact[0].get<Int>(col_id));
 }
 
+// Cosine is undefined for a zero-norm vector (0/0 — a zero vector has no
+// direction). A zero-norm query is rejected with InvalidArgument on every
+// search path, and a zero-norm stored vector is treated like one holding
+// NaN/Inf: never indexed, never returned as a neighbour. L2 and inner product
+// keep accepting zero vectors — a zero point (L2) or an all-zero score (IP)
+// is well-defined.
+TEST(Table_VectorIndexCosineZeroNorm)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    const int N = 40;
+    DBRef sg = DB::create(path);
+    WriteTransaction wt(sg);
+    TableRef t = wt.add_table("vectors");
+    ColKey col_id = t->add_column(type_Int, "id");
+    ColKey col_vec = t->add_column_list(type_Float, "embedding");
+    ObjKey edit_key;
+    for (int i = 0; i < N; ++i) {
+        Obj o = t->create_object();
+        o.set(col_id, i);
+        if (i == 5)
+            edit_key = o.get_key();
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : knn_test_vec(i))
+            lst.add(x);
+    }
+    auto add_zero_row = [&](int64_t id) {
+        Obj o = t->create_object();
+        o.set(col_id, id);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (size_t j = 0; j < 16; ++j)
+            lst.add(0.0f);
+    };
+    add_zero_row(1000); // stored before the build: must never enter the index
+
+    VectorIndexConfig cfg = exact_cfg(N);
+    cfg.metric = VectorMetric::Cosine;
+    cfg.dimensions = 16;
+    t->add_vector_index(col_vec, cfg);
+    VectorIndex* index = t->get_vector_index(col_vec);
+    CHECK_EQUAL(size_t(N), index->count());
+
+    // The zero query is rejected on the graph path, the flat exact path, and
+    // the descriptor (TableView) path — approximate, exact and tiny filtered
+    // views alike.
+    const std::vector<float> zero_query(16, 0.0f);
+    CHECK_THROW(index->search(*t, zero_query, 3, nullptr), InvalidArgument);
+    CHECK_THROW(index->search(*t, zero_query, 3, nullptr, /*ef=*/t->size()), InvalidArgument);
+    TableView all = t->where().find_all();
+    CHECK_THROW(all.knnsearch(col_vec, zero_query, 3), InvalidArgument);
+    TableView tiny = t->where().less(col_id, 4).find_all();
+    CHECK_THROW(tiny.knnsearch(col_vec, zero_query, 2), InvalidArgument);
+    TableView flat = t->where().find_all();
+    CHECK_THROW(flat.knnsearch(col_vec, zero_query, 3, /*ef=*/0, /*exact=*/true), InvalidArgument);
+
+    // Valid queries never see the zero-norm rows: not the one predating the
+    // build, not one inserted after it, not one edited down to zeros.
+    auto has_id = [&](const std::vector<ObjKey>& keys, int64_t id) {
+        for (ObjKey key : keys) {
+            if (t->get_object(key).get<Int>(col_id) == id)
+                return true;
+        }
+        return false;
+    };
+    std::vector<ObjKey> res = index->search(*t, knn_test_vec(7), N + 8, nullptr);
+    CHECK_EQUAL(size_t(N), res.size());
+    CHECK_NOT(has_id(res, 1000));
+
+    add_zero_row(1001); // insert-after-build: dropped when the search absorbs it
+    Lst<float> edited = t->get_object(edit_key).get_list<float>(col_vec);
+    for (size_t j = 0; j < 16; ++j)
+        edited.set(j, 0.0f); // edit-to-zero: tombstoned on absorb
+    res = index->search(*t, knn_test_vec(7), N + 8, nullptr);
+    CHECK_EQUAL(size_t(N) - 1, res.size());
+    CHECK_NOT(has_id(res, 1000));
+    CHECK_NOT(has_id(res, 1001));
+    CHECK_NOT(has_id(res, 5));
+    CHECK_EQUAL(size_t(N) - 1, index->count());
+
+    // The same exclusions hold on the flat exact path (live table data).
+    res = index->search(*t, knn_test_vec(7), N + 8, nullptr, /*ef=*/t->size());
+    CHECK_EQUAL(size_t(N) - 1, res.size());
+
+    // Zero-norm vectors stay legal under L2: re-index the same column and the
+    // zero query is answered, with the three zero rows as its nearest points.
+    t->remove_vector_index(col_vec);
+    VectorIndexConfig l2 = exact_cfg(N);
+    l2.metric = VectorMetric::L2;
+    l2.dimensions = 16;
+    t->add_vector_index(col_vec, l2);
+    index = t->get_vector_index(col_vec);
+    CHECK_EQUAL(size_t(N) + 2, index->count()); // every row indexes now
+    std::vector<ObjKey> nearest = index->search(*t, zero_query, 3, nullptr);
+    CHECK_EQUAL(size_t(3), nearest.size());
+    CHECK(has_id(nearest, 5));
+    CHECK(has_id(nearest, 1000));
+    CHECK(has_id(nearest, 1001));
+
+    // Inner product likewise: an all-zero query scores every row 0 — legal.
+    t->remove_vector_index(col_vec);
+    VectorIndexConfig ip = exact_cfg(N);
+    ip.metric = VectorMetric::InnerProduct;
+    ip.dimensions = 16;
+    t->add_vector_index(col_vec, ip);
+    index = t->get_vector_index(col_vec);
+    CHECK_EQUAL(size_t(3), index->search(*t, zero_query, 3, nullptr).size());
+
+    // SQ8 + cosine follows the same rules: the zero row never reaches the
+    // quantizer or the graph, and the zero query is rejected up front.
+    TableRef q = wt.add_table("vectors_sq8");
+    ColKey qid = q->add_column(type_Int, "id");
+    ColKey qvec = q->add_column_list(type_Float, "embedding");
+    for (int i = 0; i < N; ++i) {
+        Obj o = q->create_object();
+        o.set(qid, i);
+        Lst<float> lst = o.get_list<float>(qvec);
+        for (float x : knn_test_vec(i))
+            lst.add(2.0f * x);
+    }
+    {
+        Obj o = q->create_object();
+        o.set(qid, 1000);
+        Lst<float> lst = o.get_list<float>(qvec);
+        for (size_t j = 0; j < 16; ++j)
+            lst.add(0.0f);
+    }
+    VectorIndexConfig sq8 = exact_cfg(N);
+    sq8.metric = VectorMetric::Cosine;
+    sq8.encoding = VectorEncoding::SQ8;
+    sq8.dimensions = 16;
+    q->add_vector_index(qvec, sq8);
+    VectorIndex* qindex = q->get_vector_index(qvec);
+    CHECK_EQUAL(size_t(N), qindex->count());
+    CHECK_THROW(qindex->search(*q, zero_query, 3, nullptr), InvalidArgument);
+    res = qindex->search(*q, knn_test_vec(7), 1, nullptr);
+    CHECK_EQUAL(size_t(1), res.size());
+    CHECK_EQUAL(7, q->get_object(res[0]).get<Int>(qid));
+    wt.commit();
+}
+
 // Event-driven maintenance: inserts, erases and in-place edits are recorded as
 // they happen and folded in without ever scanning the table. Searches in write
 // transactions (absorb) and read transactions (overlay) must both stay exact
