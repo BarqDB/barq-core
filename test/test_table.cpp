@@ -5829,6 +5829,72 @@ TEST(Table_VectorIndexConfig)
     }
 }
 
+// Table::clear must not demote a declared dimension to "infer from data":
+// config() reports h_dim only while the declared flag is set, so zeroing it on
+// clear made every later open see dimensions = 0 and reject the SDK-declared
+// config as drift.
+TEST(Table_VectorIndexClearKeepsDeclaredDims)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    VectorIndexConfig cfg;
+    cfg.metric = VectorMetric::L2;
+    cfg.dimensions = 4;
+    cfg.m = 8;
+    cfg.ef_construction = 32;
+
+    DBRef sg = DB::create(path);
+    ColKey col_vec;
+    {
+        WriteTransaction wt(sg);
+        TableRef t = wt.add_table("vectors");
+        col_vec = t->add_column_list(type_Float, "embedding");
+        Obj o = t->create_object();
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : {1.0f, 0.0f, 0.0f, 0.0f})
+            lst.add(x);
+        t->add_vector_index(col_vec, cfg);
+        wt.commit();
+    }
+    {
+        WriteTransaction wt(sg);
+        wt.get_table("vectors")->clear();
+        wt.commit();
+    }
+    // The declared width survives the clear, in this process and after reopen.
+    {
+        ReadTransaction rt(sg);
+        CHECK_EQUAL(4, rt.get_table("vectors")->get_vector_index(col_vec)->config().dimensions);
+    }
+    {
+        DBRef sg2 = DB::create(path);
+        {
+            ReadTransaction rt(sg2);
+            CHECK_EQUAL(4, rt.get_table("vectors")->get_vector_index(col_vec)->config().dimensions);
+        }
+        // An SDK reconcile re-adding the identical config must stay a no-op.
+        {
+            WriteTransaction wt(sg2);
+            wt.get_table("vectors")->add_vector_index(col_vec, cfg);
+            wt.commit();
+        }
+        // And the empty-but-declared index still answers (and enforces) 4-dim queries.
+        {
+            WriteTransaction wt(sg2);
+            TableRef t = wt.get_table("vectors");
+            Obj o = t->create_object();
+            Lst<float> lst = o.get_list<float>(col_vec);
+            for (float x : {0.0f, 1.0f, 0.0f, 0.0f})
+                lst.add(x);
+            wt.commit();
+        }
+        ReadTransaction rt(sg2);
+        ConstTableRef t = rt.get_table("vectors");
+        TableView v = t->where().find_all();
+        v.knnsearch(col_vec, {0.0f, 1.0f, 0.0f, 0.0f}, 1);
+        CHECK_EQUAL(1, v.size());
+    }
+}
+
 // In-place vector edits: the list-of-floats write path records the touched key in
 // the index's persisted pending list; searches re-rank it from live data at once,
 // and the next write-transaction search folds it into the graph.

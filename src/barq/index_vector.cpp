@@ -1865,7 +1865,14 @@ void VectorIndex::table_cleared()
     refresh_if_stale();
     Trees& t = *m_trees;
     clear_graph_arrays(t);
-    t.set_hdr(h_dim, 0); // rediscovered from the next data
+    // A declared dimension is fixed at creation and survives a clear — only an
+    // inferred one is rediscovered from the next data. Zeroing a declared one
+    // made config() report dimensions = 0 forever after (the read path returns
+    // h_dim only while the declared flag is set), which every SDK's open-time
+    // reconcile then rejects as config drift.
+    const bool declared = t.header.size() > h_flags && (t.hdr(h_flags) & f_dim_declared);
+    if (!declared)
+        t.set_hdr(h_dim, 0); // rediscovered from the next data
     if (m_tracked && t.header.size() > h_flags)
         t.set_hdr(h_flags, t.hdr(h_flags) & ~f_events_overflowed);
     reset_caches();
