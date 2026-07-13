@@ -1,6 +1,6 @@
 FROM debian:bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake g++ ninja-build libssl-dev zlib1g-dev \
+    cmake g++ ninja-build libssl-dev libuv1-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . ./core
@@ -12,7 +12,7 @@ RUN cmake -S core -B build -G Ninja \
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl libssl3 zlib1g \
+    ca-certificates curl libssl3 libuv1 zlib1g \
     && install -d -o 65532 -g 65532 /var/lib/barq \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/build/src/barq/sync/noinst/server/barq-server /usr/local/bin/barq-core
