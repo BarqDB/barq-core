@@ -768,6 +768,41 @@ void BPlusTreeBase::replace_root(std::unique_ptr<BPlusTreeNode> new_root)
     m_root = std::move(new_root);
 }
 
+void BPlusTreeBase::bulk_adopt_leaves(std::vector<ref_type>& level, size_t total_size)
+{
+    BARQ_ASSERT(m_size == 0 && m_root && m_root->get_tree_size() == 0);
+    if (level.empty())
+        return;
+
+    // Group nodes under compact inner nodes level by level. On every level each
+    // child spans exactly `elems_per_child` elements except the very last one,
+    // which spans the remainder — the same shape append-grown trees have.
+    size_t elems_per_child = BARQ_MAX_BPNODE_SIZE;
+    std::vector<ref_type> next;
+    while (level.size() > 1) {
+        next.clear();
+        next.reserve((level.size() + BARQ_MAX_BPNODE_SIZE - 1) / BARQ_MAX_BPNODE_SIZE);
+        for (size_t i = 0; i < level.size(); i += BARQ_MAX_BPNODE_SIZE) {
+            size_t n = std::min(level.size() - i, size_t(BARQ_MAX_BPNODE_SIZE));
+            BPlusTreeInner inner(this);
+            inner.create(elems_per_child);
+            for (size_t j = 0; j < n; ++j)
+                inner.add_bp_node_ref(level[i + j]);
+            size_t sub_size = (i + n < level.size()) ? n * elems_per_child : total_size - i * elems_per_child;
+            inner.append_tree_size(sub_size);
+            next.push_back(inner.get_ref());
+        }
+        level.swap(next);
+        elems_per_child *= BARQ_MAX_BPNODE_SIZE;
+    }
+
+    ref_type old_root = m_root->get_ref();
+    replace_root(create_root_from_ref(level[0]));
+    Array::destroy_deep(old_root, m_alloc);
+    m_size = total_size;
+    invalidate_leaf_cache();
+}
+
 void BPlusTreeBase::bptree_insert(size_t n, BPlusTreeNode::InsertFunc func)
 {
     size_t bptree_size = m_root->get_tree_size();

@@ -330,6 +330,29 @@ public:
     bool compact(bool bump_version_number = false, std::optional<const char*> output_encryption_key = util::none)
         REQUIRES(!m_mutex);
 
+    /// compact(), but only when at least `min_wasted_ratio` of the file is free
+    /// space — the point where handing the space back to the OS beats letting
+    /// future writes reuse it. Returns true if compaction ran; false when the
+    /// file is compact enough already, or whenever compact() would back out
+    /// (other DBs attached, transactions active).
+    bool compact_if_wasteful(double min_wasted_ratio = 0.5) REQUIRES(!m_mutex);
+
+    /// Ask for a best-effort opportunistic compaction. Set by maintenance that
+    /// rewrites big parts of the file and strands the old copy as dead space —
+    /// a vector-index rebuild does this automatically. The next quiet moment
+    /// (end of a plain commit, or an explicit close) compacts if at least half
+    /// the file is free space; when other transactions or DBs are in the way
+    /// the hint sticks around for the opportunity after that. The dead space is
+    /// reusable by later writes either way — compaction just also hands it back
+    /// to the OS.
+    void request_opportunistic_compaction() noexcept
+    {
+        m_compact_hint.store(true, std::memory_order_relaxed);
+    }
+
+    /// Consume a pending compaction hint if the moment allows (see above).
+    void try_hinted_compaction() noexcept REQUIRES(!m_mutex);
+
     void write_copy(std::string_view path, const char* output_encryption_key) REQUIRES(!m_mutex);
 
 #ifdef BARQ_DEBUG
@@ -492,6 +515,7 @@ private:
     size_t m_used_space GUARDED_BY(m_mutex) = 0;
     std::vector<ReadLockInfo> m_local_locks_held GUARDED_BY(m_mutex); // tracks all read locks held by this DB
     std::atomic<EvacStage> m_evac_stage = EvacStage::idle;
+    std::atomic<bool> m_compact_hint{false}; // see request_opportunistic_compaction()
     util::File m_file;
     util::File::Map<SharedInfo> m_file_map; // Never remapped, provides access to everything but the ringbuffer
     std::unique_ptr<SharedInfo> m_in_memory_info;

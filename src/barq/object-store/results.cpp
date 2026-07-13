@@ -589,7 +589,7 @@ size_t Results::index_of(Mixed const& value)
 
 size_t Results::index_of(Query&& q)
 {
-    if (m_descriptor_ordering.will_apply_sort()) {
+    if (m_descriptor_ordering.will_apply_sort() || m_descriptor_ordering.will_apply_knn()) {
         Results filtered(filter(std::move(q)));
         filtered.assert_unlocked();
         auto first = filtered.first();
@@ -966,6 +966,20 @@ Results Results::apply_ordering(DescriptorOrdering&& ordering)
     return Results(m_barq, do_get_query(), std::move(new_order));
 }
 
+Results Results::knn_search(ColKey column, const std::vector<float>& query_data, size_t k, size_t ef,
+                            bool exact) const
+{
+    if (!m_table->is_list(column) || m_table->get_column_type(column) != type_Float)
+        throw IllegalOperation("Semantic knn search can only be done on lists of floats");
+
+    auto new_order = m_descriptor_ordering;
+    new_order.append_knn(SemanticSearchDescriptor(column, query_data, k, ef, exact));
+    util::CheckedUniqueLock lock(m_mutex);
+    if (m_mode == Mode::Collection)
+        return Results(m_barq, m_collection, std::move(new_order));
+    return Results(m_barq, do_get_query(), std::move(new_order));
+}
+
 Results Results::distinct(DistinctDescriptor&& uniqueness) const
 {
     DescriptorOrdering new_order = m_descriptor_ordering;
@@ -1106,7 +1120,10 @@ bool Results::is_in_table_order() const NO_THREAD_SAFETY_ANALYSIS
         case Mode::Collection:
             return false;
         case Mode::Query:
-            return m_query.produces_results_in_table_order() && !m_descriptor_ordering.will_apply_sort();
+            // A knn descriptor orders by distance, so like a sort it takes the
+            // results out of table order (notifications must then compute moves).
+            return m_query.produces_results_in_table_order() && !m_descriptor_ordering.will_apply_sort() &&
+                   !m_descriptor_ordering.will_apply_knn();
         case Mode::TableView:
             return m_table_view.is_in_table_order();
     }

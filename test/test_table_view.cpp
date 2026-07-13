@@ -2408,4 +2408,153 @@ TEST(TableView_Filter)
     }
 }
 
+TEST(TableView_VectorSearch)
+{
+    Table table;
+    auto col_id = table.add_column(type_Int, "id");
+    auto col_lst = table.add_column_list(type_Float, "embeddings");
+
+    {
+        Obj o1 = table.create_object();
+        o1.set(col_id, 1);
+        Lst<float> lst = o1.get_list<float>(col_lst);
+        lst.add(0.003f);
+        lst.add(0.004f);
+        lst.add(0.005f);
+        lst.add(0.100f);
+        lst.add(0.010f);
+        // dist = 0.996921
+    }
+
+    {
+        Obj o1 = table.create_object();
+        o1.set(col_id, 2);
+        Lst<float> lst = o1.get_list<float>(col_lst);
+        lst.add(0.001f);
+        lst.add(0.004f);
+        lst.add(0.005f);
+        lst.add(0.100f);
+        lst.add(0.010f);
+        // dist = 0.996927
+    }
+
+    {
+        Obj o1 = table.create_object();
+        o1.set(col_id, 3);
+        Lst<float> lst = o1.get_list<float>(col_lst);
+        lst.add(0.001f);
+        lst.add(0.004f);
+        lst.add(0.005f);
+        lst.add(0.100f);
+        lst.add(0.010f);
+        // dist = 0.996927
+    }
+
+    {
+        Obj o1 = table.create_object();
+        o1.set(col_id, 4);
+        Lst<float> lst = o1.get_list<float>(col_lst);
+        lst.add(0.004f);
+        lst.add(0.005f);
+        lst.add(0.010f);
+        lst.add(0.025f);
+        lst.add(0.100f);
+        // dist = 0.989363
+    }
+
+    {
+        Obj o1 = table.create_object();
+        o1.set(col_id, 5);
+        Lst<float> lst = o1.get_list<float>(col_lst);
+        lst.add(0.003f);
+        lst.add(0.007f);
+        lst.add(0.008f);
+        lst.add(0.020f);
+        lst.add(0.100f);
+        // dist = 0.989476
+    }
+
+    // Test single knn query
+    table.add_vector_index(col_lst); // semantic search now requires a persisted index
+
+    TableView v = table.where().find_all();
+    v.knnsearch(col_lst, {0.003f, 0.005f, 0.010f, 0.020f, 0.100f}, 2);
+    CHECK_EQUAL(2, v.size());
+    CHECK_EQUAL(4, v[0].get<Int>(col_id));
+    CHECK_EQUAL(5, v[1].get<Int>(col_id));
+
+    // Test knn combined with regular query
+    TableView v2 = table.where().less(col_id, 5).find_all();
+    v2.knnsearch(col_lst, {0.003f, 0.005f, 0.010f, 0.020f, 0.100f}, 2);
+    CHECK_EQUAL(2, v2.size());
+    CHECK_EQUAL(4, v2[0].get<Int>(col_id));
+    CHECK_EQUAL(1, v2[1].get<Int>(col_id));
+
+    TableView v3 = table.where().find_all();
+    DescriptorOrdering ordering;
+    ordering.append_knn(SemanticSearchDescriptor(col_lst, {0.003f, 0.005f, 0.010f, 0.020f, 0.100f}, 2));
+    ordering.append_sort(SortDescriptor({{col_id}}, {false}));
+    v3.apply_descriptor_ordering(ordering);
+    CHECK_EQUAL(2, v3.size());
+    CHECK_EQUAL(5, v3[0].get<Int>(col_id));
+    CHECK_EQUAL(4, v3[1].get<Int>(col_id));
+}
+
+// Exercises the HNSW graph at a scale where it actually matters (2000 vectors),
+// unlike the tiny cases above where any search is trivially exact.
+TEST(TableView_VectorSearch_Index)
+{
+    Table table;
+    auto col_id = table.add_column(type_Int, "id");
+    auto col_vec = table.add_column_list(type_Float, "embedding");
+
+    // Deterministic constant-magnitude (+/-0.25) vectors. The first 11 components
+    // encode the id in binary, so every vector is unique (no collisions) and the
+    // query below has a single, unambiguous nearest neighbour.
+    const size_t D = 16;
+    auto make_vec = [D](int i) {
+        std::vector<float> v(D);
+        for (size_t j = 0; j < D; ++j) {
+            bool bit;
+            if (j < 11) {
+                bit = (i >> j) & 1;
+            }
+            else {
+                std::mt19937 g(uint32_t(i) * 2654435761u + uint32_t(j));
+                bit = g() & 1u;
+            }
+            v[j] = bit ? 0.25f : -0.25f;
+        }
+        return v;
+    };
+
+    const int N = 2000;
+    for (int i = 0; i < N; ++i) {
+        Obj o = table.create_object();
+        o.set(col_id, i);
+        Lst<float> lst = o.get_list<float>(col_vec);
+        for (float x : make_vec(i))
+            lst.add(x);
+    }
+
+    // Querying with an object's own embedding must return that object first: proof
+    // the graph search locates the exact neighbour among 2000, not by luck.
+    table.add_vector_index(col_vec); // semantic search now requires a persisted index
+
+    const int target = 1234;
+    TableView v = table.where().find_all();
+    v.knnsearch(col_vec, make_vec(target), 10);
+    CHECK_EQUAL(10, v.size());
+    CHECK_EQUAL(target, v[0].get<Int>(col_id));
+
+    // Composed with a regular query (id < target): the target is filtered out, so
+    // every neighbour returned must satisfy the predicate. Exercises the candidate
+    // filter path through the index at scale.
+    TableView v2 = table.where().less(col_id, target).find_all();
+    v2.knnsearch(col_vec, make_vec(target), 10);
+    CHECK_EQUAL(10, v2.size());
+    for (size_t i = 0; i < v2.size(); ++i)
+        CHECK(v2[i].get<Int>(col_id) < target);
+}
+
 #endif // TEST_TABLE_VIEW

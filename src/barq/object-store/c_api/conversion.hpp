@@ -8,6 +8,7 @@
 #include <barq/object-store/object_schema.hpp>
 #include <barq/object-store/shared_barq.hpp>
 
+#include <barq/index_vector.hpp>
 #include <barq/string_data.hpp>
 #include <barq/binary_data.hpp>
 #include <barq/timestamp.hpp>
@@ -28,6 +29,52 @@ static inline barq_string_t to_capi(StringData data)
 // Because this is often used as `return to_capi(...);` it is dangerous to pass a temporary string here. If you really
 // need to and know it is correct (eg passing to a C callback), you can explicitly create the StringData wrapper.
 barq_string_t to_capi(const std::string&& str) = delete; // temporary std::string would dangle.
+
+static inline VectorMetric from_capi(barq_vector_metric_e metric) noexcept
+{
+    return static_cast<VectorMetric>(metric);
+}
+
+static inline barq_vector_metric_e to_capi(VectorMetric metric) noexcept
+{
+    return static_cast<barq_vector_metric_e>(metric);
+}
+
+static inline VectorEncoding from_capi(barq_vector_encoding_e encoding) noexcept
+{
+    return static_cast<VectorEncoding>(encoding);
+}
+
+static inline barq_vector_encoding_e to_capi(VectorEncoding encoding) noexcept
+{
+    return static_cast<barq_vector_encoding_e>(encoding);
+}
+
+static inline VectorIndexConfig from_capi(const barq_vector_index_config_t& config) noexcept
+{
+    VectorIndexConfig out;
+    out.metric = from_capi(config.metric);
+    out.encoding = from_capi(config.encoding);
+    out.dimensions = config.dimensions;
+    out.m = config.m;
+    out.ef_construction = config.ef_construction;
+    out.ef_search = config.ef_search;
+    out.build_threads = config.build_threads;
+    return out;
+}
+
+static inline barq_vector_index_config_t to_capi(const VectorIndexConfig& config) noexcept
+{
+    barq_vector_index_config_t out{};
+    out.metric = to_capi(config.metric);
+    out.encoding = to_capi(config.encoding);
+    out.dimensions = config.dimensions;
+    out.m = config.m;
+    out.ef_construction = config.ef_construction;
+    out.ef_search = config.ef_search;
+    out.build_threads = config.build_threads;
+    return out;
+}
 
 static inline barq_string_t to_capi(const std::string& str)
 {

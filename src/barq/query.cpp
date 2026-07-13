@@ -1331,7 +1331,8 @@ ObjKey Query::find() const
     init();
 
     // ordering could change the way in which objects are returned, in this case we need to run find_all()
-    if (m_ordering && (m_ordering->will_apply_sort() || m_ordering->will_apply_distinct())) {
+    if (m_ordering &&
+        (m_ordering->will_apply_sort() || m_ordering->will_apply_distinct() || m_ordering->will_apply_knn())) {
         auto table_view = find_all();
         if (table_view.size() > 0) {
             // we just need to find the first.
@@ -1660,7 +1661,7 @@ size_t Query::count(const DescriptorOrdering& descriptor) const
 
     size_t limit = size_t(-1);
 
-    if (!descriptor.will_apply_distinct() && !descriptor.will_apply_filter()) {
+    if (!descriptor.will_apply_distinct() && !descriptor.will_apply_filter() && !descriptor.will_apply_knn()) {
         if (bool(min_limit)) {
             limit = *min_limit;
         }

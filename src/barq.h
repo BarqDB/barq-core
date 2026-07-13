@@ -322,6 +322,33 @@ typedef enum barq_property_flags {
     BARQ_PROPERTY_FULLTEXT_INDEXED = 8,
 } barq_property_flags_e;
 
+typedef enum barq_vector_metric {
+    // Values matching `barq::VectorMetric`.
+    BARQ_VECTOR_METRIC_INNER_PRODUCT = 0,
+    BARQ_VECTOR_METRIC_L2 = 1,
+    BARQ_VECTOR_METRIC_COSINE = 2,
+} barq_vector_metric_e;
+
+typedef enum barq_vector_encoding {
+    // Values matching `barq::VectorEncoding`.
+    BARQ_VECTOR_ENCODING_FLOAT32 = 0,
+    BARQ_VECTOR_ENCODING_SQ8 = 1,
+} barq_vector_encoding_e;
+
+// Mirrors `barq::VectorIndexConfig`. `dimensions` of 0 means "infer from the
+// first inserted vector"; `ef_search` of 0 means "use the index default".
+typedef struct barq_vector_index_config {
+    barq_vector_metric_e metric;
+    barq_vector_encoding_e encoding;
+    size_t dimensions;
+    size_t m;
+    size_t ef_construction;
+    size_t ef_search;
+    // Worker threads used for a full build/rebuild. 0 means one per core.
+    // This is a build-time setting and is not persisted with the index.
+    size_t build_threads;
+} barq_vector_index_config_t;
+
 
 /* Notification types */
 typedef struct barq_notification_token barq_notification_token_t;
@@ -1526,6 +1553,69 @@ BARQ_API barq_object_t* barq_object_find_with_primary_key(const barq_t*, barq_cl
  * @return A non-NULL pointer if no exception was thrown.
  */
 BARQ_API barq_results_t* barq_object_find_all(const barq_t*, barq_class_key_t);
+
+/**
+ * Add a vector (HNSW) index to a list-of-float column. Idempotent when an index
+ * with an identical config already exists; a config that differs only in
+ * ef_search updates the persisted ef_search in place (it is a query-time knob
+ * and never requires a rebuild); any other conflicting config throws. Requires
+ * m >= 2 and ef_construction >= 1. Pass a NULL @a config to use the engine
+ * defaults. Must run in a write transaction.
+ *
+ * @return True if no exception occurred.
+ */
+BARQ_API bool barq_add_vector_index(barq_t*, barq_class_key_t class_key, barq_property_key_t col_key,
+                                    const barq_vector_index_config_t* config);
+
+/**
+ * Remove the vector index from a column, if any. Must run in a write transaction.
+ *
+ * @return True if no exception occurred.
+ */
+BARQ_API bool barq_remove_vector_index(barq_t*, barq_class_key_t class_key, barq_property_key_t col_key);
+
+/**
+ * Rebuild a column's vector index from the current table data. Must run in a
+ * write transaction.
+ *
+ * @return True if no exception occurred.
+ */
+BARQ_API bool barq_rebuild_vector_index(barq_t*, barq_class_key_t class_key, barq_property_key_t col_key);
+
+/**
+ * Query whether a column has a vector index.
+ *
+ * @param out_has Set to true if the column has a vector index.
+ * @return True if no exception occurred.
+ */
+BARQ_API bool barq_has_vector_index(const barq_t*, barq_class_key_t class_key, barq_property_key_t col_key,
+                                    bool* out_has);
+
+/**
+ * Read the stored config of a column's vector index. Throws if the column has
+ * no vector index.
+ *
+ * @param out_config Populated with the stored index config.
+ * @return True if no exception occurred.
+ */
+BARQ_API bool barq_get_vector_index_config(const barq_t*, barq_class_key_t class_key, barq_property_key_t col_key,
+                                           barq_vector_index_config_t* out_config);
+
+/**
+ * Run a k-nearest-neighbour search over a vector-indexed column and return the
+ * results ordered closest-first.
+ *
+ * @param col_key A list-of-float column that has a vector index.
+ * @param query_data The query vector.
+ * @param query_size The number of floats in @a query_data.
+ * @param k The number of neighbours to return.
+ * @param ef Query-time beam width (0 = use the index config).
+ * @param exact If true, run an exact flat scan for the true neighbours (overrides @a ef).
+ * @return A non-NULL results pointer if no exception was thrown.
+ */
+BARQ_API barq_results_t* barq_results_knn_search(const barq_results_t*, barq_property_key_t col_key,
+                                                 const float* query_data, size_t query_size, size_t k, size_t ef,
+                                                 bool exact);
 
 /**
  * Create an object in a class without a primary key.

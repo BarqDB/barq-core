@@ -48,6 +48,13 @@ public:
         return m_transact_stage != DB::transact_Ready && db->is_attached();
     }
 
+    /// Forwarded to DB::request_opportunistic_compaction() — lets in-transaction
+    /// maintenance (e.g. a vector-index rebuild) flag the dead space it strands.
+    void request_opportunistic_compaction() noexcept
+    {
+        db->request_opportunistic_compaction();
+    }
+
     /// Get the approximate size of the data that would be written to the file if
     /// a commit were done at this point. The reported size will always be bigger
     /// than what will eventually be needed as we reserve a bit more memory than

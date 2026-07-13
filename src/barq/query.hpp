@@ -303,7 +303,7 @@ public:
     // True if matching rows are guaranteed to be returned in table order.
     bool produces_results_in_table_order() const
     {
-        return !m_view;
+        return !m_view && !m_source_collection;
     }
 
     // Get the ObjKey of the object which owns the restricting view, or null

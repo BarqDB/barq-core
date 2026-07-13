@@ -133,7 +133,7 @@ static_assert(!col_type_OldStringEnum.is_valid());
 static_assert(!col_type_OldTable.is_valid());
 static_assert(!col_type_OldDateTime.is_valid());
 
-enum class IndexType { None, General, Fulltext };
+enum class IndexType { None, General, Fulltext, Vector };
 
 inline std::ostream& operator<<(std::ostream& ostr, IndexType type)
 {
@@ -146,6 +146,9 @@ inline std::ostream& operator<<(std::ostream& ostr, IndexType type)
             break;
         case IndexType::Fulltext:
             ostr << "fulltext index";
+            break;
+        case IndexType::Vector:
+            ostr << "vector index";
             break;
     }
     return ostr;
@@ -181,6 +184,10 @@ enum ColumnAttr {
 
     /// Specifies that elements in the column are full-text indexed
     col_attr_FullText_Indexed = 256,
+
+    /// Specifies that the (list-of-float) elements in the column have a
+    /// persisted vector (HNSW) search index.
+    col_attr_Vector_Indexed = 512,
 
     /// Either list, dictionary, or set
     col_attr_Collection = 128 + 64 + 32

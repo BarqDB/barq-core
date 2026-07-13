@@ -34,6 +34,7 @@
 #include <catch2/catch_all.hpp>
 
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <thread>
 #include <fstream>
@@ -4514,6 +4515,216 @@ TEST_CASE("C API - properties", "[c_api]") {
     barq_close(barq);
     REQUIRE(barq_is_closed(barq));
     barq_release(barq);
+}
+
+TEST_CASE("C API - vector search", "[c_api][vector]")
+{
+    TestFile test_file;
+
+    const barq_class_info_t classes[1] = {{
+        "Document", "", 2, 0, BARQ_INVALID_CLASS_KEY, BARQ_CLASS_NORMAL,
+    }};
+    const barq_property_info_t properties[2] = {
+        {"id", "", BARQ_PROPERTY_TYPE_INT, BARQ_COLLECTION_TYPE_NONE, "", "", BARQ_INVALID_PROPERTY_KEY,
+         BARQ_PROPERTY_NORMAL},
+        {"embedding", "", BARQ_PROPERTY_TYPE_FLOAT, BARQ_COLLECTION_TYPE_LIST, "", "", BARQ_INVALID_PROPERTY_KEY,
+         BARQ_PROPERTY_NORMAL},
+    };
+    const barq_property_info_t* class_properties[1] = {properties};
+    auto schema = cptr_checked(barq_schema_new(classes, 1, class_properties));
+    auto config = cptr(barq_config_new());
+    barq_config_set_path(config.get(), test_file.path.c_str());
+    barq_config_set_schema_mode(config.get(), BARQ_SCHEMA_MODE_AUTOMATIC);
+    barq_config_set_schema(config.get(), schema.get());
+    barq_config_set_schema_version(config.get(), 0);
+    auto barq = cptr_checked(barq_open(config.get()));
+
+    bool found = false;
+    barq_class_info_t document_class;
+    REQUIRE(checked(barq_find_class(barq.get(), "Document", &found, &document_class)));
+    REQUIRE(found);
+    barq_property_info_t id_property, embedding_property;
+    REQUIRE(checked(barq_find_property(barq.get(), document_class.key, "id", &found, &id_property)));
+    REQUIRE(found);
+    REQUIRE(checked(
+        barq_find_property(barq.get(), document_class.key, "embedding", &found, &embedding_property)));
+    REQUIRE(found);
+
+    auto add_document = [&](int64_t id, std::initializer_list<float> embedding) {
+        auto object = cptr_checked(barq_object_create(barq.get(), document_class.key));
+        REQUIRE(checked(barq_set_value(object.get(), id_property.key, barq_int_val(id), false)));
+        auto list = cptr_checked(barq_get_list(object.get(), embedding_property.key));
+        size_t index = 0;
+        for (float value : embedding) {
+            REQUIRE(checked(barq_list_insert(list.get(), index++, barq_float_val(value))));
+        }
+    };
+
+    REQUIRE(checked(barq_begin_write(barq.get())));
+    add_document(1, {0.0f, 0.0f});
+    add_document(2, {1.0f, 0.0f});
+    add_document(3, {0.0f, 1.0f});
+    add_document(4, {10.0f, 10.0f});
+
+    const barq_vector_index_config_t index_config = {
+        BARQ_VECTOR_METRIC_L2,
+        BARQ_VECTOR_ENCODING_SQ8,
+        2,
+        8,
+        32,
+        16,
+        1,
+    };
+    REQUIRE(checked(barq_add_vector_index(barq.get(), document_class.key, embedding_property.key, &index_config)));
+    REQUIRE(checked(barq_commit(barq.get())));
+
+    bool has_index = false;
+    REQUIRE(checked(barq_has_vector_index(barq.get(), document_class.key, embedding_property.key, &has_index)));
+    CHECK(has_index);
+
+    barq_vector_index_config_t stored_config{};
+    REQUIRE(checked(
+        barq_get_vector_index_config(barq.get(), document_class.key, embedding_property.key, &stored_config)));
+    CHECK(stored_config.metric == index_config.metric);
+    CHECK(stored_config.encoding == index_config.encoding);
+    CHECK(stored_config.dimensions == index_config.dimensions);
+    CHECK(stored_config.m == index_config.m);
+    CHECK(stored_config.ef_construction == index_config.ef_construction);
+    CHECK(stored_config.ef_search == index_config.ef_search);
+    CHECK(stored_config.build_threads == index_config.build_threads);
+
+    auto result_id = [&](barq_results_t* results, size_t index) {
+        auto object = cptr_checked(barq_results_get_object(results, index));
+        barq_value_t value;
+        REQUIRE(checked(barq_get_value(object.get(), id_property.key, &value)));
+        REQUIRE(value.type == BARQ_TYPE_INT);
+        return value.integer;
+    };
+    const float query[2] = {0.9f, 0.1f};
+    auto all = cptr_checked(barq_object_find_all(barq.get(), document_class.key));
+
+    SECTION("approximate and exact search")
+    {
+        auto approximate =
+            cptr_checked(barq_results_knn_search(all.get(), embedding_property.key, query, 2, 2, 16, false));
+        size_t count = 0;
+        REQUIRE(checked(barq_results_count(approximate.get(), &count)));
+        REQUIRE(count == 2);
+        CHECK(result_id(approximate.get(), 0) == 2);
+        CHECK(result_id(approximate.get(), 1) == 1);
+
+        auto exact = cptr_checked(barq_results_knn_search(all.get(), embedding_property.key, query, 2, 2, 0, true));
+        REQUIRE(checked(barq_results_count(exact.get(), &count)));
+        REQUIRE(count == 2);
+        CHECK(result_id(exact.get(), 0) == 2);
+        CHECK(result_id(exact.get(), 1) == 1);
+    }
+
+    SECTION("filtered search")
+    {
+        auto filter = cptr_checked(barq_query_parse(barq.get(), document_class.key, "id >= 3", 0, nullptr));
+        auto filtered = cptr_checked(barq_results_filter(all.get(), filter.get()));
+        auto nearest =
+            cptr_checked(barq_results_knn_search(filtered.get(), embedding_property.key, query, 2, 2, 0, true));
+        size_t count = 0;
+        REQUIRE(checked(barq_results_count(nearest.get(), &count)));
+        REQUIRE(count == 2);
+        CHECK(result_id(nearest.get(), 0) == 3);
+        CHECK(result_id(nearest.get(), 1) == 4);
+    }
+
+    SECTION("rebuild and remove")
+    {
+        REQUIRE(checked(barq_begin_write(barq.get())));
+        REQUIRE(checked(barq_rebuild_vector_index(barq.get(), document_class.key, embedding_property.key)));
+        REQUIRE(checked(barq_commit(barq.get())));
+
+        REQUIRE(checked(barq_begin_write(barq.get())));
+        REQUIRE(checked(barq_remove_vector_index(barq.get(), document_class.key, embedding_property.key)));
+        REQUIRE(checked(barq_commit(barq.get())));
+        REQUIRE(checked(
+            barq_has_vector_index(barq.get(), document_class.key, embedding_property.key, &has_index)));
+        CHECK_FALSE(has_index);
+        CHECK_FALSE(barq_get_vector_index_config(barq.get(), document_class.key, embedding_property.key,
+                                                 &stored_config));
+        CHECK_ERR(BARQ_ERR_INDEX_OUT_OF_BOUNDS);
+    }
+
+    SECTION("invalid dimensions, values, properties, and conflicting configs")
+    {
+        const float wrong_dimension[1] = {1.0f};
+        CHECK_FALSE(
+            barq_results_knn_search(all.get(), embedding_property.key, wrong_dimension, 1, 1, 0, false));
+        CHECK_ERR(BARQ_ERR_ILLEGAL_OPERATION);
+
+        const float non_finite[2] = {std::numeric_limits<float>::quiet_NaN(), 0.0f};
+        CHECK_FALSE(barq_results_knn_search(all.get(), embedding_property.key, non_finite, 2, 1, 0, false));
+        CHECK_ERR(BARQ_ERR_INVALID_ARGUMENT);
+
+        CHECK_FALSE(barq_results_knn_search(all.get(), embedding_property.key, nullptr, 2, 1, 0, false));
+        CHECK_ERR(BARQ_ERR_INVALID_ARGUMENT);
+
+        auto invalid_config = index_config;
+        invalid_config.m = 0;
+        REQUIRE(checked(barq_begin_write(barq.get())));
+        CHECK_FALSE(barq_add_vector_index(barq.get(), document_class.key, embedding_property.key,
+                                          &invalid_config));
+        CHECK_ERR(BARQ_ERR_INVALID_ARGUMENT);
+        REQUIRE(checked(barq_rollback(barq.get())));
+
+        // m == 1 would divide by log(1) == 0 in the level assignment.
+        invalid_config = index_config;
+        invalid_config.m = 1;
+        REQUIRE(checked(barq_begin_write(barq.get())));
+        CHECK_FALSE(barq_add_vector_index(barq.get(), document_class.key, embedding_property.key,
+                                          &invalid_config));
+        CHECK_ERR(BARQ_ERR_INVALID_ARGUMENT);
+        REQUIRE(checked(barq_rollback(barq.get())));
+
+        invalid_config = index_config;
+        invalid_config.metric = static_cast<barq_vector_metric_e>(99);
+        REQUIRE(checked(barq_begin_write(barq.get())));
+        CHECK_FALSE(barq_add_vector_index(barq.get(), document_class.key, embedding_property.key,
+                                          &invalid_config));
+        CHECK_ERR(BARQ_ERR_INVALID_ARGUMENT);
+        REQUIRE(checked(barq_rollback(barq.get())));
+
+        REQUIRE(checked(barq_begin_write(barq.get())));
+        CHECK_FALSE(barq_add_vector_index(barq.get(), document_class.key, id_property.key, &index_config));
+        CHECK(barq_get_last_error(nullptr));
+        barq_clear_last_error();
+        REQUIRE(checked(barq_rollback(barq.get())));
+
+        auto conflicting_config = index_config;
+        conflicting_config.metric = BARQ_VECTOR_METRIC_COSINE;
+        REQUIRE(checked(barq_begin_write(barq.get())));
+        CHECK_FALSE(barq_add_vector_index(barq.get(), document_class.key, embedding_property.key,
+                                          &conflicting_config));
+        CHECK(barq_get_last_error(nullptr));
+        barq_clear_last_error();
+        REQUIRE(checked(barq_rollback(barq.get())));
+    }
+
+    SECTION("ef_search-only change updates the persisted config in place")
+    {
+        auto retuned = index_config;
+        retuned.ef_search = 64;
+        REQUIRE(checked(barq_begin_write(barq.get())));
+        REQUIRE(checked(
+            barq_add_vector_index(barq.get(), document_class.key, embedding_property.key, &retuned)));
+        REQUIRE(checked(barq_commit(barq.get())));
+
+        barq_vector_index_config_t updated{};
+        REQUIRE(checked(
+            barq_get_vector_index_config(barq.get(), document_class.key, embedding_property.key, &updated)));
+        CHECK(updated.ef_search == 64);
+        // The graph-shaping settings are untouched.
+        CHECK(updated.metric == index_config.metric);
+        CHECK(updated.encoding == index_config.encoding);
+        CHECK(updated.dimensions == index_config.dimensions);
+        CHECK(updated.m == index_config.m);
+        CHECK(updated.ef_construction == index_config.ef_construction);
+    }
 }
 
 TEST_CASE("C API - queries", "[c_api]") {

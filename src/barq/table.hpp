@@ -56,6 +56,8 @@ struct GlobalKey;
 class Group;
 class LinkChain;
 class SearchIndex;
+class VectorIndex;
+struct VectorIndexConfig;
 class SortDescriptor;
 class StringIndex;
 class Subexpr;
@@ -247,6 +249,21 @@ public:
         add_search_index(col_key, IndexType::Fulltext);
     }
     void remove_search_index(ColKey col_key);
+
+    /// Vector (HNSW) search index over a list-of-floats column. Persisted in the
+    /// database file and purely local (never written to sync changesets).
+    void add_vector_index(ColKey col_key, const VectorIndexConfig& config);
+    void add_vector_index(ColKey col_key);
+    void remove_vector_index(ColKey col_key);
+    /// Re-index from the current data. Use after editing vector values in place —
+    /// incremental maintenance tracks objects by key, not content.
+    void rebuild_vector_index(ColKey col_key);
+    bool has_vector_index(ColKey col_key) const noexcept;
+    VectorIndex* get_vector_index(ColKey col_key) const noexcept;
+    /// Called from the list-of-floats write path: records that `key`'s vector was
+    /// edited in place so the index re-ranks it (const: only index bookkeeping is
+    /// touched). No-op when the column has no vector index.
+    void vector_index_touch(ColKey col_key, ObjKey key) const;
 
     void enumerate_string_column(ColKey col_key);
     bool is_enumerated(ColKey col_key) const noexcept;
@@ -732,6 +749,11 @@ private:
     Array m_opposite_table;                    // 7th slot in m_top
     Array m_opposite_column;                   // 8th slot in m_top
     std::vector<std::unique_ptr<SearchIndex>> m_index_accessors;
+    // Vector indexes reuse the per-column search-index ref slot (m_index_refs); a column
+    // is either general/fulltext (StringIndex) or vector (VectorIndex), never both.
+    std::vector<std::unique_ptr<VectorIndex>> m_vector_index_accessors;
+    // Fast gate for the per-object insert/erase vector-index notifications.
+    bool m_has_any_vector_index = false;
     ColKey m_primary_key_col;
     Replication* const* m_repl;
     static Replication* g_dummy_replication;
@@ -746,6 +768,7 @@ private:
     void erase_from_search_indexes(ObjKey key);
     void update_indexes(ObjKey key, const FieldValues& values);
     void clear_indexes();
+    void hint_compaction_after_index_rebuild() const noexcept;
     template <typename T>
     void do_populate_index(StringIndex* index, ColKey::Idx col_ndx);
 
@@ -782,6 +805,7 @@ private:
     ColKey do_insert_root_column(ColKey col_key, ColumnType, StringData name, DataType key_type = DataType(0));
     void do_erase_root_column(ColKey col_key);
     void do_add_search_index(ColKey col_key, IndexType type);
+    void do_add_vector_index(ColKey col_key, const VectorIndexConfig& config);
 
     bool has_any_embedded_objects();
     void set_opposite_column(ColKey col_key, TableKey opposite_table, ColKey opposite_column);
@@ -842,6 +866,7 @@ private:
     /// table.
     void refresh_accessor_tree();
     void refresh_index_accessors();
+    void refresh_vector_index_accessors();
     void refresh_content_version();
     void flush_for_commit();
 

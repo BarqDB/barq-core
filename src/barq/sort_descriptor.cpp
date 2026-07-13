@@ -18,11 +18,18 @@
 
 #include <barq/sort_descriptor.hpp>
 #include <barq/table.hpp>
+#include <barq/index_vector.hpp>
 #include <barq/table_view.hpp>
 #include <barq/db.hpp>
 #include <barq/util/assert.hpp>
 #include <barq/list.hpp>
 #include <barq/dictionary.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <unordered_set>
 
 using namespace barq;
 
@@ -380,6 +387,7 @@ void FilterDescriptor::execute(const Table& table, KeyValues& key_values, const 
 {
     KeyValues filtered;
     filtered.create();
+    filtered.set_unique_direct_table_results(key_values.has_unique_direct_table_results());
     auto sz = key_values.size();
     for (size_t i = 0; i < sz; i++) {
         auto key = key_values.get(i);
@@ -536,6 +544,13 @@ void DescriptorOrdering::append_filter(FilterDescriptor filter)
     }
 }
 
+void DescriptorOrdering::append_knn(SemanticSearchDescriptor knn)
+{
+    if (knn.is_valid()) {
+        m_descriptors.emplace_back(new SemanticSearchDescriptor(std::move(knn)));
+    }
+}
+
 void DescriptorOrdering::append(const DescriptorOrdering& other)
 {
     for (const auto& d : other.m_descriptors) {
@@ -592,6 +607,14 @@ bool DescriptorOrdering::will_apply_filter() const
     return std::any_of(m_descriptors.begin(), m_descriptors.end(), [](const std::unique_ptr<BaseDescriptor>& desc) {
         BARQ_ASSERT(desc->is_valid());
         return desc->get_type() == DescriptorType::Filter;
+    });
+}
+
+bool DescriptorOrdering::will_apply_knn() const
+{
+    return std::any_of(m_descriptors.begin(), m_descriptors.end(), [](const std::unique_ptr<BaseDescriptor>& desc) {
+        BARQ_ASSERT(desc->is_valid());
+        return desc->get_type() == DescriptorType::Knn;
     });
 }
 
@@ -662,4 +685,61 @@ void DescriptorOrdering::get_versions(const Group* group, TableVersions& version
         BARQ_ASSERT_DEBUG(group);
         versions.emplace_back(table_key, group->get_table(table_key)->get_content_version());
     }
+}
+
+
+std::string SemanticSearchDescriptor::get_description(ConstTableRef) const
+{
+    return "KNN()";
+}
+
+void SemanticSearchDescriptor::execute(const Table& table, KeyValues& key_values, const BaseDescriptor*) const
+{
+    const size_t dim = m_query_data.size();
+    const size_t candidate_rows = key_values.size();
+    if (dim == 0 || candidate_rows == 0) {
+        key_values.clear();
+        return;
+    }
+    if (!std::all_of(m_query_data.begin(), m_query_data.end(), [](float value) {
+            return std::isfinite(value);
+        })) {
+        throw InvalidArgument("Query vector must contain only finite values");
+    }
+
+    // If a persisted vector index exists on this column, use it — it survives reopen
+    // without a rebuild and is maintained through the table.
+    if (VectorIndex* vindex = table.get_vector_index(m_column)) {
+        std::vector<ObjKey> ordered;
+        // Exact mode asks the index for a beam that covers the whole candidate
+        // universe, which it answers with a flat scan over live table data.
+        const size_t ef = m_exact ? std::numeric_limits<size_t>::max() : m_ef;
+        if (key_values.has_unique_direct_table_results() && candidate_rows == table.size()) {
+            // The view covers the whole table: skip building a candidate set (it
+            // costs O(view) per query); the index validates results instead.
+            ordered = vindex->search(table, m_query_data, m_k, nullptr, ef);
+        }
+        else {
+            std::vector<uint64_t> keys;
+            keys.reserve(candidate_rows);
+            for (size_t i = 0; i < candidate_rows; ++i) {
+                ObjKey key = key_values.get(i);
+                if (key != null_key && table.is_valid(key))
+                    keys.push_back(uint64_t(key.value));
+            }
+            VectorCandidates cand(std::move(keys)); // a bitmap for dense key ranges
+            ordered = vindex->search(table, m_query_data, m_k, &cand, ef);
+        }
+        key_values.clear();
+        for (ObjKey key : ordered)
+            key_values.add(key);
+        return;
+    }
+
+    // No persisted vector index on this column. Refuse rather than silently
+    // building a throwaway in-memory graph: that ignored the model's configured
+    // metric (wrong for cosine/L2 data), was never persisted, and was rebuilt on
+    // every reopen. Semantic search requires an index on the column.
+    throw IllegalOperation(
+        "Semantic search requires a vector index on this property (create one with add_vector_index)");
 }

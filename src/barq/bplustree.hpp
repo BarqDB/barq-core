@@ -262,6 +262,12 @@ protected:
     virtual BPlusTreeLeaf* cache_leaf(MemRef mem) = 0;
     virtual void replace_root(std::unique_ptr<BPlusTreeNode> new_root);
     std::unique_ptr<BPlusTreeNode> create_root_from_ref(ref_type ref);
+
+    // Adopt `leaf_refs` as the entire content of this (empty) tree: build the
+    // compact inner levels bottom-up and install the root. Every leaf must be
+    // full (BARQ_MAX_BPNODE_SIZE) except possibly the last; `total_size` is the
+    // overall element count. `leaf_refs` is consumed (used as level scratch).
+    void bulk_adopt_leaves(std::vector<ref_type>& leaf_refs, size_t total_size);
 };
 
 template <>
@@ -405,6 +411,103 @@ public:
         m_root->bptree_traverse(func);
 
         return all_values;
+    }
+
+    // Append `count` values pulled chunk-wise from `fill(offset, n, out)`. An
+    // empty tree is assembled bottom-up — whole leaves, then the inner levels in
+    // one pass — costing orders of magnitude fewer tree descents than add() per
+    // element; a non-empty tree falls back to plain appends.
+    template <typename Filler>
+    void add_from(size_t count, Filler&& fill)
+    {
+        if (count == 0)
+            return;
+        std::vector<T> buf(std::min(count, size_t(BARQ_MAX_BPNODE_SIZE)));
+        // Keep a single leaf in the tree's existing root. A one-leaf bulk
+        // replacement gives no speedup and needlessly churns the root while
+        // rebuilding several small trees back-to-back.
+        if (m_size != 0 || count <= BARQ_MAX_BPNODE_SIZE) {
+            for (size_t offset = 0; offset < count;) {
+                size_t n = std::min(count - offset, size_t(BARQ_MAX_BPNODE_SIZE));
+                fill(offset, n, buf.data());
+                for (size_t j = 0; j < n; ++j)
+                    add(buf[j]);
+                offset += n;
+            }
+            return;
+        }
+        std::vector<ref_type> leaves;
+        leaves.reserve((count + BARQ_MAX_BPNODE_SIZE - 1) / BARQ_MAX_BPNODE_SIZE);
+        for (size_t offset = 0; offset < count;) {
+            size_t n = std::min(count - offset, size_t(BARQ_MAX_BPNODE_SIZE));
+            fill(offset, n, buf.data());
+            LeafNode leaf(this);
+            leaf.create();
+            for (size_t j = 0; j < n; ++j)
+                leaf.LeafArray::add(buf[j]);
+            leaves.push_back(leaf.get_ref());
+            offset += n;
+        }
+        bulk_adopt_leaves(leaves, count);
+    }
+
+    // Append values [0, count) — the write-side twin of get_range.
+    void add_range(const T* values, size_t count)
+    {
+        add_from(count, [values](size_t offset, size_t n, T* out) {
+            std::copy(values + offset, values + offset + n, out);
+        });
+    }
+
+    // Copy values [n, n + count) into out as signed 8-bit values — a straight
+    // byte copy per leaf while the leaf stores width-8 data (the caller
+    // guarantees every value fits int8; narrower leaves fall back to
+    // per-element reads). Integer trees only.
+    void get_range_i8(size_t n, size_t count, int8_t* out) const
+    {
+        static_assert(std::is_same_v<T, int64_t>, "byte reads are for integer trees");
+        BARQ_ASSERT_DEBUG(n + count <= size());
+        while (count > 0) {
+            size_t copied = 0;
+            auto func = [&](BPlusTreeNode* node, size_t ndx) {
+                LeafNode* leaf = static_cast<LeafNode*>(node);
+                size_t avail = leaf->size() - ndx;
+                copied = std::min(count, avail);
+                if (leaf->get_width() == 8) {
+                    const int8_t* src = reinterpret_cast<const int8_t*>(leaf->m_data) + ndx;
+                    std::copy(src, src + copied, out);
+                }
+                else {
+                    for (size_t i = 0; i < copied; i++)
+                        out[i] = int8_t(leaf->get(ndx + i));
+                }
+            };
+            m_root->bptree_access(n, func);
+            n += copied;
+            out += copied;
+            count -= copied;
+        }
+    }
+
+    // Copy values [n, n + count) into out — one tree descent per touched leaf
+    // instead of one per element.
+    void get_range(size_t n, size_t count, T* out) const
+    {
+        BARQ_ASSERT_DEBUG(n + count <= size());
+        while (count > 0) {
+            size_t copied = 0;
+            auto func = [&](BPlusTreeNode* node, size_t ndx) {
+                LeafNode* leaf = static_cast<LeafNode*>(node);
+                size_t avail = leaf->size() - ndx;
+                copied = std::min(count, avail);
+                for (size_t i = 0; i < copied; i++)
+                    out[i] = leaf->get(ndx + i);
+            };
+            m_root->bptree_access(n, func);
+            n += copied;
+            out += copied;
+            count -= copied;
+        }
     }
 
     void set(size_t n, T value)

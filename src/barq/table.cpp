@@ -30,9 +30,11 @@
 #include <barq/exceptions.hpp>
 #include <barq/impl/destroy_guard.hpp>
 #include <barq/index_string.hpp>
+#include <barq/index_vector.hpp>
 #include <barq/query_conditions_tpl.hpp>
 #include <barq/replication.hpp>
 #include <barq/table_view.hpp>
+#include <barq/transaction.hpp>
 #include <barq/util/features.h>
 #include <barq/util/serializer.hpp>
 
@@ -773,6 +775,12 @@ void Table::erase_from_search_indexes(ObjKey key)
                 index->erase(key);
             }
         }
+        if (m_has_any_vector_index) {
+            for (auto&& index : m_vector_index_accessors) {
+                if (index)
+                    index->object_erased(key);
+            }
+        }
     }
 }
 
@@ -781,6 +789,13 @@ void Table::update_indexes(ObjKey key, const FieldValues& values)
     // Tombstones do not use index - will crash if we try to insert values
     if (key.is_unresolved()) {
         return;
+    }
+
+    if (m_has_any_vector_index) {
+        for (auto&& index : m_vector_index_accessors) {
+            if (index)
+                index->object_inserted(key);
+        }
     }
 
     auto sz = m_index_accessors.size();
@@ -869,6 +884,12 @@ void Table::clear_indexes()
             index->clear();
         }
     }
+    if (m_has_any_vector_index) {
+        for (auto&& index : m_vector_index_accessors) {
+            if (index)
+                index->table_cleared();
+        }
+    }
 }
 
 void Table::do_add_search_index(ColKey col_key, IndexType type)
@@ -916,6 +937,8 @@ void Table::add_search_index(ColKey col_key, IndexType type)
         throw InvalidColumnKey("primary key cannot have a full text index");
 
     switch (type) {
+        case IndexType::Vector:
+            throw IllegalOperation("Use add_vector_index() to create a vector index");
         case IndexType::None:
             remove_search_index(col_key);
             return;
@@ -1071,6 +1094,9 @@ void Table::do_erase_root_column(ColKey col_key)
         m_index_refs.set(col_ndx, 0);
         m_index_accessors[col_ndx].reset();
     }
+    // The vector index (if any) shares m_index_refs[col_ndx], destroyed just above.
+    if (col_ndx < m_vector_index_accessors.size())
+        m_vector_index_accessors[col_ndx].reset();
     m_opposite_table.set(col_ndx, TableKey().value);
     m_opposite_column.set(col_ndx, ColKey().value);
     m_index_accessors[col_ndx] = nullptr;
@@ -1085,6 +1111,9 @@ void Table::do_erase_root_column(ColKey col_key)
     while (m_index_accessors.size() > m_leaf_ndx2colkey.size()) {
         BARQ_ASSERT(m_index_accessors.back() == nullptr);
         m_index_accessors.pop_back();
+    }
+    while (m_vector_index_accessors.size() > m_leaf_ndx2colkey.size()) {
+        m_vector_index_accessors.pop_back();
     }
     bump_content_version();
     bump_storage_version();
@@ -1961,6 +1990,14 @@ void Table::update_from_parent() noexcept
                 index->update_from_parent();
             }
         }
+        // Vector index accessors cache refs into the previous transaction's
+        // slab just like StringIndexes do; skipping them here would make the
+        // next notify/maintenance write go through freed memory.
+        for (auto&& index : m_vector_index_accessors) {
+            if (index) {
+                index->update_from_parent();
+            }
+        }
 
         m_opposite_table.init_from_parent();
         m_opposite_column.init_from_parent();
@@ -2155,24 +2192,217 @@ void Table::refresh_index_accessors()
         ref_type ref = m_index_refs.get_as_ref(col_ndx);
 
         if (ref == 0) {
-            // accessor drop
+            // accessor drop (read no spec attr for unindexed columns — some have no attr slot)
             m_index_accessors[col_ndx].reset();
+            continue;
         }
-        else {
-            auto attr = m_spec.get_column_attr(m_leaf_ndx2spec_ndx[col_ndx]);
-            bool fulltext = attr.test(col_attr_FullText_Indexed);
-            auto col_key = m_leaf_ndx2colkey[col_ndx];
-            ClusterColumn virtual_col(&m_clusters, col_key, fulltext ? IndexType::Fulltext : IndexType::General);
+        auto attr = m_spec.get_column_attr(m_leaf_ndx2spec_ndx[col_ndx]);
+        if (attr.test(col_attr_Vector_Indexed)) {
+            // m_index_refs[col_ndx] holds a vector index blob, not a StringIndex tree;
+            // it is (re)built by refresh_vector_index_accessors below.
+            m_index_accessors[col_ndx].reset();
+            continue;
+        }
+        bool fulltext = attr.test(col_attr_FullText_Indexed);
+        auto col_key = m_leaf_ndx2colkey[col_ndx];
+        ClusterColumn virtual_col(&m_clusters, col_key, fulltext ? IndexType::Fulltext : IndexType::General);
 
-            if (m_index_accessors[col_ndx]) { // still there, refresh:
-                m_index_accessors[col_ndx]->refresh_accessor_tree(virtual_col);
-            }
-            else { // new index!
-                m_index_accessors[col_ndx] =
-                    std::make_unique<StringIndex>(ref, &m_index_refs, col_ndx, virtual_col, get_alloc());
-            }
+        if (m_index_accessors[col_ndx]) { // still there, refresh:
+            m_index_accessors[col_ndx]->refresh_accessor_tree(virtual_col);
+        }
+        else { // new index!
+            m_index_accessors[col_ndx] =
+                std::make_unique<StringIndex>(ref, &m_index_refs, col_ndx, virtual_col, get_alloc());
         }
     }
+
+    refresh_vector_index_accessors();
+}
+
+void Table::refresh_vector_index_accessors()
+{
+    size_t col_ndx_end = m_leaf_ndx2colkey.size();
+    m_vector_index_accessors.resize(col_ndx_end);
+    m_has_any_vector_index = false;
+    for (size_t col_ndx = 0; col_ndx < col_ndx_end; ++col_ndx) {
+        ref_type ref = (col_ndx < m_index_refs.size()) ? m_index_refs.get_as_ref(col_ndx) : 0;
+        // Only indexed columns (ref != 0) have a meaningful spec attribute; reading the
+        // attr for unindexed/backlink columns would index past the spec's attr array.
+        if (ref == 0 || !m_spec.get_column_attr(m_leaf_ndx2spec_ndx[col_ndx]).test(col_attr_Vector_Indexed)) {
+            m_vector_index_accessors[col_ndx].reset();
+        }
+        else if (m_vector_index_accessors[col_ndx]) {
+            m_vector_index_accessors[col_ndx]->refresh_accessor_tree();
+            m_has_any_vector_index = true;
+        }
+        else {
+            m_vector_index_accessors[col_ndx] =
+                std::make_unique<VectorIndex>(ref, &m_index_refs, col_ndx, m_leaf_ndx2colkey[col_ndx], get_alloc());
+            m_has_any_vector_index = true;
+        }
+    }
+}
+
+void Table::do_add_vector_index(ColKey col_key, const VectorIndexConfig& config)
+{
+    size_t column_ndx = col_key.get_index().val;
+    if (m_vector_index_accessors.size() <= column_ndx)
+        m_vector_index_accessors.resize(column_ndx + 1);
+    if (m_vector_index_accessors[column_ndx])
+        return; // already indexed
+
+    // Reuse the per-column search-index ref slot (m_index_refs) — no top-array growth.
+    // A list-of-float column never carries a StringIndex, so the slot is free.
+    auto index = std::make_unique<VectorIndex>(col_key, get_alloc(), config);
+    index->set_parent(&m_index_refs, column_ndx);
+    m_index_refs.set(column_ndx, index->get_ref());
+    index->rebuild(*this); // build the graph from the current data and persist it
+    m_index_refs.set(column_ndx, index->get_ref());
+    m_vector_index_accessors[column_ndx] = std::move(index);
+    m_has_any_vector_index = true;
+    hint_compaction_after_index_rebuild();
+}
+
+// A full (re)build rewrites the whole graph, leaving the previous copy as dead
+// space in the file (copy-on-write). The space gets reused by later writes, but
+// ask the DB to also hand it back to the OS at the next quiet moment (right
+// after this transaction commits, in the common case).
+void Table::hint_compaction_after_index_rebuild() const noexcept
+{
+    if (auto tr = dynamic_cast<Transaction*>(get_parent_group()))
+        tr->request_opportunistic_compaction();
+}
+
+// Two vector index configs can share the same persisted graph when the settings
+// that shape it match. ef_search is a query-time beam floor (it may differ without
+// a rebuild) and build_threads is not persisted, so both are excluded.
+static bool vector_config_compatible(const VectorIndexConfig& a, const VectorIndexConfig& b)
+{
+    return a.metric == b.metric && a.encoding == b.encoding && a.dimensions == b.dimensions && a.m == b.m &&
+           a.ef_construction == b.ef_construction;
+}
+
+// Reject a config the graph math can't support before anything is persisted.
+// This is the enforcement point every caller shares — the C API, the bindgen
+// SDKs and direct C++ users all funnel through Table::add_vector_index.
+static void validate_vector_config(const VectorIndexConfig& config)
+{
+    if (config.metric != VectorMetric::InnerProduct && config.metric != VectorMetric::L2 &&
+        config.metric != VectorMetric::Cosine)
+        throw InvalidArgument("Invalid vector metric");
+    if (config.encoding != VectorEncoding::Float32 && config.encoding != VectorEncoding::SQ8)
+        throw InvalidArgument("Invalid vector encoding");
+    // m == 1 would divide by log(1) == 0 in the HNSW level assignment.
+    if (config.m < 2)
+        throw InvalidArgument("Vector index m must be at least 2");
+    if (config.ef_construction == 0)
+        throw InvalidArgument("Vector index ef_construction must be greater than zero");
+}
+
+void Table::add_vector_index(ColKey col_key, const VectorIndexConfig& config)
+{
+    check_column(col_key);
+    validate_vector_config(config);
+    if (!(col_key.is_list() && col_key.get_type() == col_type_Float)) {
+        throw IllegalOperation(
+            util::format("Vector index requires a list-of-float property: %1", get_column_name(col_key)));
+    }
+
+    auto spec_ndx = leaf_ndx2spec_ndx(col_key.get_index());
+    auto attr = m_spec.get_column_attr(spec_ndx);
+    if (attr.test(col_attr_Vector_Indexed)) {
+        // Already indexed: an identical request is an idempotent no-op, but a
+        // different graph shape is rejected rather than silently ignored, so the
+        // wrong index can't be left in place. The caller reconciles by removing it.
+        if (VectorIndex* existing = get_vector_index(col_key)) {
+            if (!vector_config_compatible(existing->config(), config))
+                throw IllegalOperation(
+                    util::format("A vector index already exists on '%1' with a different configuration; "
+                                 "remove it before re-creating with new settings",
+                                 get_column_name(col_key)));
+            // Same graph shape: adopt a changed query-time beam in place —
+            // ef_search never requires a rebuild (write transactions only).
+            if (existing->config().ef_search != config.ef_search)
+                existing->set_ef_search(config.ef_search);
+        }
+        return;
+    }
+
+    do_add_vector_index(col_key, config);
+
+    attr.set(col_attr_Vector_Indexed);
+    m_spec.set_column_attr(spec_ndx, attr); // Throws
+}
+
+void Table::add_vector_index(ColKey col_key)
+{
+    add_vector_index(col_key, VectorIndexConfig{});
+}
+
+void Table::remove_vector_index(ColKey col_key)
+{
+    check_column(col_key);
+    auto column_ndx = col_key.get_index();
+
+    // Early-out if non-indexed
+    if (column_ndx.val >= m_vector_index_accessors.size() || !m_vector_index_accessors[column_ndx.val])
+        return;
+
+    // Re-attach the accessor from the parent slot before touching anything:
+    // destroy_deep() through a ref cached from an earlier transaction would
+    // free stale (or since-reused) blocks.
+    auto& index = m_vector_index_accessors[column_ndx.val];
+    index->update_from_parent();
+    // Detach the graph from its parent next. This also makes the parent path
+    // writable before destroy_deep() starts returning the graph's blocks.
+    m_index_refs.set(column_ndx.val, 0);
+    index->destroy();
+    index.reset();
+    m_has_any_vector_index =
+        std::any_of(m_vector_index_accessors.begin(), m_vector_index_accessors.end(), [](auto& ptr) {
+            return bool(ptr);
+        });
+
+    // update spec
+    auto spec_ndx = leaf_ndx2spec_ndx(column_ndx);
+    auto attr = m_spec.get_column_attr(spec_ndx);
+    attr.reset(col_attr_Vector_Indexed);
+    m_spec.set_column_attr(spec_ndx, attr); // Throws
+}
+
+void Table::rebuild_vector_index(ColKey col_key)
+{
+    check_column(col_key);
+    auto column_ndx = col_key.get_index();
+
+    if (column_ndx.val >= m_vector_index_accessors.size() || !m_vector_index_accessors[column_ndx.val])
+        throw IllegalOperation(
+            util::format("Column has no vector index to rebuild: %1", get_column_name(col_key)));
+
+    auto& index = m_vector_index_accessors[column_ndx.val];
+    index->rebuild(*this);
+    m_index_refs.set(column_ndx.val, index->get_ref());
+    hint_compaction_after_index_rebuild();
+}
+
+bool Table::has_vector_index(ColKey col_key) const noexcept
+{
+    size_t col_ndx = col_key.get_index().val;
+    return col_ndx < m_vector_index_accessors.size() && m_vector_index_accessors[col_ndx] != nullptr;
+}
+
+VectorIndex* Table::get_vector_index(ColKey col_key) const noexcept
+{
+    size_t col_ndx = col_key.get_index().val;
+    if (col_ndx < m_vector_index_accessors.size())
+        return m_vector_index_accessors[col_ndx].get();
+    return nullptr;
+}
+
+void Table::vector_index_touch(ColKey col_key, ObjKey key) const
+{
+    if (VectorIndex* index = get_vector_index(col_key))
+        index->mark_dirty(key);
 }
 
 bool Table::is_cross_table_link_target() const noexcept

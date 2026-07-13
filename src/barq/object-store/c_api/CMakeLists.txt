@@ -14,6 +14,7 @@ set(BARQ_FFI_SOURCES
     schema.cpp
     set.cpp
     util.cpp
+    vector.cpp
 
     conversion.hpp
     types.hpp

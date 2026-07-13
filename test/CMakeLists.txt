@@ -24,6 +24,7 @@ endif()
 add_subdirectory(benchmark-common-tasks)
 add_subdirectory(benchmark-crud)
 add_subdirectory(benchmark-larger)
+add_subdirectory(benchmark-vector-search)
 add_subdirectory(benchmark-sync)
 # FIXME: Add other benchmarks
 
