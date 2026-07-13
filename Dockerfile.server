@@ -1,10 +1,10 @@
 FROM debian:bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake g++ libssl-dev zlib1g-dev \
+    cmake g++ ninja-build libssl-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . ./core
-RUN cmake -S core -B build \
+RUN cmake -S core -B build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
       -DBARQ_BUILD_TESTS=OFF \
       -DBARQ_ENABLE_SYNC=ON \
@@ -16,7 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && install -d -o 65532 -g 65532 /var/lib/barq \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/build/src/barq/sync/noinst/server/barq-server /usr/local/bin/barq-core
-ENV BARQ_INTERNAL_SECRET=""
 USER 65532:65532
 EXPOSE 9090
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=12 \
