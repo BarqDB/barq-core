@@ -6,7 +6,8 @@ WORKDIR /src
 COPY . ./core
 RUN cmake -S core -B build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
-      -DBARQ_BUILD_TESTS=OFF \
+      -DBARQ_NO_TESTS=ON \
+      -DBARQ_BUILD_SERVER=ON \
       -DBARQ_ENABLE_SYNC=ON \
     && cmake --build build --target BarqSyncServer -j 4
 
