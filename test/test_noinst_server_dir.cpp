@@ -66,6 +66,7 @@ TEST(ServerDir_TenantVirtualPathRejectsEscapes)
     CHECK(!make_tenant_virtual_path("tenant-a", "../shared", virt_path));
     CHECK(!make_tenant_virtual_path("tenant-a", ".hidden", virt_path));
     CHECK(!make_tenant_virtual_path("bad/tenant", "shared", virt_path));
+    CHECK(!make_tenant_virtual_path("_system", "control", virt_path));
 }
 
 #ifndef _WIN32

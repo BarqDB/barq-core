@@ -222,7 +222,9 @@ struct HTTPParserBase {
     util::Optional<size_t> m_found_content_length;
     bool m_has_chunked_encoding = false;
     std::optional<std::stringstream> m_chunked_encoding_ss;
-    static const size_t read_buffer_size = 8192;
+    // Internal API JSON bodies (schema manifests and atomic batches) can be
+    // larger than websocket handshake requests.
+    static const size_t read_buffer_size = 64 * 1024;
     static const size_t max_header_line_length = read_buffer_size;
 
     /// Parses the contents of m_read_buffer as a HTTP header line,

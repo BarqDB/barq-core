@@ -108,6 +108,10 @@ void find_barq_files(const std::string& root_dir, H handler)
         while (ds.next(name)) {                                              // Throws
             std::string real_subpath = util::File::resolve(name, real_path); // Throws
             if (util::File::is_dir(real_subpath)) {                          // Throws
+                // Go owns root/_system/control.barq. It is local control-plane
+                // state and must never enter the sync file registry.
+                if (virt_path.empty() && name == "_system")
+                    continue;
                 if (StringData{name}.ends_with(barq_suffix))
                     throw std::runtime_error("Illegal directory path: " + real_subpath);
                 std::string virt_subpath = virt_path + "/" + name; // Throws

@@ -43,6 +43,7 @@ struct Options {
     std::string tls_cert;
     std::string tls_key;
     std::string server_id = "barq-server";
+    std::string internal_api_secret;
     util::Logger::Level log_level = util::Logger::Level::info;
     std::size_t tenant_max_connections = 0;
     std::size_t tenant_max_files = 0;
@@ -80,6 +81,7 @@ void print_usage(std::ostream& out)
         << "  --tls-cert PEM              TLS certificate chain file.\n"
         << "  --tls-key PEM               TLS private key file.\n"
         << "  --server-id ID              Server id. Default: barq-server\n"
+        << "  --internal-api-secret TEXT Shared bearer secret for /internal/v1.\n"
         << "  --log-level LEVEL           all, trace, debug, detail, info, warn, error, fatal, off.\n"
         << "  --disable-sync-to-disk      Dev/test only. Keep synced data off disk.\n"
         << "  --help                      Show this help.\n";
@@ -229,6 +231,10 @@ bool parse_args(int argc, char* argv[], Options& options)
             if (!read_value(i, argc, argv, options.server_id, "--server-id"))
                 return false;
         }
+        else if (arg == "--internal-api-secret") {
+            if (!read_value(i, argc, argv, options.internal_api_secret, "--internal-api-secret"))
+                return false;
+        }
         else if (arg == "--log-level") {
             std::string value;
             if (!read_value(i, argc, argv, value, "--log-level"))
@@ -375,6 +381,7 @@ int main(int argc, char* argv[])
 
         sync::Server::Config config;
         config.id = options.server_id;
+        config.internal_api_secret = options.internal_api_secret;
         config.listen_address = options.host;
         config.listen_port = options.port;
         config.logger = logger;
