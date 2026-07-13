@@ -6,6 +6,7 @@
 #include <barq/list.hpp>
 #include <barq/object_id.hpp>
 #include <barq/set.hpp>
+#include <barq/sort_descriptor.hpp>
 #include <barq/string_data.hpp>
 #include <barq/sync/changeset.hpp>
 #include <barq/sync/changeset_encoder.hpp>
@@ -144,22 +145,130 @@ std::uintmax_t directory_size(const std::string& path)
     return total;
 }
 
-const Server::Config::FLXRule* find_flx_rule(const std::vector<Server::Config::FLXRule>& rules,
-                                             const std::string& table_name) noexcept
+struct FLXAccessRule {
+    std::string object_type;
+    std::string read;
+    std::string write;
+    std::string legacy_owner_field;
+};
+
+struct FLXRuleSet {
+    uint64_t revision = 0;
+    std::string hash;
+    std::vector<FLXAccessRule> rules;
+    bool persisted = false;
+};
+
+std::string flx_rules_hash(const FLXRuleSet&);
+
+const FLXAccessRule* find_flx_access_rule(const FLXRuleSet& rule_set, const std::string& table_name) noexcept
 {
-    auto it = std::find_if(rules.begin(), rules.end(), [&](const Server::Config::FLXRule& rule) {
-        return rule.table == table_name;
+    StringData object_type = Group::table_name_to_class_name(table_name);
+    auto it = std::find_if(rule_set.rules.begin(), rule_set.rules.end(), [&](const FLXAccessRule& rule) {
+        return rule.object_type == table_name || rule.object_type == object_type;
     });
-    return it == rules.end() ? nullptr : &*it;
+    return it == rule_set.rules.end() ? nullptr : &*it;
 }
 
-const Server::Config::FLXRule* find_flx_rule_for_table(const std::vector<Server::Config::FLXRule>& rules,
-                                                       const std::string& table_name)
+std::string flx_replace_user_argument(std::string_view source)
 {
-    if (auto rule = find_flx_rule(rules, table_name)) {
-        return rule;
+    std::string result;
+    result.reserve(source.size());
+    char quote = 0;
+    bool escaped = false;
+    for (std::size_t i = 0; i < source.size();) {
+        char ch = source[i];
+        if (quote) {
+            result.push_back(ch);
+            ++i;
+            if (escaped) {
+                escaped = false;
+            }
+            else if (ch == '\\') {
+                escaped = true;
+            }
+            else if (ch == quote) {
+                quote = 0;
+            }
+            continue;
+        }
+        if (ch == '\'' || ch == '"') {
+            quote = ch;
+            result.push_back(ch);
+            ++i;
+            continue;
+        }
+        constexpr std::string_view user_argument = "$user.id";
+        if (source.substr(i, user_argument.size()) == user_argument) {
+            result += "$0";
+            i += user_argument.size();
+            continue;
+        }
+        if (ch == '$' && i + 1 < source.size() &&
+            (std::isdigit(static_cast<unsigned char>(source[i + 1])) ||
+             (source[i + 1] == 'K' && i + 2 < source.size() &&
+              std::isdigit(static_cast<unsigned char>(source[i + 2]))))) {
+            throw std::invalid_argument("FLX rules must use $user.id instead of positional query arguments");
+        }
+        result.push_back(ch);
+        ++i;
     }
-    return find_flx_rule(rules, std::string(Group::table_name_to_class_name(table_name)));
+    return result;
+}
+
+std::unique_ptr<Query> compile_flx_access_query(ConstTableRef table, const std::string& source,
+                                                const std::string& user_identity)
+{
+    if (source.empty()) {
+        throw std::invalid_argument("FLX rule predicates must not be empty");
+    }
+    std::string query_source = flx_replace_user_argument(source); // Throws
+    std::vector<Mixed> arguments{Mixed{StringData{user_identity}}};
+    Query query = table->query(query_source, arguments); // Throws
+    query.find();                                         // Throws; initializes parser-built query nodes.
+    if (auto ordering = query.get_ordering(); ordering && !ordering->is_empty()) {
+        throw std::invalid_argument("FLX rules must be predicates; SORT, DISTINCT, LIMIT, and KNN are not allowed");
+    }
+    TableVersions dependencies = query.sync_view_if_needed(); // Throws
+    Group* group = table->get_parent_group();
+    for (std::size_t i = 1; group && i < dependencies.size(); ++i) {
+        ConstTableRef dependency = group->get_table(dependencies[i].first);
+        if (dependency && !dependency->is_embedded()) {
+            throw std::invalid_argument("FLX rules may not traverse links to another top-level object type");
+        }
+    }
+    return std::make_unique<Query>(std::move(query));
+}
+
+bool flx_access_query_matches(const FLXAccessRule& rule, bool write, ConstTableRef table, const Obj& object,
+                              const std::string& user_identity)
+{
+    auto query = compile_flx_access_query(table, write ? rule.write : rule.read, user_identity); // Throws
+    return query->eval_object(object);
+}
+
+std::shared_ptr<const FLXRuleSet> make_static_flx_rule_set(const Server::Config& config)
+{
+    auto rule_set = std::make_shared<FLXRuleSet>();
+    for (const auto& rule : config.flx_rules) {
+        FLXAccessRule access_rule;
+        access_rule.object_type = std::string(Group::table_name_to_class_name(rule.table)); // Throws
+        if (rule.mode == Server::Config::FLXRule::Mode::PublicReadOnly) {
+            access_rule.read = "TRUEPREDICATE";
+            access_rule.write = "FALSEPREDICATE";
+        }
+        else {
+            access_rule.read = rule.owner_field + " == $user.id"; // Throws
+            access_rule.write = access_rule.read;
+            access_rule.legacy_owner_field = rule.owner_field; // Throws
+        }
+        rule_set->rules.push_back(std::move(access_rule)); // Throws
+    }
+    std::sort(rule_set->rules.begin(), rule_set->rules.end(), [](const auto& a, const auto& b) {
+        return a.object_type < b.object_type;
+    });
+    rule_set->hash = flx_rules_hash(*rule_set); // Throws
+    return rule_set;
 }
 
 Instruction::Payload::Type flx_payload_type(DataType type)
@@ -945,6 +1054,133 @@ private:
 constexpr const char* c_flx_visible_state_table = "flx_visible_state";
 constexpr const char* c_flx_visible_state_client_file_ident = "client_file_ident";
 constexpr const char* c_flx_visible_state_json = "visible_json";
+constexpr const char* c_flx_rule_state_table = "flx_rule_state";
+constexpr const char* c_flx_rule_state_id = "id";
+constexpr const char* c_flx_rule_state_revision = "revision";
+constexpr const char* c_flx_rule_state_hash = "hash";
+constexpr const char* c_flx_rule_state_json = "rules_json";
+
+nlohmann::json flx_rules_json(const FLXRuleSet& rule_set)
+{
+    nlohmann::json rules = nlohmann::json::array();
+    for (const auto& rule : rule_set.rules) {
+        rules.push_back({{"object_type", rule.object_type}, {"read", rule.read}, {"write", rule.write}});
+    }
+    return {{"rules", std::move(rules)}};
+}
+
+std::string flx_rules_hash(const FLXRuleSet& rule_set)
+{
+    std::string canonical = flx_rules_json(rule_set).dump();
+    unsigned char digest[32];
+    util::sha256(canonical.data(), canonical.size(), digest);
+    static constexpr char alphabet[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(64);
+    for (unsigned char byte : digest) {
+        result.push_back(alphabet[byte >> 4]);
+        result.push_back(alphabet[byte & 0x0f]);
+    }
+    return result;
+}
+
+std::shared_ptr<FLXRuleSet> parse_flx_rule_set(const nlohmann::json& document, uint64_t revision, bool persisted)
+{
+    if (!document.is_object() || !document.contains("rules") || !document["rules"].is_array()) {
+        throw std::invalid_argument("rules must be an array");
+    }
+    auto rule_set = std::make_shared<FLXRuleSet>();
+    rule_set->revision = revision;
+    rule_set->persisted = persisted;
+    std::set<std::string> object_types;
+    for (const auto& item : document["rules"]) {
+        if (!item.is_object() || !item.contains("object_type") || !item["object_type"].is_string() ||
+            !item.contains("read") || !item["read"].is_string() || !item.contains("write") ||
+            !item["write"].is_string()) {
+            throw std::invalid_argument("each FLX rule needs string object_type, read, and write fields");
+        }
+        FLXAccessRule rule{item["object_type"].get<std::string>(), item["read"].get<std::string>(),
+                           item["write"].get<std::string>()};
+        if (rule.object_type.empty() || rule.read.empty() || rule.write.empty()) {
+            throw std::invalid_argument("FLX rule object_type, read, and write fields must not be empty");
+        }
+        if (!object_types.insert(rule.object_type).second) {
+            throw std::invalid_argument("duplicate FLX rule for object type " + rule.object_type);
+        }
+        rule_set->rules.push_back(std::move(rule));
+    }
+    std::sort(rule_set->rules.begin(), rule_set->rules.end(), [](const auto& a, const auto& b) {
+        return a.object_type < b.object_type;
+    });
+    rule_set->hash = flx_rules_hash(*rule_set); // Throws
+    return rule_set;
+}
+
+void validate_flx_rule_set(const FLXRuleSet& rule_set, Transaction& tr)
+{
+    for (const auto& rule : rule_set.rules) {
+        Group::TableNameBuffer buffer;
+        StringData table_name = Group::class_name_to_table_name(rule.object_type, buffer);
+        ConstTableRef table = tr.get_table(table_name); // Throws
+        if (!table || table->is_embedded() || table->is_asymmetric()) {
+            throw std::invalid_argument("FLX rule names missing top-level object type " + rule.object_type);
+        }
+        compile_flx_access_query(table, rule.read, "__barq_rule_test_user__");  // Throws
+        compile_flx_access_query(table, rule.write, "__barq_rule_test_user__"); // Throws
+    }
+}
+
+std::shared_ptr<const FLXRuleSet> load_flx_rule_set(Transaction& tr,
+                                                   std::shared_ptr<const FLXRuleSet> fallback)
+{
+    ConstTableRef table = tr.get_table(c_flx_rule_state_table); // Throws
+    if (!table) {
+        return fallback;
+    }
+    ColKey revision_col = table->get_column_key(c_flx_rule_state_revision);
+    ColKey hash_col = table->get_column_key(c_flx_rule_state_hash);
+    ColKey json_col = table->get_column_key(c_flx_rule_state_json);
+    ObjKey key = table->find_primary_key(Mixed{int64_t(1)}); // Throws
+    if (!revision_col || !hash_col || !json_col || !key) {
+        throw std::runtime_error("invalid hidden FLX rule state");
+    }
+    Obj object = table->get_object(key);
+    int64_t revision = object.get<int64_t>(revision_col);
+    if (revision <= 0) {
+        throw std::runtime_error("invalid hidden FLX rule revision");
+    }
+    std::string stored_hash = std::string(object.get<StringData>(hash_col));
+    std::string stored_json = std::string(object.get<StringData>(json_col));
+    auto rule_set = parse_flx_rule_set(nlohmann::json::parse(stored_json), uint64_t(revision), true); // Throws
+    if (rule_set->hash != stored_hash) {
+        throw std::runtime_error("hidden FLX rule state hash does not match its contents");
+    }
+    validate_flx_rule_set(*rule_set, tr); // Throws; fail closed on schema drift.
+    return rule_set;
+}
+
+void persist_flx_rule_set(Transaction& tr, const FLXRuleSet& rule_set)
+{
+    TableRef table = tr.get_table(c_flx_rule_state_table); // Throws
+    if (!table) {
+        table = tr.add_table_with_primary_key(c_flx_rule_state_table, type_Int, c_flx_rule_state_id); // Throws
+        table->add_column(type_Int, c_flx_rule_state_revision);                                       // Throws
+        table->add_column(type_String, c_flx_rule_state_hash);                                        // Throws
+        table->add_column(type_String, c_flx_rule_state_json);                                        // Throws
+    }
+    ColKey revision_col = table->get_column_key(c_flx_rule_state_revision);
+    ColKey hash_col = table->get_column_key(c_flx_rule_state_hash);
+    ColKey json_col = table->get_column_key(c_flx_rule_state_json);
+    if (!revision_col || !hash_col || !json_col) {
+        throw std::runtime_error("invalid hidden FLX rule state schema");
+    }
+    ObjKey key = table->find_primary_key(Mixed{int64_t(1)}); // Throws
+    Obj object = key ? table->get_object(key) : table->create_object_with_primary_key(Mixed{int64_t(1)}); // Throws
+    std::string json = flx_rules_json(rule_set).dump(); // Throws
+    object.set(revision_col, int64_t(rule_set.revision));
+    object.set(hash_col, StringData{rule_set.hash});
+    object.set(json_col, StringData{json});
+}
 
 std::string flx_primary_key_part(const FLXPrimaryKey& primary_key)
 {
@@ -1738,7 +1974,7 @@ struct FLXCompensationCandidate {
     version_type rejected_client_version = 0;
     std::string user_identity;
     bool user_is_admin = false;
-    bool before_matches_owner = false;
+    bool before_matches_write = false;
     FLXObjectSnapshot before;
 };
 
@@ -1749,16 +1985,6 @@ struct FLXRejectedUpdate {
     FLXPrimaryKey primary_key;
     std::string reason;
 };
-
-bool flx_object_owner_matches(ConstTableRef table, const Obj& obj, const std::string& owner_field,
-                              const std::string& identity)
-{
-    ColKey owner_col = table->get_column_key(owner_field);
-    if (!owner_col || obj.is_null(owner_col) || DataType(owner_col.get_type()) != type_String) {
-        return false;
-    }
-    return obj.get_any(owner_col).get<StringData>() == identity;
-}
 
 FLXObjectSnapshot flx_snapshot_object(ConstTableRef table, const std::string& table_name,
                                       const FLXPrimaryKey& primary_key)
@@ -2028,6 +2254,18 @@ public:
     FLXVisibleObjects get_flx_visible_objects(file_ident_type client_file_ident);
     void set_flx_visible_objects(file_ident_type client_file_ident, FLXVisibleObjects visible_objects);
 
+    std::shared_ptr<const FLXRuleSet> get_flx_rule_set() const noexcept
+    {
+        return std::atomic_load(&m_flx_rule_set);
+    }
+
+    void set_flx_rule_set(std::shared_ptr<const FLXRuleSet> rule_set) noexcept
+    {
+        std::atomic_store(&m_flx_rule_set, std::move(rule_set));
+    }
+
+    std::size_t refresh_flx_sessions();
+
     // Run gc_flx_visible_state() at most once over the lifetime of this
     // ServerFile (i.e. once per activation / server run), triggered lazily the
     // first time a Flexible Sync client binds. A GC failure is logged but never
@@ -2077,6 +2315,9 @@ private:
     // FLX sessions need the old visible set after reconnect to know which
     // objects must be erased from the local filtered file.
     std::map<file_ident_type, FLXVisibleObjects> m_flx_visible_objects_by_client_file;
+
+    // The immutable rules used by sessions and worker jobs for this database.
+    std::shared_ptr<const FLXRuleSet> m_flx_rule_set;
 
     FLXVisibleObjects load_flx_visible_objects(file_ident_type client_file_ident);
     void persist_flx_visible_objects(file_ident_type client_file_ident, const FLXVisibleObjects& visible_objects);
@@ -2201,9 +2442,11 @@ private:
     // NOTE: These functions are executed by the worker thread
     void worker_allocate_file_identifiers();
     bool worker_integrate_changes_from_downstream(WorkerState&);
-    std::vector<FLXCompensationCandidate> worker_prepare_flx_compensation_candidates(DBRef);
+    std::vector<FLXCompensationCandidate>
+    worker_prepare_flx_compensation_candidates(DBRef, const std::shared_ptr<const FLXRuleSet>&);
     bool worker_apply_flx_compensating_writes(ServerHistory&, DBRef,
-                                              const std::vector<FLXCompensationCandidate>&);
+                                              const std::vector<FLXCompensationCandidate>&,
+                                              const std::shared_ptr<const FLXRuleSet>&);
     ServerHistory& get_client_file_history(WorkerState& state, std::unique_ptr<ServerHistory>& hist_ptr,
                                            DBRef& sg_ptr);
     ServerHistory& get_reference_file_history(WorkerState& state);
@@ -3116,26 +3359,10 @@ InternalAPIResponse internal_error(HTTPStatus status, const char* code, std::str
     return {status, {{"code", code}, {"message", std::move(message)}}};
 }
 
-DBOptions internal_db_options(const Server::Config& config, const std::string& tenant,
-                              std::optional<std::array<char, 64>>& derived_key)
-{
-    DBOptions options;
-    if (config.tenant_encryption_master_secret) {
-        derived_key = _impl::derive_tenant_encryption_key(tenant, *config.tenant_encryption_master_secret);
-        options.encryption_key = derived_key->data();
-    }
-    else if (config.encryption_key) {
-        options.encryption_key = config.encryption_key->data();
-    }
-    if (config.disable_sync_to_disk)
-        options.durability = DBOptions::Durability::Unsafe;
-    return options;
-}
-
 struct OpenDataDB {
-    std::unique_ptr<ServerHistory> history;
     DBRef db;
     std::string virt_path;
+    util::bind_ptr<ServerFile> server_file;
 };
 
 OpenDataDB open_data_db(ServerImpl& server, const nlohmann::json& scope)
@@ -3149,12 +3376,14 @@ OpenDataDB open_data_db(ServerImpl& server, const nlohmann::json& scope)
     std::string virt_path;
     if (!_impl::make_tenant_virtual_path(tenant, database, virt_path))
         throw std::invalid_argument("invalid tenant or database");
-    server.get_or_create_file(virt_path); // Register the file with the sync process.
-    std::string real_path = _impl::map_virt_to_real_barq_path(server.get_root_dir(), virt_path);
-    auto history = server.make_history_for_path();
-    std::optional<std::array<char, 64>> derived_key;
-    DBRef db = DB::create(*history, real_path, internal_db_options(server.get_config(), tenant, derived_key));
-    return {std::move(history), std::move(db), std::move(virt_path)};
+    // Tenant-key mode adds the tenant prefix during BIND. Single-key mode
+    // expects the JWT path itself to be "tenant/database".
+    if (!server.get_access_control().uses_tenant_public_keys())
+        virt_path.erase(0, 1);
+    util::bind_ptr<ServerFile> server_file =
+        server.get_or_create_file(virt_path); // Register the file with the sync process.
+    DBRef db = server_file->access().shared_group;
+    return {std::move(db), std::move(virt_path), std::move(server_file)};
 }
 
 Mixed json_to_mixed(const nlohmann::json& value, DataType type)
@@ -3466,6 +3695,236 @@ InternalAPIResponse schema_change(ServerImpl& server, const nlohmann::json& requ
              {"applied", true}}};
 }
 
+const char* schema_data_type_name(DataType type)
+{
+    switch (type) {
+        case type_Int:
+            return "int";
+        case type_Bool:
+            return "bool";
+        case type_String:
+            return "string";
+        case type_Binary:
+            return "binary";
+        case type_Timestamp:
+            return "timestamp";
+        case type_Float:
+            return "float";
+        case type_Double:
+            return "double";
+        case type_Decimal:
+            return "decimal";
+        case type_ObjectId:
+            return "object_id";
+        case type_UUID:
+            return "uuid";
+        case type_Mixed:
+            return "mixed";
+        case type_Link:
+            return "link";
+        case type_TypedLink:
+            return "typed_link";
+    }
+    return "unknown";
+}
+
+InternalAPIResponse read_schema(ServerImpl& server, const nlohmann::json& request)
+{
+    if (!request.contains("scope")) {
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument", "scope is required");
+    }
+    OpenDataDB opened = open_data_db(server, request["scope"]);
+    TransactionRef tr = opened.db->start_read();
+    nlohmann::json objects = nlohmann::json::array();
+    for (TableKey key : tr->get_table_keys()) {
+        ConstTableRef table = tr->get_table(key);
+        if (!table || table->is_embedded() || table->is_asymmetric() ||
+            !table->get_name().begins_with("class_")) {
+            continue;
+        }
+        nlohmann::json properties = nlohmann::json::array();
+        ColKey primary_key = table->get_primary_key_column();
+        for (ColKey column : table->get_column_keys()) {
+            nlohmann::json property = {
+                {"name", std::string(table->get_column_name(column))},
+                {"type", schema_data_type_name(table->get_column_type(column))},
+                {"nullable", table->is_nullable(column)},
+                {"primary_key", column == primary_key},
+            };
+            if (column.is_list())
+                property["collection"] = "list";
+            else if (column.is_set())
+                property["collection"] = "set";
+            else if (column.is_dictionary())
+                property["collection"] = "dictionary";
+            else
+                property["collection"] = "none";
+            if (ConstTableRef target = table->get_link_target(column)) {
+                property["target"] = std::string(target->get_class_name());
+                property["embedded"] = target->is_embedded();
+            }
+            properties.push_back(std::move(property));
+        }
+        objects.push_back({{"name", std::string(table->get_class_name())}, {"properties", std::move(properties)}});
+    }
+    return {HTTPStatus::Ok, {{"version", current_schema_version(*tr)}, {"objects", std::move(objects)}}};
+}
+
+nlohmann::json flx_rule_set_response(const FLXRuleSet& rule_set)
+{
+    return {{"revision", rule_set.revision},
+            {"hash", rule_set.hash},
+            {"source", rule_set.persisted ? "database" : "bootstrap"},
+            {"rules", flx_rules_json(rule_set)["rules"]}};
+}
+
+std::vector<std::string> flx_rule_changes(const FLXRuleSet& current, const FLXRuleSet& candidate)
+{
+    std::map<std::string, const FLXAccessRule*> old_rules;
+    std::map<std::string, const FLXAccessRule*> new_rules;
+    for (const auto& rule : current.rules)
+        old_rules[rule.object_type] = &rule;
+    for (const auto& rule : candidate.rules)
+        new_rules[rule.object_type] = &rule;
+    std::vector<std::string> changes;
+    for (const auto& [name, rule] : new_rules) {
+        auto old = old_rules.find(name);
+        if (old == old_rules.end())
+            changes.push_back("allow object type " + name);
+        else if (old->second->read != rule->read || old->second->write != rule->write)
+            changes.push_back("change rules for " + name);
+    }
+    for (const auto& [name, rule] : old_rules) {
+        static_cast<void>(rule);
+        if (new_rules.count(name) == 0)
+            changes.push_back("deny object type " + name);
+    }
+    return changes;
+}
+
+InternalAPIResponse read_flx_rules(ServerImpl& server, const nlohmann::json& request)
+{
+    if (!request.contains("scope"))
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument", "scope is required");
+    OpenDataDB opened = open_data_db(server, request["scope"]);
+    auto rule_set = opened.server_file->get_flx_rule_set();
+    if (!rule_set)
+        return internal_error(HTTPStatus::InternalServerError, "internal", "FLX rule state is unavailable");
+    return {HTTPStatus::Ok, flx_rule_set_response(*rule_set)};
+}
+
+InternalAPIResponse change_flx_rules(ServerImpl& server, const nlohmann::json& request, bool apply)
+{
+    if (!request.contains("scope") || !request.contains("expected_revision") ||
+        !request["expected_revision"].is_number_unsigned()) {
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument", "scope and expected_revision are required");
+    }
+    OpenDataDB opened = open_data_db(server, request["scope"]);
+    auto current = opened.server_file->get_flx_rule_set();
+    if (!current)
+        return internal_error(HTTPStatus::InternalServerError, "internal", "FLX rule state is unavailable");
+    uint64_t expected = request["expected_revision"].get<uint64_t>();
+    uint64_t target = current->revision + 1;
+    if (apply) {
+        if (!request.contains("target_revision") || !request["target_revision"].is_number_unsigned())
+            return internal_error(HTTPStatus::BadRequest, "invalid_argument", "target_revision is required");
+        target = request["target_revision"].get<uint64_t>();
+    }
+    auto candidate = parse_flx_rule_set(request, target, apply); // Throws
+
+    if (apply && target == current->revision && candidate->hash == current->hash) {
+        nlohmann::json response = flx_rule_set_response(*current);
+        response["applied"] = true;
+        response["current_revision"] = current->revision;
+        response["target_revision"] = current->revision;
+        response["changes"] = nlohmann::json::array();
+        response["refreshed_sessions"] = 0;
+        return {HTTPStatus::Ok, std::move(response)};
+    }
+    if (expected != current->revision) {
+        return internal_error(HTTPStatus::Conflict, "conflict", "FLX rule revision does not match current revision");
+    }
+    if (target != current->revision + 1) {
+        return internal_error(HTTPStatus::Conflict, "conflict", "target_revision must be the next revision");
+    }
+
+    TransactionRef validation = opened.db->start_read();
+    validate_flx_rule_set(*candidate, *validation); // Throws
+    std::vector<std::string> changes = flx_rule_changes(*current, *candidate);
+    if (!apply) {
+        nlohmann::json response = flx_rule_set_response(*candidate);
+        response["current_revision"] = current->revision;
+        response["target_revision"] = target;
+        response["applied"] = false;
+        response["changes"] = changes;
+        return {HTTPStatus::Ok, std::move(response)};
+    }
+
+    validation.reset();
+    TransactionRef write = opened.db->start_write();
+    auto stored = load_flx_rule_set(*write, make_static_flx_rule_set(server.get_config())); // Throws
+    if (!stored || stored->revision != expected) {
+        return internal_error(HTTPStatus::Conflict, "conflict", "FLX rule revision changed while applying");
+    }
+    validate_flx_rule_set(*candidate, *write); // Throws again in the committing transaction.
+    persist_flx_rule_set(*write, *candidate);  // Throws
+    write->commit();
+    opened.server_file->set_flx_rule_set(candidate);
+    std::size_t refreshed = opened.server_file->refresh_flx_sessions(); // Throws
+
+    nlohmann::json response = flx_rule_set_response(*candidate);
+    response["current_revision"] = current->revision;
+    response["target_revision"] = target;
+    response["applied"] = true;
+    response["changes"] = changes;
+    response["refreshed_sessions"] = refreshed;
+    return {HTTPStatus::Ok, std::move(response)};
+}
+
+InternalAPIResponse test_flx_rules(ServerImpl& server, const nlohmann::json& request)
+{
+    if (!request.contains("scope") || !request.contains("user_id") || !request["user_id"].is_string() ||
+        !request.contains("object_type") || !request["object_type"].is_string() ||
+        !request.contains("primary_key")) {
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument",
+                              "scope, user_id, object_type, and primary_key are required");
+    }
+    OpenDataDB opened = open_data_db(server, request["scope"]);
+    TransactionRef tr = opened.db->start_read();
+    std::shared_ptr<const FLXRuleSet> rule_set = opened.server_file->get_flx_rule_set();
+    if (request.contains("rules")) {
+        auto candidate = parse_flx_rule_set(request, rule_set ? rule_set->revision + 1 : 1, false); // Throws
+        validate_flx_rule_set(*candidate, *tr); // Throws
+        rule_set = std::move(candidate);
+    }
+    std::string object_type = request["object_type"].get<std::string>();
+    ConstTableRef table = tr->get_table("class_" + object_type);
+    if (!table)
+        return internal_error(HTTPStatus::NotFound, "not_found", "Barq object type not found");
+    ColKey primary_key_col = table->get_primary_key_column();
+    if (!primary_key_col)
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument", "object type has no primary key");
+    Mixed primary_key = json_to_mixed(request["primary_key"], table->get_column_type(primary_key_col)); // Throws
+    ObjKey key = table->find_primary_key(primary_key); // Throws
+    const FLXAccessRule* rule = rule_set ? find_flx_access_rule(*rule_set, object_type) : nullptr;
+    if (!key) {
+        return {HTTPStatus::Ok,
+                {{"object_type", object_type}, {"found", false}, {"configured", rule != nullptr},
+                 {"can_read", false}, {"can_write", false}}};
+    }
+    bool read_allowed = false;
+    bool write_allowed = false;
+    if (rule) {
+        Obj object = table->get_object(key);
+        std::string user_id = request["user_id"].get<std::string>();
+        read_allowed = flx_access_query_matches(*rule, false, table, object, user_id);  // Throws
+        write_allowed = flx_access_query_matches(*rule, true, table, object, user_id); // Throws
+    }
+    return {HTTPStatus::Ok,
+            {{"object_type", object_type}, {"found", true}, {"configured", rule != nullptr},
+             {"can_read", read_allowed}, {"can_write", write_allowed}}};
+}
+
 InternalAPIResponse handle_internal_api(ServerImpl& server, const HTTPRequest& request)
 {
     const auto& config = server.get_config();
@@ -3477,10 +3936,13 @@ InternalAPIResponse handle_internal_api(ServerImpl& server, const HTTPRequest& r
 
     std::string path = request.path.substr(0, request.path.find('?'));
     if (path == "/internal/v1/health" && request.method == HTTPMethod::Get) {
+        nlohmann::json capabilities = {"crud", "schema", "schema_read"};
+        if (config.enable_flx_sync)
+            capabilities.push_back("flx_rules");
         return {HTTPStatus::Ok,
                 {{"status", "ok"},
                  {"version", BARQ_VERSION_STRING},
-                 {"capabilities", {"crud", "schema"}}}};
+                 {"capabilities", std::move(capabilities)}}};
     }
     if ((path == "/internal/v1/read" || path == "/internal/v1/write") && request.method == HTTPMethod::Post) {
         if (!request.body)
@@ -3488,6 +3950,34 @@ InternalAPIResponse handle_internal_api(ServerImpl& server, const HTTPRequest& r
         try {
             nlohmann::json body = nlohmann::json::parse(*request.body);
             return path == "/internal/v1/read" ? read_object(server, body) : write_object(server, body);
+        }
+        catch (const std::invalid_argument& e) {
+            return internal_error(HTTPStatus::BadRequest, "invalid_argument", e.what());
+        }
+        catch (const nlohmann::json::exception& e) {
+            return internal_error(HTTPStatus::BadRequest, "invalid_argument", e.what());
+        }
+    }
+    if ((path == "/internal/v1/schema/read" || path == "/internal/v1/flx/rules/read" ||
+         path == "/internal/v1/flx/rules/plan" || path == "/internal/v1/flx/rules/apply" ||
+         path == "/internal/v1/flx/rules/test") &&
+        request.method == HTTPMethod::Post) {
+        if (path.rfind("/internal/v1/flx/", 0) == 0 && !config.enable_flx_sync) {
+            return internal_error(HTTPStatus::Conflict, "conflict", "FLX sync is disabled");
+        }
+        if (!request.body)
+            return internal_error(HTTPStatus::BadRequest, "invalid_argument", "JSON body is required");
+        try {
+            nlohmann::json body = nlohmann::json::parse(*request.body);
+            if (path == "/internal/v1/schema/read")
+                return read_schema(server, body);
+            if (path == "/internal/v1/flx/rules/read")
+                return read_flx_rules(server, body);
+            if (path == "/internal/v1/flx/rules/plan")
+                return change_flx_rules(server, body, false);
+            if (path == "/internal/v1/flx/rules/apply")
+                return change_flx_rules(server, body, true);
+            return test_flx_rules(server, body);
         }
         catch (const std::invalid_argument& e) {
             return internal_error(HTTPStatus::BadRequest, "invalid_argument", e.what());
@@ -5099,6 +5589,20 @@ public:
         logger.detail("Received: ERROR"); // Throws
     }
 
+    bool refresh_flx_rules()
+    {
+        if (!m_connection.is_flx_sync_connection() || !ident_message_received() || m_flx_query_version <= 0 ||
+            unbind_message_received() || error_occurred()) {
+            return false;
+        }
+        m_flx_bootstrap_pending = true;
+        m_flx_bootstrap_send_all_objects = false;
+        m_flx_bootstrap_state.reset();
+        m_flx_incremental_state.reset();
+        ensure_enlisted_to_send(); // Throws
+        return true;
+    }
+
     void send_query_error_message(int error_code, std::string_view message, int64_t query_version)
     {
         logger.detail("Sending: QUERY_ERROR(error_code=%1, message_size=%2, query_version=%3)", error_code,
@@ -5147,7 +5651,9 @@ private:
     };
 
     struct FLXCompiledTableQuery {
-        const Server::Config::FLXRule* rule = nullptr;
+        std::shared_ptr<const FLXRuleSet> rule_set;
+        const FLXAccessRule* rule = nullptr;
+        std::unique_ptr<Query> read_rule;
         std::vector<FLXCompiledQuery> queries;
     };
 
@@ -5285,13 +5791,10 @@ private:
     /// download progress is up to date.
     bool m_one_download_message_sent = false;
 
-    const Server::Config::FLXRule* get_flx_rule(const std::string& table_name) const noexcept
+    const FLXAccessRule* get_flx_rule(const std::shared_ptr<const FLXRuleSet>& rule_set,
+                                      const std::string& table_name) const noexcept
     {
-        const Server::Config& config = m_connection.get_server().get_config();
-        if (auto rule = find_flx_rule(config.flx_rules, table_name)) {
-            return rule;
-        }
-        return find_flx_rule(config.flx_rules, std::string(Group::table_name_to_class_name(table_name)));
+        return rule_set ? find_flx_access_rule(*rule_set, table_name) : nullptr;
     }
 
     ConstTableRef get_flx_table(const Transaction& tr, const std::string& name,
@@ -5313,53 +5816,15 @@ private:
         return table;
     }
 
-    bool validate_flx_rule_for_existing_table(const Server::Config::FLXRule* rule, const std::string& table_name,
-                                              ConstTableRef table, std::string& error) const
+    bool object_matches_flx_rule(const FLXCompiledTableQuery& compiled_table, const Obj& obj) const
     {
-        if (!rule) {
-            return true; // Default deny: the effective result is empty.
-        }
-
-        if (rule->mode == Server::Config::FLXRule::Mode::Owner) {
-            ColKey owner_col = table->get_column_key(rule->owner_field);
-            if (!owner_col) {
-                error = util::format("FLX owner rule for '%1' names missing owner field '%2'", table_name,
-                                     rule->owner_field);
-                return false;
-            }
-            if (DataType(owner_col.get_type()) != type_String) {
-                error = util::format("FLX owner rule for '%1' requires string owner field '%2'", table_name,
-                                     rule->owner_field);
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    bool object_matches_flx_rule(const Server::Config::FLXRule* rule, ConstTableRef table, const Obj& obj) const
-    {
-        if (!rule) {
+        if (!compiled_table.rule) {
             return false;
         }
         if (m_user_is_admin) {
             return true;
         }
-        if (rule->mode == Server::Config::FLXRule::Mode::PublicReadOnly) {
-            return true;
-        }
-
-        BARQ_ASSERT(rule->mode == Server::Config::FLXRule::Mode::Owner);
-        ColKey owner_col = table->get_column_key(rule->owner_field);
-        // The owner column must be a string. This mirrors the guard in
-        // flx_object_owner_matches() on the write path: `set_flx_query` validates
-        // the owner type when the table exists at subscription time, but the
-        // table may have been created (or the column re-typed) afterwards, so we
-        // must not call Mixed::get<StringData>() on a non-string here.
-        if (!owner_col || obj.is_null(owner_col) || DataType(owner_col.get_type()) != type_String) {
-            return false;
-        }
-        return obj.get_any(owner_col).get<StringData>() == m_user_identity;
+        return compiled_table.read_rule && compiled_table.read_rule->eval_object(obj);
     }
 
     std::string flx_primary_key_part(const FLXPrimaryKey& primary_key) const
@@ -5949,6 +6414,7 @@ private:
     FLXCompiledQueries compile_flx_queries(const Transaction& tr) const
     {
         FLXCompiledQueries compiled_queries;
+        std::shared_ptr<const FLXRuleSet> rule_set = m_server_file->get_flx_rule_set();
         for (const auto& [subscription_table_name, query_string] : m_flx_queries) {
             std::string actual_table_name;
             ConstTableRef subscription_table = get_flx_table(tr, subscription_table_name, &actual_table_name);
@@ -5956,7 +6422,7 @@ private:
                 continue;
             }
 
-            const Server::Config::FLXRule* rule = get_flx_rule(actual_table_name);
+            const FLXAccessRule* rule = get_flx_rule(rule_set, actual_table_name);
             if (!rule) {
                 continue; // Default deny.
             }
@@ -5969,7 +6435,22 @@ private:
             }
 
             auto& compiled_table = compiled_queries[actual_table_name]; // Throws
-            compiled_table.rule = rule;
+            if (!compiled_table.rule) {
+                compiled_table.rule_set = rule_set;
+                compiled_table.rule = rule;
+                if (!m_user_is_admin) {
+                    try {
+                        compiled_table.read_rule =
+                            compile_flx_access_query(subscription_table, rule->read, m_user_identity); // Throws
+                    }
+                    catch (const std::exception&) {
+                        // A schema changed outside the schema API after the subscription was accepted.
+                        // Keep the session alive and fail closed until the schema or rule is repaired.
+                        compiled_table.read_rule =
+                            compile_flx_access_query(subscription_table, "FALSEPREDICATE", m_user_identity); // Throws
+                    }
+                }
+            }
             compiled_table.queries.push_back(std::move(compiled_query)); // Throws
         }
         return compiled_queries;
@@ -5978,7 +6459,8 @@ private:
     bool object_matches_flx_compiled_table(const FLXCompiledTableQuery& compiled_table, ConstTableRef table,
                                            const Obj& obj) const
     {
-        if (!object_matches_flx_rule(compiled_table.rule, table, obj)) {
+        static_cast<void>(table);
+        if (!object_matches_flx_rule(compiled_table, obj)) {
             return false;
         }
 
@@ -6346,6 +6828,7 @@ private:
 
         auto& file = m_server_file->access(); // Throws
         TransactionRef tr = file.shared_group->start_read(); // Throws
+        std::shared_ptr<const FLXRuleSet> rule_set = m_server_file->get_flx_rule_set();
         for (const auto& [table_name, query_string] : parsed_queries) {
             std::string actual_table_name;
             ConstTableRef table = get_flx_table(*tr, table_name, &actual_table_name); // Throws
@@ -6361,9 +6844,27 @@ private:
                 error = util::format("Bad subscription query for '%1': %2", table_name, e.what());
                 return false;
             }
-            if (!validate_flx_rule_for_existing_table(get_flx_rule(actual_table_name), actual_table_name, table,
-                                                      error)) {
-                return false;
+            if (const FLXAccessRule* rule = get_flx_rule(rule_set, actual_table_name)) {
+                if (!rule->legacy_owner_field.empty()) {
+                    ColKey owner_col = table->get_column_key(rule->legacy_owner_field);
+                    if (!owner_col) {
+                        error = util::format("FLX owner rule for '%1' names missing owner field '%2'",
+                                             actual_table_name, rule->legacy_owner_field);
+                        return false;
+                    }
+                    if (DataType(owner_col.get_type()) != type_String) {
+                        error = util::format("FLX owner rule for '%1' requires string owner field '%2'",
+                                             actual_table_name, rule->legacy_owner_field);
+                        return false;
+                    }
+                }
+                try {
+                    compile_flx_access_query(table, rule->read, m_user_identity); // Throws
+                }
+                catch (const std::exception& e) {
+                    error = util::format("Bad server FLX rule for '%1': %2", table_name, e.what());
+                    return false;
+                }
             }
         }
 
@@ -6817,6 +7318,19 @@ private:
 };
 
 
+std::size_t ServerFile::refresh_flx_sessions()
+{
+    std::size_t refreshed = 0;
+    for (const auto& [client_file_ident, session] : m_identified_sessions) {
+        static_cast<void>(client_file_ident);
+        if (session->refresh_flx_rules()) { // Throws
+            ++refreshed;
+        }
+    }
+    return refreshed;
+}
+
+
 // ============================ SessionQueue implementation ============================
 
 void SessionQueue::push_back(Session* sess) noexcept
@@ -6889,7 +7403,8 @@ ServerFile::~ServerFile() noexcept
 
 void ServerFile::initialize()
 {
-    const ServerHistory& history = access().history; // Throws
+    auto& file = access();
+    const ServerHistory& history = file.history; // Throws
     file_ident_type partial_file_ident = 0;
     version_type partial_progress_reference_version = 0;
     bool has_upstream_sync_status;
@@ -6897,6 +7412,9 @@ void ServerFile::initialize()
                        partial_progress_reference_version); // Throws
     BARQ_ASSERT(!has_upstream_sync_status);
     BARQ_ASSERT(partial_file_ident == 0);
+
+    TransactionRef tr = file.shared_group->start_read(); // Throws
+    set_flx_rule_set(load_flx_rule_set(*tr, make_static_flx_rule_set(m_server.get_config()))); // Throws
 }
 
 
@@ -7384,7 +7902,8 @@ void ServerFile::worker_allocate_file_identifiers()
 }
 
 
-std::vector<FLXCompensationCandidate> ServerFile::worker_prepare_flx_compensation_candidates(DBRef shared_group)
+std::vector<FLXCompensationCandidate> ServerFile::worker_prepare_flx_compensation_candidates(
+    DBRef shared_group, const std::shared_ptr<const FLXRuleSet>& rule_set)
 {
     std::vector<FLXCompensationCandidate> candidates;
     bool has_flx_changesets = false;
@@ -7401,8 +7920,6 @@ std::vector<FLXCompensationCandidate> ServerFile::worker_prepare_flx_compensatio
 
     TransactionRef tr = shared_group->start_read(); // Throws
     std::map<std::string, std::size_t> candidate_indexes;
-    const Server::Config& config = m_server.get_config();
-
     for (const auto& [client_file_ident, list] : m_work.changesets_from_downstream) {
         if (!list.is_flx_sync) {
             continue;
@@ -7432,13 +7949,18 @@ std::vector<FLXCompensationCandidate> ServerFile::worker_prepare_flx_compensatio
                     if (table) {
                         candidate->before =
                             flx_snapshot_object(table, touched_object.table_name, touched_object.primary_key); // Throws
-                        const Server::Config::FLXRule* rule =
-                            find_flx_rule_for_table(config.flx_rules, touched_object.table_name); // Throws
-                        if (rule && rule->mode == Server::Config::FLXRule::Mode::Owner && candidate->before.existed) {
+                        const FLXAccessRule* rule =
+                            rule_set ? find_flx_access_rule(*rule_set, touched_object.table_name) : nullptr;
+                        if (rule && candidate->before.existed && !candidate->user_is_admin) {
                             Obj before = flx_find_object(table, touched_object.primary_key); // Throws
-                            candidate->before_matches_owner =
-                                before && flx_object_owner_matches(table, before, rule->owner_field,
-                                                                  candidate->user_identity); // Throws
+                            try {
+                                candidate->before_matches_write =
+                                    before && flx_access_query_matches(*rule, true, table, before,
+                                                                       candidate->user_identity); // Throws
+                            }
+                            catch (const std::exception&) {
+                                candidate->before_matches_write = false; // Fail closed on a stale or invalid rule.
+                            }
                         }
                     }
                     else {
@@ -7459,7 +7981,8 @@ std::vector<FLXCompensationCandidate> ServerFile::worker_prepare_flx_compensatio
 
 
 bool ServerFile::worker_apply_flx_compensating_writes(
-    ServerHistory& history, DBRef, const std::vector<FLXCompensationCandidate>& candidates)
+    ServerHistory& history, DBRef, const std::vector<FLXCompensationCandidate>& candidates,
+    const std::shared_ptr<const FLXRuleSet>& rule_set)
 {
     if (candidates.empty()) {
         return false;
@@ -7467,13 +7990,12 @@ bool ServerFile::worker_apply_flx_compensating_writes(
 
     std::vector<FLXRejectedUpdate> rejected_updates;
     std::vector<Work::PendingFLXForcedRemoval> forced_removals;
-    const Server::Config& config = m_server.get_config();
     bool produced_new_barq_version = history.transact(
         [&](Transaction& tr) {
             bool dirty = false;
             for (const FLXCompensationCandidate& candidate : candidates) {
-                const Server::Config::FLXRule* rule =
-                    find_flx_rule_for_table(config.flx_rules, candidate.before.table_name); // Throws
+                const FLXAccessRule* rule =
+                    rule_set ? find_flx_access_rule(*rule_set, candidate.before.table_name) : nullptr;
                 bool reject = false;
                 std::string reason;
 
@@ -7490,20 +8012,26 @@ bool ServerFile::worker_apply_flx_compensating_writes(
                 else if (candidate.user_is_admin) {
                     reject = false;
                 }
-                else if (rule->mode == Server::Config::FLXRule::Mode::PublicReadOnly) {
-                    reject = true;
-                    reason = "write denied: table is read-only"; // Throws
-                }
                 else {
-                    BARQ_ASSERT(rule->mode == Server::Config::FLXRule::Mode::Owner);
-                    if (candidate.before.existed && !candidate.before_matches_owner) {
+                    if (candidate.before.existed && !candidate.before_matches_write) {
                         reject = true;
-                        reason = "write denied: object is not owned by the user"; // Throws
+                        reason = rule->legacy_owner_field.empty()
+                                     ? "write denied: previous object does not match the FLX write rule"
+                                     : "write denied: previous owner field does not match the user"; // Throws
                     }
-                    else if (after && !flx_object_owner_matches(table, after, rule->owner_field,
-                                                               candidate.user_identity)) { // Throws
-                        reject = true;
-                        reason = "write denied: owner field does not match the user"; // Throws
+                    else if (after) {
+                        try {
+                            if (!flx_access_query_matches(*rule, true, table, after, candidate.user_identity)) {
+                                reject = true;
+                                reason = rule->legacy_owner_field.empty()
+                                             ? "write denied: new object does not match the FLX write rule"
+                                             : "write denied: owner field does not match the user"; // Throws
+                            }
+                        }
+                        catch (const std::exception&) {
+                            reject = true;
+                            reason = "write denied: FLX write rule could not be evaluated"; // Throws
+                        }
                     }
                 }
 
@@ -7591,8 +8119,9 @@ bool ServerFile::worker_integrate_changes_from_downstream(WorkerState& state)
     DBRef sg_ptr;
     ServerHistory& hist = get_client_file_history(state, hist_ptr, sg_ptr);
     DBRef shared_group = state.use_file_cache ? worker_access().shared_group : sg_ptr; // Throws
+    std::shared_ptr<const FLXRuleSet> rule_set = get_flx_rule_set();
     std::vector<FLXCompensationCandidate> flx_compensation_candidates =
-        worker_prepare_flx_compensation_candidates(shared_group); // Throws
+        worker_prepare_flx_compensation_candidates(shared_group, rule_set); // Throws
 
     bool backup_whole_barq = false;
     bool produced_new_barq_version = hist.integrate_client_changesets(
@@ -7608,7 +8137,7 @@ bool ServerFile::worker_integrate_changes_from_downstream(WorkerState& state)
     }
 
     bool produced_compensating_write =
-        worker_apply_flx_compensating_writes(hist, shared_group, flx_compensation_candidates); // Throws
+        worker_apply_flx_compensating_writes(hist, shared_group, flx_compensation_candidates, rule_set); // Throws
     if (produced_compensating_write) {
         m_work.produced_new_barq_version = true;
         m_work.produced_new_sync_version = true;
