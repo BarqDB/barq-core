@@ -36,6 +36,7 @@
 #include <barq/util/random.hpp>
 #include <barq/util/safe_int_ops.hpp>
 #include <barq/util/scope_exit.hpp>
+#include <barq/util/sha_crypto.hpp>
 #include <barq/util/scratch_allocator.hpp>
 #include <barq/util/thread.hpp>
 #include <barq/util/thread_exec_guard.hpp>
@@ -3103,6 +3104,418 @@ inline void SyncConnection::write_error(std::error_code ec)
 }
 
 
+namespace {
+
+struct InternalAPIResponse {
+    HTTPStatus status = HTTPStatus::Ok;
+    nlohmann::json body = nlohmann::json::object();
+};
+
+InternalAPIResponse internal_error(HTTPStatus status, const char* code, std::string message)
+{
+    return {status, {{"code", code}, {"message", std::move(message)}}};
+}
+
+DBOptions internal_db_options(const Server::Config& config, const std::string& tenant,
+                              std::optional<std::array<char, 64>>& derived_key)
+{
+    DBOptions options;
+    if (config.tenant_encryption_master_secret) {
+        derived_key = _impl::derive_tenant_encryption_key(tenant, *config.tenant_encryption_master_secret);
+        options.encryption_key = derived_key->data();
+    }
+    else if (config.encryption_key) {
+        options.encryption_key = config.encryption_key->data();
+    }
+    if (config.disable_sync_to_disk)
+        options.durability = DBOptions::Durability::Unsafe;
+    return options;
+}
+
+struct OpenDataDB {
+    std::unique_ptr<ServerHistory> history;
+    DBRef db;
+    std::string virt_path;
+};
+
+OpenDataDB open_data_db(ServerImpl& server, const nlohmann::json& scope)
+{
+    if (!scope.is_object() || !scope.contains("tenant") || !scope.contains("database") ||
+        !scope["tenant"].is_string() || !scope["database"].is_string()) {
+        throw std::invalid_argument("scope needs tenant and database");
+    }
+    std::string tenant = scope["tenant"].get<std::string>();
+    std::string database = scope["database"].get<std::string>();
+    std::string virt_path;
+    if (!_impl::make_tenant_virtual_path(tenant, database, virt_path))
+        throw std::invalid_argument("invalid tenant or database");
+    server.get_or_create_file(virt_path); // Register the file with the sync process.
+    std::string real_path = _impl::map_virt_to_real_barq_path(server.get_root_dir(), virt_path);
+    auto history = server.make_history_for_path();
+    std::optional<std::array<char, 64>> derived_key;
+    DBRef db = DB::create(*history, real_path, internal_db_options(server.get_config(), tenant, derived_key));
+    return {std::move(history), std::move(db), std::move(virt_path)};
+}
+
+Mixed json_to_mixed(const nlohmann::json& value, DataType type)
+{
+    if (value.is_null())
+        return Mixed{};
+    if (type == type_String && value.is_string())
+        return Mixed{StringData{value.get_ref<const std::string&>()}};
+    if (type == type_Int && value.is_number_integer())
+        return Mixed{value.get<int64_t>()};
+    if (type == type_Bool && value.is_boolean())
+        return Mixed{value.get<bool>()};
+    if (type == type_Double && value.is_number())
+        return Mixed{value.get<double>()};
+    if (type == type_Float && value.is_number())
+        return Mixed{value.get<float>()};
+    if (type == type_ObjectId && value.is_string())
+        return Mixed{ObjectId{value.get_ref<const std::string&>()}};
+    if (type == type_UUID && value.is_string())
+        return Mixed{UUID{value.get_ref<const std::string&>()}};
+    if (type == type_Mixed) {
+        if (value.is_string())
+            return Mixed{StringData{value.get_ref<const std::string&>()}};
+        if (value.is_boolean())
+            return Mixed{value.get<bool>()};
+        if (value.is_number_integer())
+            return Mixed{value.get<int64_t>()};
+        if (value.is_number())
+            return Mixed{value.get<double>()};
+    }
+    throw std::invalid_argument("JSON value does not match the Barq column type");
+}
+
+std::string object_etag(const nlohmann::json& data)
+{
+    std::string canonical = data.dump(); // nlohmann objects use sorted keys.
+    unsigned char hash[32];
+    util::sha256(canonical.data(), canonical.size(), hash);
+    static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string encoded;
+    encoded.reserve(43);
+    for (size_t i = 0; i < sizeof(hash); i += 3) {
+        uint32_t value = uint32_t(hash[i]) << 16;
+        if (i + 1 < sizeof(hash))
+            value |= uint32_t(hash[i + 1]) << 8;
+        if (i + 2 < sizeof(hash))
+            value |= uint32_t(hash[i + 2]);
+        encoded.push_back(alphabet[(value >> 18) & 63]);
+        encoded.push_back(alphabet[(value >> 12) & 63]);
+        if (i + 1 < sizeof(hash))
+            encoded.push_back(alphabet[(value >> 6) & 63]);
+        if (i + 2 < sizeof(hash))
+            encoded.push_back(alphabet[value & 63]);
+    }
+    return "\"" + encoded + "\"";
+}
+
+nlohmann::json object_data(const Obj& object, ColKey primary_key_col)
+{
+    std::ostringstream out;
+    object.to_json(out);
+    nlohmann::json data = nlohmann::json::parse(out.str());
+    data.erase(std::string(object.get_table()->get_column_name(primary_key_col)));
+    return data;
+}
+
+nlohmann::json api_object(const std::string& type, const nlohmann::json& primary_key,
+                          const nlohmann::json& data)
+{
+    return {{"type", type}, {"primary_key", primary_key}, {"data", data}, {"etag", object_etag(data)}};
+}
+
+InternalAPIResponse read_object(ServerImpl& server, const nlohmann::json& request)
+{
+    if (!request.contains("scope") || !request.contains("type") || !request["type"].is_string() ||
+        !request.contains("primary_key")) {
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument", "scope, type, and primary_key are required");
+    }
+    OpenDataDB opened = open_data_db(server, request["scope"]);
+    TransactionRef rt = opened.db->start_read();
+    std::string type = request["type"].get<std::string>();
+    TableRef table = rt->get_table("class_" + type);
+    if (!table)
+        return internal_error(HTTPStatus::NotFound, "not_found", "Barq object type not found");
+    ColKey pk_col = table->get_primary_key_column();
+    if (!pk_col)
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument", "Barq object type has no primary key");
+    Mixed pk;
+    try {
+        pk = json_to_mixed(request["primary_key"], table->get_column_type(pk_col));
+    }
+    catch (const std::invalid_argument& e) {
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument", e.what());
+    }
+    ObjKey key = table->find_primary_key(pk);
+    if (!key)
+        return internal_error(HTTPStatus::NotFound, "not_found", "Barq object not found");
+    return {HTTPStatus::Ok, api_object(type, request["primary_key"], object_data(table->get_object(key), pk_col))};
+}
+
+InternalAPIResponse write_object(ServerImpl& server, const nlohmann::json& request)
+{
+    if (!request.contains("scope") || !request.contains("operation") || !request.contains("type") ||
+        !request["type"].is_string() || !request.contains("primary_key")) {
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument",
+                              "scope, operation, type, and primary_key are required");
+    }
+    OpenDataDB opened = open_data_db(server, request["scope"]);
+    TransactionRef wt = opened.db->start_write();
+    std::string type = request["type"].get<std::string>();
+    std::string operation = request["operation"].get<std::string>();
+    TableRef table = wt->get_table("class_" + type);
+    if (!table)
+        return internal_error(HTTPStatus::NotFound, "not_found", "Barq object type not found; apply its schema first");
+    ColKey pk_col = table->get_primary_key_column();
+    if (!pk_col)
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument", "Barq object type has no primary key");
+
+    Mixed pk;
+    try {
+        pk = json_to_mixed(request["primary_key"], table->get_column_type(pk_col));
+    }
+    catch (const std::invalid_argument& e) {
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument", e.what());
+    }
+    ObjKey key = table->find_primary_key(pk);
+    bool exists = bool(key);
+    if (operation == "create" && exists)
+        return internal_error(HTTPStatus::Conflict, "conflict", "Barq object already exists");
+    if ((operation == "patch" || operation == "delete") && !exists)
+        return internal_error(HTTPStatus::NotFound, "not_found", "Barq object not found");
+
+    Obj object;
+    if (exists) {
+        object = table->get_object(key);
+        std::string current_etag = object_etag(object_data(object, pk_col));
+        if (!request.contains("if_match") || !request["if_match"].is_string() ||
+            request["if_match"].get_ref<const std::string&>().empty()) {
+            return internal_error(HTTPStatus::PreconditionRequired, "precondition_failed", "If-Match is required");
+        }
+        if (request["if_match"].get<std::string>() != current_etag)
+            return internal_error(HTTPStatus::Conflict, "conflict", "ETag does not match current object");
+    }
+    else {
+        object = table->create_object_with_primary_key(pk);
+    }
+
+    if (operation == "delete") {
+        object.remove();
+        uint64_t cursor = wt->commit();
+        server.recognize_external_change(opened.virt_path);
+        return {HTTPStatus::Ok, {{"deleted", true}, {"cursor", cursor}}};
+    }
+    if (operation != "create" && operation != "patch")
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument", "unsupported write operation");
+    if (!request.contains("data") || !request["data"].is_object())
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument", "create and patch need an object data field");
+
+    try {
+        for (auto it = request["data"].begin(); it != request["data"].end(); ++it) {
+            ColKey col = table->get_column_key(it.key());
+            if (!col || col == pk_col)
+                throw std::invalid_argument("unknown or primary-key field: " + it.key());
+            if (col.is_collection() || table->get_column_type(col) == type_Link)
+                throw std::invalid_argument("collection and link writes are not supported by CRUD v1: " + it.key());
+            object.set_any(col, json_to_mixed(it.value(), table->get_column_type(col)));
+        }
+    }
+    catch (const std::invalid_argument& e) {
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument", e.what());
+    }
+
+    nlohmann::json data = object_data(object, pk_col);
+    nlohmann::json result_object = api_object(type, request["primary_key"], data);
+    uint64_t cursor = wt->commit();
+    server.recognize_external_change(opened.virt_path);
+    return {HTTPStatus::Ok, {{"object", std::move(result_object)}, {"cursor", cursor}}};
+}
+
+DataType schema_data_type(const std::string& name)
+{
+    if (name == "string")
+        return type_String;
+    if (name == "int")
+        return type_Int;
+    if (name == "bool")
+        return type_Bool;
+    if (name == "double")
+        return type_Double;
+    if (name == "float")
+        return type_Float;
+    if (name == "mixed")
+        return type_Mixed;
+    if (name == "object_id")
+        return type_ObjectId;
+    if (name == "uuid")
+        return type_UUID;
+    throw std::invalid_argument("unsupported schema field type: " + name);
+}
+
+uint64_t current_schema_version(Transaction& tr)
+{
+    TableRef metadata = tr.get_table("barq_api_schema");
+    if (!metadata)
+        return 0;
+    ColKey version_col = metadata->get_column_key("version");
+    ObjKey key = metadata->find_primary_key(Mixed{int64_t(1)});
+    if (!version_col || !key)
+        return 0;
+    return metadata->get_object(key).get<int64_t>(version_col);
+}
+
+InternalAPIResponse schema_change(ServerImpl& server, const nlohmann::json& request, bool apply)
+{
+    if (!request.contains("scope") || !request.contains("version") || !request["version"].is_number_integer() ||
+        request["version"].get<uint64_t>() == 0 || !request.contains("manifest") ||
+        !request["manifest"].is_object() || !request["manifest"].contains("objects") ||
+        !request["manifest"]["objects"].is_array()) {
+        return internal_error(HTTPStatus::BadRequest, "invalid_argument",
+                              "scope, positive version, and manifest.objects are required");
+    }
+    OpenDataDB opened = open_data_db(server, request["scope"]);
+    TransactionRef tr = apply ? opened.db->start_write() : opened.db->start_read();
+    uint64_t current = current_schema_version(*tr);
+    uint64_t target = request["version"].get<uint64_t>();
+    if (target < current)
+        return internal_error(HTTPStatus::Conflict, "conflict", "schema version cannot move backwards");
+    nlohmann::json changes = nlohmann::json::array();
+
+    for (const auto& object_schema : request["manifest"]["objects"]) {
+        if (!object_schema.is_object() || !object_schema.contains("name") || !object_schema["name"].is_string() ||
+            !object_schema.contains("primary_key") || !object_schema["primary_key"].is_object() ||
+            !object_schema.contains("properties") || !object_schema["properties"].is_array()) {
+            return internal_error(HTTPStatus::BadRequest, "invalid_argument",
+                                  "each object needs name, primary_key, and properties");
+        }
+        std::string object_name = object_schema["name"].get<std::string>();
+        const auto& primary_key = object_schema["primary_key"];
+        if (!primary_key.contains("name") || !primary_key.contains("type") || !primary_key["name"].is_string() ||
+            !primary_key["type"].is_string()) {
+            return internal_error(HTTPStatus::BadRequest, "invalid_argument", "primary_key needs name and type");
+        }
+        std::string table_name = "class_" + object_name;
+        std::string pk_name = primary_key["name"].get<std::string>();
+        DataType pk_type = schema_data_type(primary_key["type"].get<std::string>());
+        bool pk_nullable = primary_key.value("nullable", false);
+        TableRef table = tr->get_table(table_name);
+        bool new_table = !table;
+        if (new_table) {
+            changes.push_back("create object " + object_name);
+            if (apply)
+                table = tr->add_table_with_primary_key(table_name, pk_type, pk_name, pk_nullable);
+        }
+        else {
+            ColKey existing_pk = table->get_primary_key_column();
+            if (!existing_pk || table->get_column_name(existing_pk) != pk_name ||
+                table->get_column_type(existing_pk) != pk_type || table->is_nullable(existing_pk) != pk_nullable) {
+                return internal_error(HTTPStatus::Conflict, "conflict",
+                                      "primary key changes are not allowed for " + object_name);
+            }
+        }
+
+        for (const auto& property : object_schema["properties"]) {
+            if (!property.is_object() || !property.contains("name") || !property.contains("type") ||
+                !property["name"].is_string() || !property["type"].is_string()) {
+                return internal_error(HTTPStatus::BadRequest, "invalid_argument", "properties need name and type");
+            }
+            std::string name = property["name"].get<std::string>();
+            if (name == pk_name)
+                continue;
+            DataType type = schema_data_type(property["type"].get<std::string>());
+            bool nullable = property.value("nullable", false);
+            ColKey existing = table ? table->get_column_key(name) : ColKey{};
+            if (existing) {
+                if (table->get_column_type(existing) != type || table->is_nullable(existing) != nullable)
+                    return internal_error(HTTPStatus::Conflict, "conflict",
+                                          "field type changes are not allowed for " + object_name + "." + name);
+                continue;
+            }
+            if (!new_table && table->size() != 0 && !nullable)
+                return internal_error(HTTPStatus::Conflict, "conflict",
+                                      "new fields on a non-empty object type must be nullable: " + object_name + "." +
+                                          name);
+            changes.push_back("add field " + object_name + "." + name);
+            if (apply)
+                table->add_column(type, name, nullable);
+        }
+    }
+
+    if (!apply)
+        return {HTTPStatus::Ok,
+                {{"current_version", current}, {"target_version", target}, {"changes", std::move(changes)},
+                 {"applied", false}}};
+
+    TableRef metadata = tr->get_table("barq_api_schema");
+    if (!metadata) {
+        metadata = tr->add_table_with_primary_key("barq_api_schema", type_Int, "id");
+        metadata->add_column(type_Int, "version");
+        metadata->add_column(type_String, "manifest");
+    }
+    ObjKey metadata_key = metadata->find_primary_key(Mixed{int64_t(1)});
+    Obj metadata_object = metadata_key ? metadata->get_object(metadata_key)
+                                      : metadata->create_object_with_primary_key(Mixed{int64_t(1)});
+    metadata_object.set("version", int64_t(target)).set("manifest", request["manifest"].dump());
+    tr->commit();
+    server.recognize_external_change(opened.virt_path);
+    return {HTTPStatus::Ok,
+            {{"current_version", current}, {"target_version", target}, {"changes", std::move(changes)},
+             {"applied", true}}};
+}
+
+InternalAPIResponse handle_internal_api(ServerImpl& server, const HTTPRequest& request)
+{
+    const auto& config = server.get_config();
+    if (config.internal_api_secret.empty())
+        return internal_error(HTTPStatus::NotFound, "not_found", "internal API is disabled");
+    auto authorization = request.headers.find(config.authorization_header_name);
+    if (authorization == request.headers.end() || authorization->second != "Bearer " + config.internal_api_secret)
+        return internal_error(HTTPStatus::Unauthorized, "unauthorized", "invalid internal API bearer secret");
+
+    std::string path = request.path.substr(0, request.path.find('?'));
+    if (path == "/internal/v1/health" && request.method == HTTPMethod::Get) {
+        return {HTTPStatus::Ok,
+                {{"status", "ok"},
+                 {"version", BARQ_VERSION_STRING},
+                 {"capabilities", {"crud", "schema"}}}};
+    }
+    if ((path == "/internal/v1/read" || path == "/internal/v1/write") && request.method == HTTPMethod::Post) {
+        if (!request.body)
+            return internal_error(HTTPStatus::BadRequest, "invalid_argument", "JSON body is required");
+        try {
+            nlohmann::json body = nlohmann::json::parse(*request.body);
+            return path == "/internal/v1/read" ? read_object(server, body) : write_object(server, body);
+        }
+        catch (const std::invalid_argument& e) {
+            return internal_error(HTTPStatus::BadRequest, "invalid_argument", e.what());
+        }
+        catch (const nlohmann::json::exception& e) {
+            return internal_error(HTTPStatus::BadRequest, "invalid_argument", e.what());
+        }
+    }
+    if ((path == "/internal/v1/schema/plan" || path == "/internal/v1/schema/apply") &&
+        request.method == HTTPMethod::Post) {
+        if (!request.body)
+            return internal_error(HTTPStatus::BadRequest, "invalid_argument", "JSON body is required");
+        try {
+            nlohmann::json body = nlohmann::json::parse(*request.body);
+            return schema_change(server, body, path == "/internal/v1/schema/apply");
+        }
+        catch (const std::invalid_argument& e) {
+            return internal_error(HTTPStatus::BadRequest, "invalid_argument", e.what());
+        }
+        catch (const nlohmann::json::exception& e) {
+            return internal_error(HTTPStatus::BadRequest, "invalid_argument", e.what());
+        }
+    }
+    return internal_error(HTTPStatus::NotFound, "not_found", "internal API route not found");
+}
+
+} // unnamed namespace
+
 // ============================ HTTPConnection ============================
 
 std::string g_user_agent = "User-Agent";
@@ -3330,9 +3743,25 @@ private:
         if (path == "/barq-sync" || path.begins_with("/barq-sync?") || path.begins_with("/barq-sync/%2F")) {
             handle_request_for_sync(request); // Throws
         }
+        else if (path.begins_with("/internal/v1/")) {
+            handle_request_for_internal_api(request); // Throws
+        }
         else {
             handle_404_not_found(request); // Throws
         }
+    }
+
+    void handle_request_for_internal_api(const HTTPRequest& request)
+    {
+        InternalAPIResponse result;
+        try {
+            result = handle_internal_api(m_server, request); // Throws
+        }
+        catch (const std::exception& e) {
+            logger.error("Internal API request failed: %1", e.what());
+            result = internal_error(HTTPStatus::InternalServerError, "internal", "internal data-plane failure");
+        }
+        handle_json_response(result.status, result.body.dump()); // Throws
     }
 
     void handle_request_for_sync(const HTTPRequest& request)
@@ -3595,6 +4024,28 @@ private:
             response.headers["Content-Length"] = util::to_string(body_2.size());
             response.body = std::move(body_2);
         }
+
+        auto handler = [this](std::error_code ec) {
+            if (BARQ_UNLIKELY(ec == util::error::operation_aborted))
+                return;
+            if (BARQ_UNLIKELY(ec)) {
+                write_error(ec);
+                return;
+            }
+            terminate(Logger::Level::detail, "HTTP connection closed"); // Throws
+        };
+        m_http_server.async_send_response(response, std::move(handler));
+    }
+
+    void handle_json_response(HTTPStatus http_status, std::string body)
+    {
+        HTTPResponse response;
+        response.status = http_status;
+        add_common_http_response_headers(response);
+        response.headers["Connection"] = "close";
+        response.headers["Content-Type"] = "application/json";
+        response.headers["Content-Length"] = util::to_string(body.size());
+        response.body = std::move(body);
 
         auto handler = [this](std::error_code ec) {
             if (BARQ_UNLIKELY(ec == util::error::operation_aborted))

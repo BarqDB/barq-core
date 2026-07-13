@@ -1,0 +1,6 @@
+.git
+.build-server
+build
+**/*.barq
+**/*.barq.*
+**/*.test
