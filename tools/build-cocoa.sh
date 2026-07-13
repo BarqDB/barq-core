@@ -100,18 +100,28 @@ for bt in "${BUILD_TYPES[@]}"; do
         # core binary
         tar -C core -zxvf "${filename}" "lib/libbarq${suffix}.a"
         mv "core/lib/libbarq${suffix}.a" "core/libbarq-${platform}${suffix}.a"
+        # parser binary
+        tar -C core -zxvf "${filename}" "lib/libbarq-parser${suffix}.a"
+        mv "core/lib/libbarq-parser${suffix}.a" "core/libbarq-parser-${platform}${suffix}.a"
+        # sync binary
+        tar -C core -zxvf "${filename}" "lib/libbarq-sync${suffix}.a"
+        mv "core/lib/libbarq-sync${suffix}.a" "core/libbarq-sync-${platform}${suffix}.a"
         # object store binary
         tar -C core -zxvf "${filename}" "lib/libbarq-object-store${suffix}.a"
         mv "core/lib/libbarq-object-store${suffix}.a" "core/libbarq-object-store-${platform}${suffix}.a"
         rm -r "core/lib"
 
-        # Merge the core, sync & object store libraries together
+        # Merge the core, parser, sync & object store libraries together
         libtool -static -o core/libbarq-monorepo-${platform}${suffix}.a \
           core/libbarq-${platform}${suffix}.a \
+          core/libbarq-parser-${platform}${suffix}.a \
+          core/libbarq-sync-${platform}${suffix}.a \
           core/libbarq-object-store-${platform}${suffix}.a
 
         # remove the now merged libraries
         rm -f core/libbarq-${platform}${suffix}.a \
+              core/libbarq-parser-${platform}${suffix}.a \
+              core/libbarq-sync-${platform}${suffix}.a \
               core/libbarq-object-store-${platform}${suffix}.a
     done
 done
