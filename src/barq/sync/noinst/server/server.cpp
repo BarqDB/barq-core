@@ -2443,10 +2443,13 @@ private:
     void worker_allocate_file_identifiers();
     bool worker_integrate_changes_from_downstream(WorkerState&);
     std::vector<FLXCompensationCandidate>
-    worker_prepare_flx_compensation_candidates(DBRef, const std::shared_ptr<const FLXRuleSet>&);
-    bool worker_apply_flx_compensating_writes(ServerHistory&, DBRef,
-                                              const std::vector<FLXCompensationCandidate>&,
-                                              const std::shared_ptr<const FLXRuleSet>&);
+    worker_prepare_flx_compensation_candidates(Transaction&, const std::shared_ptr<const FLXRuleSet>&);
+    bool worker_apply_flx_compensating_writes(Transaction&, const std::vector<FLXCompensationCandidate>&,
+                                              const std::shared_ptr<const FLXRuleSet>&,
+                                              std::vector<FLXRejectedUpdate>&,
+                                              std::vector<Work::PendingFLXForcedRemoval>&);
+    void worker_finalize_flx_compensating_writes(const std::vector<FLXRejectedUpdate>&,
+                                                 std::vector<Work::PendingFLXForcedRemoval>&);
     ServerHistory& get_client_file_history(WorkerState& state, std::unique_ptr<ServerHistory>& hist_ptr,
                                            DBRef& sg_ptr);
     ServerHistory& get_reference_file_history(WorkerState& state);
@@ -3978,6 +3981,12 @@ InternalAPIResponse handle_internal_api(ServerImpl& server, const HTTPRequest& r
             if (path == "/internal/v1/flx/rules/apply")
                 return change_flx_rules(server, body, true);
             return test_flx_rules(server, body);
+        }
+        catch (const Exception& e) {
+            if (e.category().test(ErrorCategory::invalid_argument)) {
+                return internal_error(HTTPStatus::BadRequest, "invalid_argument", std::string(e.reason()));
+            }
+            throw;
         }
         catch (const std::invalid_argument& e) {
             return internal_error(HTTPStatus::BadRequest, "invalid_argument", e.what());
@@ -7903,7 +7912,7 @@ void ServerFile::worker_allocate_file_identifiers()
 
 
 std::vector<FLXCompensationCandidate> ServerFile::worker_prepare_flx_compensation_candidates(
-    DBRef shared_group, const std::shared_ptr<const FLXRuleSet>& rule_set)
+    Transaction& tr, const std::shared_ptr<const FLXRuleSet>& rule_set)
 {
     std::vector<FLXCompensationCandidate> candidates;
     bool has_flx_changesets = false;
@@ -7918,7 +7927,6 @@ std::vector<FLXCompensationCandidate> ServerFile::worker_prepare_flx_compensatio
         return candidates;
     }
 
-    TransactionRef tr = shared_group->start_read(); // Throws
     std::map<std::string, std::size_t> candidate_indexes;
     for (const auto& [client_file_ident, list] : m_work.changesets_from_downstream) {
         if (!list.is_flx_sync) {
@@ -7945,7 +7953,7 @@ std::vector<FLXCompensationCandidate> ServerFile::worker_prepare_flx_compensatio
                     candidate->user_is_admin = list.flx_user_is_admin;
                     candidate->rejected_client_version = integratable.upload_cursor.client_version;
 
-                    ConstTableRef table = tr->get_table(touched_object.table_name); // Throws
+                    ConstTableRef table = tr.get_table(touched_object.table_name); // Throws
                     if (table) {
                         candidate->before =
                             flx_snapshot_object(table, touched_object.table_name, touched_object.primary_key); // Throws
@@ -7957,6 +7965,9 @@ std::vector<FLXCompensationCandidate> ServerFile::worker_prepare_flx_compensatio
                                 candidate->before_matches_write =
                                     before && flx_access_query_matches(*rule, true, table, before,
                                                                        candidate->user_identity); // Throws
+                            }
+                            catch (const Exception&) {
+                                candidate->before_matches_write = false; // Fail closed on a stale or invalid rule.
                             }
                             catch (const std::exception&) {
                                 candidate->before_matches_write = false; // Fail closed on a stale or invalid rule.
@@ -7981,92 +7992,97 @@ std::vector<FLXCompensationCandidate> ServerFile::worker_prepare_flx_compensatio
 
 
 bool ServerFile::worker_apply_flx_compensating_writes(
-    ServerHistory& history, DBRef, const std::vector<FLXCompensationCandidate>& candidates,
-    const std::shared_ptr<const FLXRuleSet>& rule_set)
+    Transaction& tr, const std::vector<FLXCompensationCandidate>& candidates,
+    const std::shared_ptr<const FLXRuleSet>& rule_set, std::vector<FLXRejectedUpdate>& rejected_updates,
+    std::vector<Work::PendingFLXForcedRemoval>& forced_removals)
 {
     if (candidates.empty()) {
         return false;
     }
 
-    std::vector<FLXRejectedUpdate> rejected_updates;
-    std::vector<Work::PendingFLXForcedRemoval> forced_removals;
-    bool produced_new_barq_version = history.transact(
-        [&](Transaction& tr) {
-            bool dirty = false;
-            for (const FLXCompensationCandidate& candidate : candidates) {
-                const FLXAccessRule* rule =
-                    rule_set ? find_flx_access_rule(*rule_set, candidate.before.table_name) : nullptr;
-                bool reject = false;
-                std::string reason;
+    bool dirty = false;
+    for (const FLXCompensationCandidate& candidate : candidates) {
+        const FLXAccessRule* rule =
+            rule_set ? find_flx_access_rule(*rule_set, candidate.before.table_name) : nullptr;
+        bool reject = false;
+        std::string reason;
 
-                TableRef table = tr.get_table(candidate.before.table_name); // Throws
-                Obj after;
-                if (table) {
-                    after = flx_find_object(table, candidate.before.primary_key); // Throws
-                }
+        TableRef table = tr.get_table(candidate.before.table_name); // Throws
+        Obj after;
+        if (table) {
+            after = flx_find_object(table, candidate.before.primary_key); // Throws
+        }
 
-                if (!rule) {
-                    reject = true;
-                    reason = "write denied: no FLX rule configured for table"; // Throws
-                }
-                else if (candidate.user_is_admin) {
-                    reject = false;
-                }
-                else {
-                    if (candidate.before.existed && !candidate.before_matches_write) {
+        if (!rule) {
+            reject = true;
+            reason = "write denied: no FLX rule configured for table"; // Throws
+        }
+        else if (candidate.user_is_admin) {
+            reject = false;
+        }
+        else {
+            if (candidate.before.existed && !candidate.before_matches_write) {
+                reject = true;
+                reason = rule->legacy_owner_field.empty()
+                             ? "write denied: previous object does not match the FLX write rule"
+                             : "write denied: previous owner field does not match the user"; // Throws
+            }
+            else if (after) {
+                try {
+                    if (!flx_access_query_matches(*rule, true, table, after, candidate.user_identity)) {
                         reject = true;
                         reason = rule->legacy_owner_field.empty()
-                                     ? "write denied: previous object does not match the FLX write rule"
-                                     : "write denied: previous owner field does not match the user"; // Throws
-                    }
-                    else if (after) {
-                        try {
-                            if (!flx_access_query_matches(*rule, true, table, after, candidate.user_identity)) {
-                                reject = true;
-                                reason = rule->legacy_owner_field.empty()
-                                             ? "write denied: new object does not match the FLX write rule"
-                                             : "write denied: owner field does not match the user"; // Throws
-                            }
-                        }
-                        catch (const std::exception&) {
-                            reject = true;
-                            reason = "write denied: FLX write rule could not be evaluated"; // Throws
-                        }
+                                     ? "write denied: new object does not match the FLX write rule"
+                                     : "write denied: owner field does not match the user"; // Throws
                     }
                 }
-
-                if (!reject) {
-                    continue;
+                catch (const Exception&) {
+                    reject = true;
+                    reason = "write denied: FLX write rule could not be evaluated"; // Throws
                 }
-
-                bool restored = flx_restore_snapshot(tr, candidate.before); // Throws
-                if (!restored) {
-                    continue;
-                }
-                dirty = true;
-
-                FLXRejectedUpdate update;
-                update.client_file_ident = candidate.client_file_ident;
-                update.rejected_client_version = candidate.rejected_client_version;
-                update.table_name = candidate.before.table_name;     // Throws
-                update.primary_key = candidate.before.primary_key;   // Throws
-                update.reason = std::move(reason);
-                rejected_updates.push_back(std::move(update)); // Throws
-
-                if (!candidate.before.existed) {
-                    Work::PendingFLXForcedRemoval removal;
-                    removal.client_file_ident = candidate.client_file_ident;
-                    removal.object.table_name = candidate.before.table_name;   // Throws
-                    removal.object.primary_key = candidate.before.primary_key; // Throws
-                    forced_removals.push_back(std::move(removal));             // Throws
+                catch (const std::exception&) {
+                    reject = true;
+                    reason = "write denied: FLX write rule could not be evaluated"; // Throws
                 }
             }
-            return dirty;
-        },
-        m_work.version_info); // Throws
+        }
 
-    if (!produced_new_barq_version || rejected_updates.empty()) {
-        return produced_new_barq_version;
+        if (!reject) {
+            continue;
+        }
+
+        bool restored = flx_restore_snapshot(tr, candidate.before); // Throws
+        if (!restored) {
+            continue;
+        }
+        dirty = true;
+
+        FLXRejectedUpdate update;
+        update.client_file_ident = candidate.client_file_ident;
+        update.rejected_client_version = candidate.rejected_client_version;
+        update.table_name = candidate.before.table_name;     // Throws
+        update.primary_key = candidate.before.primary_key;   // Throws
+        update.reason = std::move(reason);
+        rejected_updates.push_back(std::move(update)); // Throws
+
+        if (!candidate.before.existed) {
+            Work::PendingFLXForcedRemoval removal;
+            removal.client_file_ident = candidate.client_file_ident;
+            removal.object.table_name = candidate.before.table_name;   // Throws
+            removal.object.primary_key = candidate.before.primary_key; // Throws
+            forced_removals.push_back(std::move(removal));             // Throws
+        }
+    }
+    return dirty;
+}
+
+
+void ServerFile::worker_finalize_flx_compensating_writes(
+    const std::vector<FLXRejectedUpdate>& rejected_updates,
+    std::vector<Work::PendingFLXForcedRemoval>& forced_removals)
+{
+    if (rejected_updates.empty()) {
+        return;
     }
 
     version_type compensating_write_server_version = m_work.version_info.sync_version.version;
@@ -8103,7 +8119,6 @@ bool ServerFile::worker_apply_flx_compensating_writes(
     for (auto& removal : forced_removals) {
         m_work.pending_flx_forced_removals.push_back(std::move(removal)); // Throws
     }
-    return true;
 }
 
 
@@ -8118,15 +8133,33 @@ bool ServerFile::worker_integrate_changes_from_downstream(WorkerState& state)
     std::unique_ptr<ServerHistory> hist_ptr;
     DBRef sg_ptr;
     ServerHistory& hist = get_client_file_history(state, hist_ptr, sg_ptr);
-    DBRef shared_group = state.use_file_cache ? worker_access().shared_group : sg_ptr; // Throws
-    std::shared_ptr<const FLXRuleSet> rule_set = get_flx_rule_set();
-    std::vector<FLXCompensationCandidate> flx_compensation_candidates =
-        worker_prepare_flx_compensation_candidates(shared_group, rule_set); // Throws
+
+    bool has_flx_changesets = std::any_of(
+        m_work.changesets_from_downstream.begin(), m_work.changesets_from_downstream.end(),
+        [](const auto& entry) { return entry.second.is_flx_sync && entry.second.has_changesets(); });
+    std::shared_ptr<const FLXRuleSet> rule_set;
+    std::vector<FLXCompensationCandidate> flx_compensation_candidates;
+    std::vector<FLXRejectedUpdate> flx_rejected_updates;
+    std::vector<Work::PendingFLXForcedRemoval> flx_forced_removals;
+    ServerHistory::IntegrationHook flx_hook;
+    if (has_flx_changesets) {
+        flx_hook = [&](Transaction& tr, bool before_integration) {
+            if (before_integration) {
+                rule_set = load_flx_rule_set(tr, make_static_flx_rule_set(m_server.get_config())); // Throws
+                flx_compensation_candidates = worker_prepare_flx_compensation_candidates(tr, rule_set); // Throws
+                flx_rejected_updates.clear();
+                flx_forced_removals.clear();
+                return false;
+            }
+            return worker_apply_flx_compensating_writes(tr, flx_compensation_candidates, rule_set,
+                                                        flx_rejected_updates, flx_forced_removals); // Throws
+        };
+    }
 
     bool backup_whole_barq = false;
     bool produced_new_barq_version = hist.integrate_client_changesets(
         m_work.changesets_from_downstream, m_work.version_info, backup_whole_barq, m_work.integration_result,
-        wlogger); // Throws
+        wlogger, flx_hook); // Throws
     bool produced_new_sync_version = !m_work.integration_result.integrated_changesets.empty();
     BARQ_ASSERT(!produced_new_sync_version || produced_new_barq_version);
     if (produced_new_barq_version) {
@@ -8136,13 +8169,7 @@ bool ServerFile::worker_integrate_changes_from_downstream(WorkerState& state)
         }
     }
 
-    bool produced_compensating_write =
-        worker_apply_flx_compensating_writes(hist, shared_group, flx_compensation_candidates, rule_set); // Throws
-    if (produced_compensating_write) {
-        m_work.produced_new_barq_version = true;
-        m_work.produced_new_sync_version = true;
-        produced_new_sync_version = true;
-    }
+    worker_finalize_flx_compensating_writes(flx_rejected_updates, flx_forced_removals); // Throws
     return produced_new_sync_version;
 }
 

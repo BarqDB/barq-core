@@ -25,6 +25,8 @@
 #include <barq/array_integer.hpp>
 #include <barq/array_ref.hpp>
 
+#include <functional>
+
 namespace barq {
 namespace sync {
 struct Changeset;
@@ -205,6 +207,7 @@ public:
     /// received. That client file is not necessarily the client file from which
     /// the changes originated (star topology).
     using IntegratableChangesets = std::map<file_ident_type, IntegratableChangesetList>;
+    using IntegrationHook = std::function<bool(Transaction&, bool before_integration)>;
 
     struct IntegrationResult {
         std::map<file_ident_type, ExtendedIntegrationError> excluded_client_files;
@@ -332,7 +335,8 @@ public:
     /// \return True when, and only when a new Barq version (snapshot) was
     /// created.
     bool integrate_client_changesets(const IntegratableChangesets&, sync::VersionInfo& version_info,
-                                     bool& backup_whole_barq, IntegrationResult& result, util::Logger&);
+                                     bool& backup_whole_barq, IntegrationResult& result, util::Logger&,
+                                     const IntegrationHook& = {});
 
     /// EXPLAIN BACKUP incremental
     auto integrate_backup_idents_and_changeset(version_type expected_barq_version, salt_type server_version_salt,

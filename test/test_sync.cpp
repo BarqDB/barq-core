@@ -8346,7 +8346,7 @@ TEST(Sync_FLXServerBinaryLiveRuleAPIValidatesPersistsAndIsolatesScopes)
     const std::string scope = R"({"tenant":"tenant-a","database":"main"})";
     const std::string schema =
         R"({"scope":)" + scope +
-        R"(,"version":1,"manifest":{"objects":[{"name":"Order","primary_key":{"name":"id","type":"string"},"properties":[{"name":"id","type":"string"},{"name":"owner_id","type":"string"}]}]}})";
+        R"(,"version":1,"manifest":{"objects":[{"name":"Order","primary_key":{"name":"id","type":"string"},"properties":[{"name":"id","type":"string"},{"name":"owner_id","type":"string"},{"name":"amount","type":"int"}]}]}})";
     const std::string owner_rules =
         R"({"scope":)" + scope +
         R"(,"expected_revision":0,"target_revision":1,"rules":[{"object_type":"Order","read":"owner_id == $user.id","write":"owner_id == $user.id"}]})";
@@ -8380,6 +8380,18 @@ TEST(Sync_FLXServerBinaryLiveRuleAPIValidatesPersistsAndIsolatesScopes)
         HTTPResponse invalid_response =
             call_external_internal_api(port, "/internal/v1/flx/rules/plan", invalid, test_context);
         CHECK_EQUAL(invalid_response.status, HTTPStatus::BadRequest);
+
+        std::string wrong_type =
+            R"({"scope":)" + scope +
+            R"json(,"expected_revision":0,"rules":[{"object_type":"Order","read":"amount == $user.id","write":"FALSEPREDICATE"}]})json";
+        HTTPResponse wrong_type_response =
+            call_external_internal_api(port, "/internal/v1/flx/rules/plan", wrong_type, test_context);
+        CHECK_EQUAL(wrong_type_response.status, HTTPStatus::BadRequest);
+        CHECK(bool(wrong_type_response.body));
+        if (wrong_type_response.body) {
+            CHECK(wrong_type_response.body->find(R"("code":"invalid_argument")") != std::string::npos);
+            CHECK(wrong_type_response.body->find("internal data-plane failure") == std::string::npos);
+        }
 
         HTTPResponse apply_response =
             call_external_internal_api(port, "/internal/v1/flx/rules/apply", owner_rules, test_context);
