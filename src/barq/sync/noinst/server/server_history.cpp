@@ -299,7 +299,8 @@ bool ServerHistory::register_received_file_identifier(file_ident_type received_f
 
 bool ServerHistory::integrate_client_changesets(const IntegratableChangesets& integratable_changesets,
                                                 VersionInfo& version_info, bool& backup_whole_barq,
-                                                IntegrationResult& result, util::Logger& logger)
+                                                IntegrationResult& result, util::Logger& logger,
+                                                const IntegrationHook& integration_hook)
 {
     BARQ_ASSERT(!integratable_changesets.empty());
 
@@ -341,6 +342,8 @@ bool ServerHistory::integrate_client_changesets(const IntegratableChangesets& in
             version_type barq_version = tr->get_version_of_current_transaction().version;
             ensure_updated(barq_version); // Throws
             prepare_for_write();           // Throws
+            if (integration_hook)
+                integration_hook(*tr, true); // Throws
 
             bool dirty = false;
             bool backup_whole_barq_2 = false;
@@ -416,8 +419,14 @@ bool ServerHistory::integrate_client_changesets(const IntegratableChangesets& in
                 integrate(0, num_changesets, list.upload_progress); // Throws
             }
 
+            bool has_local_changeset = integration_hook && integration_hook(*tr, false); // Throws
+            if (has_local_changeset)
+                dirty = true;
+
             if (dirty) {
-                auto ta = util::make_temp_assign(m_is_local_changeset, false, true);
+                // A hook may add a local compensation entry. It stays in the
+                // same database commit as the remote write.
+                auto ta = util::make_temp_assign(m_is_local_changeset, has_local_changeset, true);
                 version_info.barq_version = tr->commit(); // Throws
                 version_info.sync_version = get_salted_server_version();
                 if (backup_whole_barq_2)

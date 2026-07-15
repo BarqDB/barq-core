@@ -27,6 +27,11 @@
 
 #if defined(BARQ_SYNC_SERVER_BINARY) && !defined(_WIN32) && !BARQ_ANDROID && !BARQ_IOS
 extern char** environ;
+
+const char g_live_rules_seed_token[] =
+    "eyJpZGVudGl0eSI6InNlZWQiLCJhZG1pbiI6dHJ1ZSwidGltZXN0YW1wIjoxNDU1NTMwNjE0LCJleHBpcmVzIjpudWxsLCJhcHBfaWQiOiJ0ZXN0IiwicGF0aCI6InRlbmFudC1hL21haW4iLCJhY2Nlc3MiOlsiZG93bmxvYWQiLCJ1cGxvYWQiLCJtYW5hZ2UiXX0=";
+const char g_live_rules_user_token[] =
+    "eyJpZGVudGl0eSI6InVzZXJfMCIsImFkbWluIjpmYWxzZSwidGltZXN0YW1wIjoxNDU1NTMwNjE0LCJleHBpcmVzIjpudWxsLCJhcHBfaWQiOiJ0ZXN0IiwicGF0aCI6InRlbmFudC1hL21haW4iLCJhY2Nlc3MiOlsiZG93bmxvYWQiLCJ1cGxvYWQiLCJtYW5hZ2UiXX0=";
 #endif
 
 #include <barq.hpp>
@@ -388,6 +393,22 @@ Session::port_type parse_external_cli_server_port(const std::string& route)
 
     unsigned long port = std::stoul(route.substr(colon_pos + 1, suffix_pos - colon_pos - 1)); // Throws
     return Session::port_type(port);
+}
+
+HTTPResponse call_external_internal_api(Session::port_type port, const std::string& path, const std::string& body,
+                                        unit_test::TestContext& test_context)
+{
+    HTTPRequest request;
+    request.method = HTTPMethod::Post;
+    request.path = path;
+    request.body = body;
+    request.headers["Authorization"] = "Bearer test-internal-secret";
+    request.headers["Content-Type"] = "application/json";
+    request.headers["Content-Length"] = util::to_string(body.size());
+    network::Endpoint endpoint{network::make_address("127.0.0.1"), port};
+    HTTPRequestClient client(test_context.logger, endpoint, request);
+    client.fetch_response();
+    return client.get_response();
 }
 #endif
 
@@ -8314,6 +8335,194 @@ TEST(Sync_FLXServerBinaryCLIEnforcesRulesEndToEnd)
 
     check_order_visibility(test_context, db_a, false, false);
     check_order_visibility(test_context, db_b, true, true);
+}
+
+TEST(Sync_FLXServerBinaryLiveRuleAPIValidatesPersistsAndIsolatesScopes)
+{
+    TEST_DIR(dir);
+    std::string server_root = util::File::resolve("server-root", dir);
+    util::make_dir_recursive(server_root);
+
+    const std::string scope = R"({"tenant":"tenant-a","database":"main"})";
+    const std::string schema =
+        R"({"scope":)" + scope +
+        R"(,"version":1,"manifest":{"objects":[{"name":"Order","primary_key":{"name":"id","type":"string"},"properties":[{"name":"id","type":"string"},{"name":"owner_id","type":"string"},{"name":"amount","type":"int"}]}]}})";
+    const std::string owner_rules =
+        R"({"scope":)" + scope +
+        R"(,"expected_revision":0,"target_revision":1,"rules":[{"object_type":"Order","read":"owner_id == $user.id","write":"owner_id == $user.id"}]})";
+
+    {
+        ExternalServerProcess server({
+            BARQ_SYNC_SERVER_BINARY,
+            "--root-dir",
+            server_root,
+            "--jwt-public-key",
+            test_server_key_path(),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--enable-flx",
+            "--internal-api-secret",
+            "test-internal-secret",
+            "--log-level",
+            "warn",
+        });
+        Session::port_type port = parse_external_cli_server_port(server.wait_for_route());
+
+        HTTPResponse schema_response =
+            call_external_internal_api(port, "/internal/v1/schema/apply", schema, test_context);
+        CHECK_EQUAL(schema_response.status, HTTPStatus::Ok);
+
+        std::string invalid =
+            R"({"scope":)" + scope +
+            R"json(,"expected_revision":0,"rules":[{"object_type":"Order","read":"TRUEPREDICATE SORT(id ASC)","write":"FALSEPREDICATE"}]})json";
+        HTTPResponse invalid_response =
+            call_external_internal_api(port, "/internal/v1/flx/rules/plan", invalid, test_context);
+        CHECK_EQUAL(invalid_response.status, HTTPStatus::BadRequest);
+
+        std::string wrong_type =
+            R"({"scope":)" + scope +
+            R"json(,"expected_revision":0,"rules":[{"object_type":"Order","read":"amount == $user.id","write":"FALSEPREDICATE"}]})json";
+        HTTPResponse wrong_type_response =
+            call_external_internal_api(port, "/internal/v1/flx/rules/plan", wrong_type, test_context);
+        CHECK_EQUAL(wrong_type_response.status, HTTPStatus::BadRequest);
+        CHECK(bool(wrong_type_response.body));
+        if (wrong_type_response.body) {
+            CHECK(wrong_type_response.body->find(R"("code":"invalid_argument")") != std::string::npos);
+            CHECK(wrong_type_response.body->find("internal data-plane failure") == std::string::npos);
+        }
+
+        HTTPResponse apply_response =
+            call_external_internal_api(port, "/internal/v1/flx/rules/apply", owner_rules, test_context);
+        CHECK_EQUAL(apply_response.status, HTTPStatus::Ok);
+        CHECK(bool(apply_response.body));
+        if (apply_response.body)
+            CHECK(apply_response.body->find(R"("revision":1)") != std::string::npos);
+
+        HTTPResponse retry_response =
+            call_external_internal_api(port, "/internal/v1/flx/rules/apply", owner_rules, test_context);
+        CHECK_EQUAL(retry_response.status, HTTPStatus::Ok);
+
+        std::string stale =
+            R"({"scope":)" + scope +
+            R"(,"expected_revision":0,"target_revision":1,"rules":[{"object_type":"Order","read":"TRUEPREDICATE","write":"TRUEPREDICATE"}]})";
+        HTTPResponse stale_response =
+            call_external_internal_api(port, "/internal/v1/flx/rules/apply", stale, test_context);
+        CHECK_EQUAL(stale_response.status, HTTPStatus::Conflict);
+
+        std::string other_scope = R"({"scope":{"tenant":"tenant-b","database":"main"}})";
+        HTTPResponse other_response =
+            call_external_internal_api(port, "/internal/v1/flx/rules/read", other_scope, test_context);
+        CHECK_EQUAL(other_response.status, HTTPStatus::Ok);
+        CHECK(bool(other_response.body));
+        if (other_response.body)
+            CHECK(other_response.body->find(R"("revision":0)") != std::string::npos);
+    }
+
+    {
+        ExternalServerProcess server({
+            BARQ_SYNC_SERVER_BINARY,
+            "--root-dir",
+            server_root,
+            "--jwt-public-key",
+            test_server_key_path(),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--enable-flx",
+            "--internal-api-secret",
+            "test-internal-secret",
+            "--log-level",
+            "warn",
+        });
+        Session::port_type port = parse_external_cli_server_port(server.wait_for_route());
+        HTTPResponse read_response =
+            call_external_internal_api(port, "/internal/v1/flx/rules/read", R"({"scope":)" + scope + "}",
+                                       test_context);
+        CHECK_EQUAL(read_response.status, HTTPStatus::Ok);
+        CHECK(bool(read_response.body));
+        if (read_response.body) {
+            CHECK(read_response.body->find(R"("revision":1)") != std::string::npos);
+            CHECK(read_response.body->find(R"("source":"database")") != std::string::npos);
+        }
+    }
+}
+
+TEST(Sync_FLXServerBinaryLiveRulesRefilterConnectedDevice)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(user_db);
+
+    create_flx_isolation_schema(seed_db, 1, "user_0", true);
+    upsert_order_owner(seed_db, 2, "user_1");
+    create_flx_isolation_schema(user_db, 0, nullptr, false);
+    auto subscriptions = SubscriptionStore::create(user_db);
+    subscribe_to_flx_isolation_tables(user_db, subscriptions);
+
+    std::string server_root = util::File::resolve("server-root", dir);
+    util::make_dir_recursive(server_root);
+    ExternalServerProcess server({
+        BARQ_SYNC_SERVER_BINARY,
+        "--root-dir",
+        server_root,
+        "--allow-unsigned-tokens",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--enable-flx",
+        "--internal-api-secret",
+        "test-internal-secret",
+        "--log-level",
+        "warn",
+    });
+    Session::port_type port = parse_external_cli_server_port(server.wait_for_route());
+
+    ExternalSyncClient seed_client(std::make_shared<util::PrefixLogger>("live rules seed: ", test_context.logger));
+    Session::Config seed_config =
+        make_external_cli_session_config(port, g_live_rules_seed_token, "seed", test_context);
+    seed_config.barq_identifier = "tenant-a/main";
+    util::Optional<Session> seed_session = Session{seed_client.get(), seed_db, nullptr, nullptr, std::move(seed_config)};
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+
+    ExternalSyncClient user_client(std::make_shared<util::PrefixLogger>("live rules user: ", test_context.logger));
+    util::Optional<Session> user_session =
+        Session{user_client.get(), user_db, subscriptions, MigrationStore::create(user_db),
+                make_external_cli_session_config(port, g_live_rules_user_token, "user_0", test_context)};
+    CHECK(user_session->wait_for_download_complete_or_client_stopped());
+    check_order_visibility(test_context, user_db, false, false);
+
+    const std::string scope = R"({"tenant":"tenant-a","database":"main"})";
+    auto apply = [&](uint64_t expected, const std::string& read, const std::string& write) {
+        std::string body = R"({"scope":)" + scope + R"(,"expected_revision":)" + util::to_string(expected) +
+                           R"(,"target_revision":)" + util::to_string(expected + 1) +
+                           R"(,"rules":[{"object_type":"Order","read":")" + read +
+                           R"(","write":")" + write + R"("}]})";
+        HTTPResponse response =
+            call_external_internal_api(port, "/internal/v1/flx/rules/apply", body, test_context);
+        CHECK_EQUAL(response.status, HTTPStatus::Ok);
+    };
+
+    apply(0, "owner_id == $user.id", "owner_id == $user.id");
+    CHECK(user_session->wait_for_download_complete_or_client_stopped());
+    check_order_visibility(test_context, user_db, true, false);
+
+    // Queue a device write while the rule revision changes. The database writer
+    // serializes both operations, and the final view follows the new revision.
+    upsert_order_owner(seed_db, 1, "user_1");
+    apply(1, "TRUEPREDICATE", "TRUEPREDICATE");
+    CHECK(seed_session->wait_for_upload_complete_or_client_stopped());
+    CHECK(user_session->wait_for_download_complete_or_client_stopped());
+    check_order_visibility(test_context, user_db, true, true);
+
+    apply(2, "owner_id == $user.id", "owner_id == $user.id");
+    CHECK(user_session->wait_for_download_complete_or_client_stopped());
+    check_order_visibility(test_context, user_db, false, false);
+    ReadTransaction read{user_db};
+    CHECK_NOT(read.get_table("flx_rule_state"));
 }
 #endif
 

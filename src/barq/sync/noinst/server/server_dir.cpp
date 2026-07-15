@@ -70,7 +70,7 @@ _impl::VirtualPathComponents _impl::parse_virtual_path(const std::string& root_p
 bool _impl::make_tenant_virtual_path(const std::string& tenant_id, const std::string& client_path,
                                      std::string& virt_path, std::string* relative_path)
 {
-    if (!valid_virt_path_segment(tenant_id))
+    if (!valid_virt_path_segment(tenant_id) || tenant_id == "_system")
         return false;
     if (client_path.empty())
         return false;

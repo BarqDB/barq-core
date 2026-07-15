@@ -114,6 +114,10 @@ public:
         /// "Bearer <token>"
         std::string authorization_header_name = "Authorization";
 
+        /// Shared bearer secret for the loopback-only Go data-plane API.
+        /// When empty, /internal/v1 is disabled.
+        std::string internal_api_secret;
+
         /// The listening socket accepts TLS/SSL connections if `ssl` is
         /// true, and non-secure tcp connections otherwise.
         bool ssl = false;
